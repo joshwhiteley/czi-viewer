@@ -1,0 +1,11 @@
+/target/
+.DS_Store
+
+# Local CZI data and machine-specific fixture configuration.
+*.czi
+/test-data/local-fixtures.toml
+/test-data/cache/
+
+# Application caches and temporary output.
+*.czi.tmp
+*.partial
