@@ -485,9 +485,12 @@ impl ViewerApp {
     /// Create the viewer state and its dedicated dataset worker.
     #[must_use]
     pub fn new(_creation_context: &eframe::CreationContext<'_>) -> Self {
-        Self {
+        let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
+        let mut app = Self {
             worker: DatasetWorker::spawn(),
-            path_input: String::new(),
+            path_input: initial_path
+                .as_ref()
+                .map_or_else(String::new, |path| path.display().to_string()),
             dataset: None,
             selection: PlaneSelection::default(),
             generations: Generations::default(),
@@ -501,7 +504,11 @@ impl ViewerApp {
             },
             camera: Camera::default(),
             fit_pending: false,
+        };
+        if initial_path.is_some() {
+            app.open_current_path();
         }
+        app
     }
 
     fn open_current_path(&mut self) {
