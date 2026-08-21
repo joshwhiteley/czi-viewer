@@ -415,7 +415,10 @@ fn bridge_socket_lifecycle_and_unix_sftp_protocol_are_strict() {
 
     let config = OpenSshConfig::new().with_control_path(control_path);
     let worker = thread::spawn(move || {
-        let mut stream = listener.accept().expect("bridge accept");
+        let mut stream = listener
+            .accept()
+            .expect("bridge accept")
+            .expect("bridge viewer connection");
         authenticate_bridge_server(&mut stream, &profile("bridge-host")).expect("bridge handshake");
         let mut header = [0_u8; 4];
         stream.read_exact(&mut header).expect("SFTP header");
@@ -463,30 +466,108 @@ fn bridge_handshake_rejects_a_different_profile_before_sftp() {
 
 #[cfg(unix)]
 #[test]
-fn bridge_cancellation_closes_a_blocked_stream() {
+fn bridge_cancellation_closes_concurrent_dataset_and_browse_streams() {
+    use std::os::unix::net::UnixStream;
+
+    let (dataset, mut dataset_peer) = UnixStream::pair().expect("dataset Unix stream pair");
+    let (browse, mut browse_peer) = UnixStream::pair().expect("browse Unix stream pair");
+    let cancellation = BridgeCancellation::default();
+    let _dataset_registration = cancellation
+        .register(&dataset)
+        .expect("register dataset bridge stream");
+    let _browse_registration = cancellation
+        .register(&browse)
+        .expect("register browse bridge stream");
+    cancellation.cancel();
+    assert_bridge_peer_closed(&mut dataset_peer);
+    assert_bridge_peer_closed(&mut browse_peer);
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_bridge_registration_does_not_unregister_a_newer_stream() {
+    use std::os::unix::net::UnixStream;
+
+    let (stale_stream, _) = UnixStream::pair().expect("stale Unix stream pair");
+    let (active_stream, mut active_peer) = UnixStream::pair().expect("active Unix stream pair");
+    let cancellation = BridgeCancellation::default();
+    let stale_registration = cancellation
+        .register(&stale_stream)
+        .expect("register stale bridge stream");
+    let _active_registration = cancellation
+        .register(&active_stream)
+        .expect("register active bridge stream");
+    drop(stale_registration);
+
+    cancellation.cancel();
+    assert_bridge_peer_closed(&mut active_peer);
+}
+
+#[cfg(unix)]
+#[test]
+fn bridge_cancellation_is_sticky_before_late_registration() {
     use std::os::unix::net::UnixStream;
 
     let (stream, mut peer) = UnixStream::pair().expect("Unix stream pair");
     let cancellation = BridgeCancellation::default();
-    cancellation
-        .register(&stream)
-        .expect("register bridge stream");
-    drop(stream);
     cancellation.cancel();
+    assert!(cancellation.register(&stream).is_err());
+    assert_bridge_peer_closed(&mut peer);
+}
+
+#[cfg(unix)]
+#[test]
+fn bridge_listener_exits_when_viewer_removes_its_private_directory() {
+    let control_path = ControlPath::create_private().expect("private control path");
+    let directory = control_path.directory().to_path_buf();
+    let listener = BridgeListener::bind(control_path.socket_path()).expect("bridge listener");
+    std::fs::remove_dir_all(&directory).expect("remove private control directory");
     let (result_tx, result_rx) = mpsc::channel();
     thread::spawn(move || {
-        let mut byte = [0_u8; 1];
         result_tx
-            .send(peer.read(&mut byte))
-            .expect("send bridge EOF");
+            .send(listener.accept())
+            .expect("send idle listener result");
     });
-    assert_eq!(
+    assert!(
         result_rx
             .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("bridge cancellation result")
-            .expect("bridge EOF"),
-        0
+            .expect("idle listener result")
+            .expect("idle listener should inspect its removed path")
+            .is_none()
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn bridge_listener_does_not_unlink_a_replacement_socket() {
+    use std::os::unix::net::UnixListener;
+
+    let control_path = ControlPath::create_private().expect("private control path");
+    let directory = control_path.directory().to_path_buf();
+    let socket_path = control_path.socket_path().to_path_buf();
+    let listener = BridgeListener::bind(&socket_path).expect("bridge listener");
+    std::fs::remove_file(&socket_path).expect("remove original bridge socket");
+    let replacement = UnixListener::bind(&socket_path).expect("replacement bridge socket");
+
+    assert!(
+        listener
+            .accept()
+            .expect("inspect replacement bridge socket")
+            .is_none()
+    );
+    assert!(socket_path.exists(), "replacement socket must be preserved");
+
+    drop(replacement);
+    std::fs::remove_file(&socket_path).expect("remove replacement bridge socket");
+    std::fs::remove_dir_all(directory).expect("remove private control directory");
+}
+
+#[cfg(unix)]
+fn assert_bridge_peer_closed(peer: &mut std::os::unix::net::UnixStream) {
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+        .expect("set bridge peer timeout");
+    let mut byte = [0_u8; 1];
+    assert_eq!(peer.read(&mut byte).expect("bridge peer EOF"), 0);
 }
 
 #[test]

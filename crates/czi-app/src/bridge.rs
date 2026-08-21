@@ -74,7 +74,9 @@ fn run(invocation: &BridgeInvocation) -> Result<(), Box<dyn std::error::Error>> 
     eprintln!(
         "Return to the viewer and click Retry, Home, or Browse. Enter any password, 2FA, or host-key confirmation here in Terminal. Keep this Terminal open while the remote file is in use."
     );
-    let mut stream = listener.accept()?;
+    let Some(mut stream) = listener.accept()? else {
+        return Ok(());
+    };
     authenticate_bridge_server(&mut stream, &invocation.profile)?;
     eprintln!(
         "Viewer connected. OpenSSH may now prompt in this Terminal; SFTP bytes are not printed here."
@@ -130,10 +132,22 @@ fn proxy_child(child: &mut std::process::Child, stream: UnixStream) -> io::Resul
     let output = copy_in_background(stdout, output_stream, finished_tx);
     let _ = finished_rx.recv();
     let _ = shutdown_stream.shutdown(Shutdown::Both);
-    let status = terminate_child(child).ok_or_else(|| io::Error::other("reap OpenSSH child"))?;
+    let (status, terminated_for_disconnect) = match child.try_wait() {
+        Ok(Some(status)) => (status, false),
+        Ok(None) => (
+            terminate_child(child).ok_or_else(|| io::Error::other("reap OpenSSH child"))?,
+            true,
+        ),
+        Err(source) => {
+            let _ = terminate_child(child);
+            let _ = input.join();
+            let _ = output.join();
+            return Err(source);
+        }
+    };
     let _ = input.join();
     let _ = output.join();
-    if status.success() {
+    if terminated_for_disconnect || status.success() {
         Ok(())
     } else {
         Err(io::Error::other(format!("OpenSSH exited with {status}")))

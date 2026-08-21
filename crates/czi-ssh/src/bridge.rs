@@ -9,13 +9,19 @@ use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::path::Path;
 #[cfg(unix)]
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+#[cfg(unix)]
+use std::thread;
+#[cfg(unix)]
+use std::time::Duration;
 
 #[cfg(unix)]
 use crate::command::{PRIVATE_CONTROL_BASE, PRIVATE_SOCKET_NAME, SOCKET_PATH_LIMIT};
 #[cfg(unix)]
 use crate::{ControlPath, OpenSshConfigError, SftpError};
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 #[cfg(unix)]
@@ -27,6 +33,26 @@ const CLIENT_MAGIC: [u8; 4] = *b"CZB1";
 const SERVER_MAGIC: [u8; 4] = *b"CZB2";
 #[cfg(unix)]
 const NONCE_LENGTH: usize = 16;
+#[cfg(unix)]
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+#[cfg(unix)]
+struct CancellationState {
+    cancelled: bool,
+    next_token: u64,
+    streams: std::collections::BTreeMap<u64, UnixStream>,
+}
+
+#[cfg(unix)]
+impl Default for CancellationState {
+    fn default() -> Self {
+        Self {
+            cancelled: false,
+            next_token: 1,
+            streams: std::collections::BTreeMap::new(),
+        }
+    }
+}
 
 /// An out-of-band closer for the active interactive bridge stream.
 ///
@@ -35,45 +61,96 @@ const NONCE_LENGTH: usize = 16;
 #[derive(Clone, Default)]
 pub struct BridgeCancellation {
     #[cfg(unix)]
-    stream: Arc<Mutex<Option<UnixStream>>>,
+    state: Arc<Mutex<CancellationState>>,
+}
+
+/// A token-scoped active bridge stream registration.
+///
+/// The registration is removed on drop. It is intentionally held by the transport rather than
+/// its caller so old sessions cannot unregister newer streams.
+#[cfg(unix)]
+#[must_use]
+pub(crate) struct BridgeRegistration {
+    cancellation: BridgeCancellation,
+    token: u64,
 }
 
 impl BridgeCancellation {
-    /// Close the active bridge stream, if any.
+    /// Latch cancellation and close every registered bridge stream.
     pub fn cancel(&self) {
         #[cfg(unix)]
-        if let Ok(mut stream) = self.stream.lock()
-            && let Some(stream) = stream.take()
         {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
+            let streams = {
+                let mut state = self.lock_state();
+                state.cancelled = true;
+                std::mem::take(&mut state.streams)
+            };
+            for stream in streams.into_values() {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
         }
     }
 
     #[cfg(unix)]
-    pub(crate) fn register(&self, stream: &UnixStream) -> Result<(), SftpError> {
+    pub(crate) fn register(&self, stream: &UnixStream) -> Result<BridgeRegistration, SftpError> {
         let stream = stream
             .try_clone()
             .map_err(|source| SftpError::io("clone bridge cancellation stream", source))?;
-        let previous = self
-            .stream
-            .lock()
-            .map_err(|_| {
-                SftpError::io(
-                    "lock bridge cancellation stream",
-                    io::Error::other("poisoned lock"),
-                )
-            })?
-            .replace(stream);
-        if let Some(previous) = previous {
-            let _ = previous.shutdown(std::net::Shutdown::Both);
+        let mut state = self.lock_state();
+        if state.cancelled {
+            drop(state);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return Err(SftpError::io(
+                "register bridge cancellation stream",
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "interactive bridge cancellation is already active",
+                ),
+            ));
         }
-        Ok(())
+        let token = state.next_token;
+        state.next_token = state.next_token.checked_add(1).ok_or_else(|| {
+            SftpError::io(
+                "register bridge cancellation stream",
+                io::Error::other("bridge registration token exhausted"),
+            )
+        })?;
+        let previous = state.streams.insert(token, stream);
+        debug_assert!(previous.is_none());
+        Ok(BridgeRegistration {
+            cancellation: self.clone(),
+            token,
+        })
     }
 
-    pub(crate) fn clear(&self) {
-        #[cfg(unix)]
-        if let Ok(mut stream) = self.stream.lock() {
-            let _ = stream.take();
+    #[cfg(unix)]
+    fn lock_state(&self) -> MutexGuard<'_, CancellationState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BridgeRegistration {
+    fn drop(&mut self) {
+        let _ = self.cancellation.lock_state().streams.remove(&self.token);
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct SocketIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+impl SocketIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
         }
     }
 }
@@ -83,6 +160,7 @@ impl BridgeCancellation {
 pub struct BridgeListener {
     listener: UnixListener,
     socket_path: std::path::PathBuf,
+    socket_identity: SocketIdentity,
 }
 
 #[cfg(unix)]
@@ -107,32 +185,69 @@ impl BridgeListener {
             let _ = fs::remove_file(socket_path);
             return Err(SftpError::io("set bridge socket permissions", source));
         }
+        let metadata = fs::symlink_metadata(socket_path)
+            .map_err(|source| SftpError::io("inspect bound bridge socket", source))?;
+        let socket_identity = SocketIdentity::from_metadata(&metadata);
+        listener
+            .set_nonblocking(true)
+            .map_err(|source| SftpError::io("configure bridge socket", source))?;
         Ok(Self {
             listener,
             socket_path: socket_path.to_path_buf(),
+            socket_identity,
         })
     }
 
     /// Accept the one viewer connection and remove the listener path immediately.
     ///
     /// The accepted stream remains usable after the path is removed, while a second bridge cannot
-    /// accidentally connect to this helper.
+    /// accidentally connect to this helper. If the viewer removes or replaces its private socket
+    /// path before connecting, returns `None` so the idle helper exits.
     ///
     /// # Errors
     ///
-    /// Returns an error if accepting the viewer stream fails.
-    pub fn accept(self) -> Result<UnixStream, SftpError> {
-        self.listener
-            .accept()
-            .map(|(stream, _)| stream)
-            .map_err(|source| SftpError::io("accept bridge connection", source))
+    /// Returns an error if accepting or inspecting the bridge socket fails.
+    pub fn accept(self) -> Result<Option<UnixStream>, SftpError> {
+        loop {
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .map_err(|source| SftpError::io("configure bridge stream", source))?;
+                    return Ok(Some(stream));
+                }
+                Err(source) if source.kind() == io::ErrorKind::Interrupted => {}
+                Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
+                    if !self.socket_path_is_current()? {
+                        return Ok(None);
+                    }
+                    thread::sleep(ACCEPT_POLL_INTERVAL);
+                }
+                Err(source) => return Err(SftpError::io("accept bridge connection", source)),
+            }
+        }
+    }
+
+    fn socket_path_is_current(&self) -> Result<bool, SftpError> {
+        match fs::symlink_metadata(&self.socket_path) {
+            Ok(metadata) => {
+                let identity = SocketIdentity::from_metadata(&metadata);
+                Ok(metadata.file_type().is_socket()
+                    && identity.device == self.socket_identity.device
+                    && identity.inode == self.socket_identity.inode)
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(SftpError::io("inspect bridge socket", source)),
+        }
     }
 }
 
 #[cfg(unix)]
 impl Drop for BridgeListener {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.socket_path);
+        if self.socket_path_is_current().unwrap_or(false) {
+            let _ = fs::remove_file(&self.socket_path);
+        }
     }
 }
 

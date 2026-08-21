@@ -137,6 +137,8 @@ impl SftpSession {
         if let Some(session) = Self::connect_bridge(profile, config, Some(cancellation))? {
             return Ok(session);
         }
+        #[cfg(not(unix))]
+        let _ = cancellation;
         Self::connect(profile, config)
     }
 
@@ -152,15 +154,10 @@ impl SftpSession {
         let Some(mut stream) = crate::connect_bridge_socket(control_path)? else {
             return Ok(None);
         };
-        if let Some(cancellation) = cancellation {
-            cancellation.register(&stream)?;
-        }
-        if let Err(error) = crate::authenticate_bridge_client(&mut stream, profile) {
-            if let Some(cancellation) = cancellation {
-                cancellation.clear();
-            }
-            return Err(error);
-        }
+        let registration = cancellation
+            .map(|cancellation| cancellation.register(&stream))
+            .transpose()?;
+        crate::authenticate_bridge_client(&mut stream, profile)?;
         let reader = stream
             .try_clone()
             .map_err(|source| SftpError::io("clone bridge socket", source))?;
@@ -168,7 +165,7 @@ impl SftpSession {
             transport: Transport::Unix {
                 reader: Some(reader),
                 writer: Some(stream),
-                cancellation: cancellation.cloned(),
+                registration,
             },
             next_request_id: Some(1),
         };
@@ -747,7 +744,7 @@ enum Transport {
     Unix {
         reader: Option<UnixStream>,
         writer: Option<UnixStream>,
-        cancellation: Option<crate::BridgeCancellation>,
+        registration: Option<crate::bridge::BridgeRegistration>,
     },
     #[cfg(test)]
     Test {
@@ -933,13 +930,11 @@ impl Transport {
             Self::Unix {
                 reader,
                 writer,
-                cancellation,
+                registration,
             } => {
                 drop(reader.take());
                 drop(writer.take());
-                if let Some(cancellation) = cancellation {
-                    cancellation.clear();
-                }
+                drop(registration.take());
             }
             #[cfg(test)]
             Self::Test { reader, writer } => {
