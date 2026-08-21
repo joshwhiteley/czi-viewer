@@ -359,6 +359,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "czi-ssh"
+version = "0.1.0"
+dependencies = [
+ "czi-core",
+]
+
+[[package]]
 name = "czi-viewer"
 version = "0.1.0"
 dependencies = [
