@@ -13,8 +13,12 @@ Dependencies normally require one of these licenses:
 - Zlib
 - Unicode-3.0
 - CC0-1.0
+- OFL-1.1
+- Ubuntu-font-1.0
 
 Other permissive licenses require explicit review. GPL, LGPL, AGPL, SSPL, and proprietary runtime dependencies are not allowed.
+
+The eframe `default_fonts` feature embeds font assets under OFL-1.1 and Ubuntu-font-1.0. These two font licenses are allowed only for those bundled assets.
 
 ## Review requirements
 

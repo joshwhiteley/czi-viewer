@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -191,24 +191,24 @@ fn worker_loop(commands: &Receiver<WorkerCommand>, events: &SyncSender<WorkerEve
                     Ok(opened) => {
                         let info = DatasetInfo::from_dataset(path, &opened);
                         dataset = Some(opened);
-                        if events
-                            .send(WorkerEvent::Opened {
+                        if !publish_event(
+                            events,
+                            WorkerEvent::Opened {
                                 info,
                                 source_generation,
-                            })
-                            .is_err()
-                        {
+                            },
+                        ) {
                             break;
                         }
                     }
                     Err(error) => {
-                        if events
-                            .send(WorkerEvent::OpenFailed {
+                        if !publish_event(
+                            events,
+                            WorkerEvent::OpenFailed {
                                 message: error.to_string(),
                                 source_generation,
-                            })
-                            .is_err()
-                        {
+                            },
+                        ) {
                             break;
                         }
                     }
@@ -234,12 +234,19 @@ fn worker_loop(commands: &Receiver<WorkerCommand>, events: &SyncSender<WorkerEve
                         plane_generation,
                     }
                 };
-                if events.send(event).is_err() {
+                if !publish_event(events, event) {
                     break;
                 }
             }
             WorkerCommand::Shutdown => break,
         }
+    }
+}
+
+fn publish_event(events: &SyncSender<WorkerEvent>, event: WorkerEvent) -> bool {
+    match events.try_send(event) {
+        Ok(()) | Err(TrySendError::Full(_)) => true,
+        Err(TrySendError::Disconnected(_)) => false,
     }
 }
 
@@ -328,6 +335,143 @@ impl Status {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Levels {
+    black: u16,
+    white: u16,
+}
+
+impl Levels {
+    fn for_tile(tile: &DecodedTile) -> Self {
+        let (minimum, maximum, full_range) = match &tile.pixels {
+            DecodedPixels::Gray8(values) => (
+                values.iter().copied().map(u16::from).min().unwrap_or(0),
+                values.iter().copied().map(u16::from).max().unwrap_or(0),
+                255,
+            ),
+            DecodedPixels::Gray16(values) => (
+                values.iter().copied().min().unwrap_or(0),
+                values.iter().copied().max().unwrap_or(0),
+                u16::MAX,
+            ),
+        };
+        if minimum == maximum {
+            Self {
+                black: 0,
+                white: full_range,
+            }
+        } else {
+            Self {
+                black: minimum,
+                white: maximum,
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Camera {
+    zoom: f32,
+    pan: egui::Vec2,
+}
+
+impl Default for Camera {
+    fn default() -> Self {
+        Self {
+            zoom: 1.0,
+            pan: egui::Vec2::ZERO,
+        }
+    }
+}
+
+impl Camera {
+    fn image_to_screen(
+        self,
+        image: egui::Pos2,
+        canvas: egui::Rect,
+        image_size: egui::Vec2,
+    ) -> egui::Pos2 {
+        canvas.center() + self.pan + (image.to_vec2() - image_size * 0.5) * self.zoom
+    }
+
+    fn screen_to_image(
+        self,
+        screen: egui::Pos2,
+        canvas: egui::Rect,
+        image_size: egui::Vec2,
+    ) -> egui::Pos2 {
+        let image = (screen - canvas.center() - self.pan) / self.zoom + image_size * 0.5;
+        egui::pos2(image.x, image.y)
+    }
+
+    fn zoom_at(
+        &mut self,
+        cursor: egui::Pos2,
+        factor: f32,
+        canvas: egui::Rect,
+        image_size: egui::Vec2,
+    ) {
+        let anchor = self.screen_to_image(cursor, canvas, image_size);
+        self.zoom = (self.zoom * factor).clamp(0.05, 64.0);
+        self.pan = cursor - canvas.center() - (anchor.to_vec2() - image_size * 0.5) * self.zoom;
+    }
+
+    fn fit(&mut self, canvas: egui::Rect, image_size: egui::Vec2) {
+        self.zoom = (canvas.width() / image_size.x)
+            .min(canvas.height() / image_size.y)
+            .clamp(0.05, 64.0);
+        self.pan = egui::Vec2::ZERO;
+    }
+
+    fn one_to_one(&mut self) {
+        *self = Self::default();
+    }
+}
+
+fn display_intensity(value: u16, levels: Levels) -> u8 {
+    if value <= levels.black {
+        return 0;
+    }
+    if value >= levels.white {
+        return u8::MAX;
+    }
+    let span = u32::from(levels.white - levels.black);
+    let scaled = u32::from(value - levels.black) * u32::from(u8::MAX) / span;
+    u8::try_from(scaled).expect("scaled grayscale intensity fits in u8")
+}
+
+fn texture_image(tile: &DecodedTile, levels: Levels) -> Result<egui::ColorImage, &'static str> {
+    let width = usize::try_from(tile.width).map_err(|_| "tile width does not fit usize")?;
+    let height = usize::try_from(tile.height).map_err(|_| "tile height does not fit usize")?;
+    let pixel_count = width
+        .checked_mul(height)
+        .ok_or("tile dimensions overflow display size")?;
+    let mut grayscale = Vec::new();
+    grayscale
+        .try_reserve_exact(pixel_count)
+        .map_err(|_| "cannot allocate display grayscale buffer")?;
+    match &tile.pixels {
+        DecodedPixels::Gray8(values) if values.len() == pixel_count => {
+            grayscale.extend(
+                values
+                    .iter()
+                    .copied()
+                    .map(|value| display_intensity(u16::from(value), levels)),
+            );
+        }
+        DecodedPixels::Gray16(values) if values.len() == pixel_count => {
+            grayscale.extend(
+                values
+                    .iter()
+                    .copied()
+                    .map(|value| display_intensity(value, levels)),
+            );
+        }
+        _ => return Err("decoded pixel count does not match the tile dimensions"),
+    }
+    Ok(egui::ColorImage::from_gray([width, height], &grayscale))
+}
+
 /// The first local, single-tile CZI viewer.
 pub struct ViewerApp {
     worker: DatasetWorker,
@@ -337,6 +481,11 @@ pub struct ViewerApp {
     generations: Generations,
     status: Status,
     tile: Option<DecodedTile>,
+    texture: Option<egui::TextureHandle>,
+    texture_dirty: bool,
+    levels: Levels,
+    camera: Camera,
+    fit_pending: bool,
 }
 
 impl ViewerApp {
@@ -351,6 +500,14 @@ impl ViewerApp {
             generations: Generations::default(),
             status: Status::normal("Enter a local .czi path or drop a file from Finder."),
             tile: None,
+            texture: None,
+            texture_dirty: false,
+            levels: Levels {
+                black: 0,
+                white: u16::MAX,
+            },
+            camera: Camera::default(),
+            fit_pending: false,
         }
     }
 
@@ -363,6 +520,9 @@ impl ViewerApp {
         let source_generation = self.generations.begin_source();
         self.dataset = None;
         self.tile = None;
+        self.texture = None;
+        self.texture_dirty = false;
+        self.fit_pending = false;
         self.status = Status::normal(format!("Opening {}…", path.display()));
         if let Err(error) = self.worker.send(WorkerCommand::Open {
             path,
@@ -378,6 +538,9 @@ impl ViewerApp {
         }
         let plane_generation = self.generations.begin_plane();
         self.tile = None;
+        self.texture = None;
+        self.texture_dirty = false;
+        self.fit_pending = false;
         self.status = Status::normal("Loading one matching tile…");
         if let Err(error) = self.worker.send(WorkerCommand::LoadTile {
             selection: self.selection,
@@ -435,7 +598,10 @@ impl ViewerApp {
                         "Loaded one {} × {} tile.",
                         tile.width, tile.height
                     ));
+                    self.levels = Levels::for_tile(&tile);
                     self.tile = Some(tile);
+                    self.texture_dirty = true;
+                    self.fit_pending = true;
                 }
                 Ok(WorkerEvent::TileFailed {
                     message,
@@ -452,6 +618,121 @@ impl ViewerApp {
             }
         }
     }
+
+    fn refresh_texture(&mut self, context: &egui::Context) {
+        if !self.texture_dirty {
+            return;
+        }
+        let Some(tile) = self.tile.as_ref() else {
+            return;
+        };
+        match texture_image(tile, self.levels) {
+            Ok(image) => {
+                if let Some(texture) = self.texture.as_mut() {
+                    texture.set(image, egui::TextureOptions::NEAREST);
+                } else {
+                    self.texture = Some(context.load_texture(
+                        "czi-selected-tile",
+                        image,
+                        egui::TextureOptions::NEAREST,
+                    ));
+                }
+                self.texture_dirty = false;
+            }
+            Err(error) => {
+                self.status = Status::error(error);
+                self.texture_dirty = false;
+            }
+        }
+    }
+
+    fn show_canvas(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("Fit").clicked() {
+                self.fit_pending = true;
+            }
+            if ui.button("1:1").clicked() {
+                self.camera.one_to_one();
+                self.fit_pending = false;
+            }
+            ui.weak("Wheel: zoom at cursor · Drag: pan · One stored tile only");
+        });
+        let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::drag());
+        painter.rect_filled(response.rect, 0.0, egui::Color32::from_gray(24));
+
+        let Some(tile) = self.tile.as_ref() else {
+            canvas_message(
+                &painter,
+                response.rect,
+                "A single selected tile will appear here.",
+            );
+            return;
+        };
+        let Some(texture) = self.texture.as_ref() else {
+            canvas_message(&painter, response.rect, "Preparing tile texture…");
+            return;
+        };
+        let Some(image_size) = display_tile_size(tile) else {
+            canvas_message(
+                &painter,
+                response.rect,
+                "Tile dimensions are not displayable.",
+            );
+            return;
+        };
+
+        if self.fit_pending {
+            self.camera.fit(response.rect, image_size);
+            self.fit_pending = false;
+        }
+        if response.hovered() {
+            if let Some(cursor) = ui.input(|input| input.pointer.hover_pos()) {
+                let scroll_y = ui.input(|input| input.raw_scroll_delta.y);
+                if scroll_y != 0.0 {
+                    self.camera.zoom_at(
+                        cursor,
+                        (scroll_y * 0.002).exp(),
+                        response.rect,
+                        image_size,
+                    );
+                }
+            }
+        }
+        if response.dragged() {
+            self.camera.pan += ui.input(|input| input.pointer.delta());
+        }
+
+        let image_rect = egui::Rect::from_min_max(
+            self.camera
+                .image_to_screen(egui::Pos2::ZERO, response.rect, image_size),
+            self.camera.image_to_screen(
+                egui::pos2(image_size.x, image_size.y),
+                response.rect,
+                image_size,
+            ),
+        );
+        painter.with_clip_rect(response.rect).image(
+            texture.id(),
+            image_rect,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn display_tile_size(tile: &DecodedTile) -> Option<egui::Vec2> {
+    (tile.width > 0 && tile.height > 0).then(|| egui::vec2(tile.width as f32, tile.height as f32))
+}
+
+fn canvas_message(painter: &egui::Painter, rect: egui::Rect, message: &str) {
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        message,
+        egui::FontId::proportional(16.0),
+        egui::Color32::LIGHT_GRAY,
+    );
 }
 
 impl eframe::App for ViewerApp {
@@ -504,6 +785,14 @@ impl eframe::App for ViewerApp {
                 }
 
                 ui.separator();
+                ui.heading("Display range");
+                if let Some(tile) = self.tile.as_ref()
+                    && level_selector(ui, tile, &mut self.levels)
+                {
+                    self.texture_dirty = true;
+                }
+
+                ui.separator();
                 ui.heading("Raw metadata preview");
                 egui::ScrollArea::vertical()
                     .max_height(260.0)
@@ -516,24 +805,11 @@ impl eframe::App for ViewerApp {
                     });
             });
 
+        self.refresh_texture(context);
         egui::CentralPanel::default().show(context, |ui| {
             ui.heading("Canvas");
             ui.separator();
-            match self.tile.as_ref() {
-                Some(DecodedTile {
-                    width,
-                    height,
-                    pixels: DecodedPixels::Gray8(_),
-                }) => ui.label(format!("Gray8 tile ready: {width} × {height}")),
-                Some(DecodedTile {
-                    width,
-                    height,
-                    pixels: DecodedPixels::Gray16(_),
-                }) => ui.label(format!("Gray16 tile ready: {width} × {height}")),
-                None => ui.label(
-                    "A single selected tile will appear here. Mosaic assembly is not available.",
-                ),
-            };
+            self.show_canvas(ui);
         });
 
         context.request_repaint_after(Duration::from_millis(100));
@@ -562,6 +838,24 @@ fn selection_selector(
             }
         });
     *selected != before
+}
+
+fn level_selector(ui: &mut egui::Ui, tile: &DecodedTile, levels: &mut Levels) -> bool {
+    let maximum = match &tile.pixels {
+        DecodedPixels::Gray8(_) => u16::from(u8::MAX),
+        DecodedPixels::Gray16(_) => u16::MAX,
+    };
+    let before = *levels;
+    ui.add(egui::Slider::new(&mut levels.black, 0..=maximum).text("Black"));
+    ui.add(egui::Slider::new(&mut levels.white, 0..=maximum).text("White"));
+    if levels.black >= levels.white {
+        if levels.black < maximum {
+            levels.white = levels.black + 1;
+        } else {
+            levels.black = levels.white.saturating_sub(1);
+        }
+    }
+    *levels != before
 }
 
 /// Run the macOS-native local viewer.
@@ -668,5 +962,38 @@ mod tests {
         let mut worker = DatasetWorker::spawn();
         worker.shutdown();
         assert!(worker.join.is_none());
+    }
+
+    #[test]
+    fn pixel_conversion_maps_black_and_white_endpoints() {
+        let levels = Levels {
+            black: 100,
+            white: 1_000,
+        };
+        assert_eq!(display_intensity(0, levels), 0);
+        assert_eq!(display_intensity(100, levels), 0);
+        assert_eq!(display_intensity(1_000, levels), u8::MAX);
+        assert_eq!(display_intensity(u16::MAX, levels), u8::MAX);
+    }
+
+    #[test]
+    fn camera_fit_transforms_and_cursor_zoom_are_stable() {
+        let canvas = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(200.0, 100.0));
+        let image_size = egui::vec2(100.0, 50.0);
+        let mut camera = Camera::default();
+        camera.fit(canvas, image_size);
+        assert!((camera.zoom - 2.0).abs() < f32::EPSILON);
+        assert_eq!(
+            camera.image_to_screen(egui::pos2(50.0, 25.0), canvas, image_size),
+            canvas.center()
+        );
+        let cursor = egui::pos2(150.0, 80.0);
+        let image_before = camera.screen_to_image(cursor, canvas, image_size);
+        camera.zoom_at(cursor, 1.5, canvas, image_size);
+        let image_after = camera.screen_to_image(cursor, canvas, image_size);
+        assert!((image_before.x - image_after.x).abs() < 0.001);
+        assert!((image_before.y - image_after.y).abs() < 0.001);
+        camera.one_to_one();
+        assert_eq!(camera, Camera::default());
     }
 }
