@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -82,12 +82,39 @@ impl DatasetInfo {
     }
 
     fn default_selection(&self) -> PlaneSelection {
-        PlaneSelection {
-            c: self.c.default_value(),
-            scene: self.s.default_value(),
-            z: self.z.default_value(),
-            t: self.t.default_value(),
+        self.planes.first().map_or_else(
+            || PlaneSelection {
+                c: self.c.default_value(),
+                scene: self.s.default_value(),
+                z: self.z.default_value(),
+                t: self.t.default_value(),
+            },
+            |plane| plane.key.into(),
+        )
+    }
+
+    fn repair_selection(&self, selection: PlaneSelection, changed: [bool; 4]) -> PlaneSelection {
+        if self.plane(selection).is_some() {
+            return selection;
         }
+        self.planes
+            .iter()
+            .find(|plane| {
+                (!changed[0] || plane.key.c == selection.c)
+                    && (!changed[1] || plane.key.scene == selection.scene)
+                    && (!changed[2] || plane.key.z == selection.z)
+                    && (!changed[3] || plane.key.t == selection.t)
+            })
+            .or_else(|| {
+                self.planes.iter().find(|plane| {
+                    (changed[0] && plane.key.c == selection.c)
+                        || (changed[1] && plane.key.scene == selection.scene)
+                        || (changed[2] && plane.key.z == selection.z)
+                        || (changed[3] && plane.key.t == selection.t)
+                })
+            })
+            .or_else(|| self.planes.first())
+            .map_or(selection, |plane| plane.key.into())
     }
 
     fn plane(&self, selection: PlaneSelection) -> Option<&PlaneInfo> {
@@ -192,7 +219,7 @@ struct DatasetWorker {
 impl DatasetWorker {
     fn spawn() -> Self {
         let (commands, command_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
-        let (event_tx, events) = mpsc::channel();
+        let (event_tx, events) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let join = thread::Builder::new()
             .name(String::from("czi-dataset-worker"))
             .spawn(move || worker_loop(&command_rx, &event_tx))
@@ -214,7 +241,14 @@ impl DatasetWorker {
         if self.join.is_none() {
             return;
         }
-        let _ = self.commands.send(WorkerCommand::Shutdown);
+        let mut sent = self.commands.try_send(WorkerCommand::Shutdown).is_ok();
+        while self.events.try_recv().is_ok() {}
+        if !sent {
+            sent = self.commands.send(WorkerCommand::Shutdown).is_ok();
+        }
+        if sent {
+            while self.events.try_recv().is_ok() {}
+        }
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -227,7 +261,7 @@ impl Drop for DatasetWorker {
     }
 }
 
-fn worker_loop(commands: &Receiver<WorkerCommand>, events: &Sender<WorkerEvent>) {
+fn worker_loop(commands: &Receiver<WorkerCommand>, events: &SyncSender<WorkerEvent>) {
     let mut dataset = None;
     let mut active_source_generation = 0;
     let mut pending_command = None;
@@ -246,19 +280,19 @@ fn worker_loop(commands: &Receiver<WorkerCommand>, events: &Sender<WorkerEvent>)
             } => {
                 active_source_generation = source_generation;
                 dataset = None;
-                let result = LocalFileSource::open(&path)
+                let result = match LocalFileSource::open(&path)
                     .map_err(czi_core::CziError::from)
                     .and_then(CziDataset::open)
-                    .and_then(|opened| {
-                        let query = TileQueryIndex::new(opened.index()).map_err(|error| {
-                            czi_core::CziError::Missing {
-                                what: "query geometry",
-                                offset: u64::try_from(error.to_string().len()).unwrap_or(u64::MAX),
-                            }
-                        })?;
-                        let info = DatasetInfo::from_dataset(path, &opened, &query);
-                        Ok((opened, query, info))
-                    });
+                {
+                    Err(error) => Err(error.to_string()),
+                    Ok(opened) => match TileQueryIndex::new(opened.index()) {
+                        Err(error) => Err(error.to_string()),
+                        Ok(query) => {
+                            let info = DatasetInfo::from_dataset(path, &opened, &query);
+                            Ok((opened, query, info))
+                        }
+                    },
+                };
                 match result {
                     Ok((opened, query, info)) => {
                         dataset = Some(WorkerDataset {
@@ -278,7 +312,7 @@ fn worker_loop(commands: &Receiver<WorkerCommand>, events: &Sender<WorkerEvent>)
                     Err(error) => {
                         if events
                             .send(WorkerEvent::OpenFailed {
-                                message: error.to_string(),
+                                message: error.clone(),
                                 source_generation,
                             })
                             .is_err()
@@ -318,12 +352,28 @@ fn worker_loop(commands: &Receiver<WorkerCommand>, events: &Sender<WorkerEvent>)
     }
 }
 
+fn take_newer_command(commands: &Receiver<WorkerCommand>) -> Option<WorkerCommand> {
+    let mut latest_view = None;
+    loop {
+        match commands.try_recv() {
+            Ok(WorkerCommand::View(request)) => latest_view = Some(WorkerCommand::View(request)),
+            Ok(command @ (WorkerCommand::Open { .. } | WorkerCommand::Shutdown)) => {
+                return Some(command);
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => return latest_view,
+        }
+    }
+}
+
 fn process_view(
     commands: &Receiver<WorkerCommand>,
-    events: &Sender<WorkerEvent>,
+    events: &SyncSender<WorkerEvent>,
     opened: &WorkerDataset,
     request: &ViewRequest,
 ) -> Option<WorkerCommand> {
+    if let Some(newer) = take_newer_command(commands) {
+        return Some(newer);
+    }
     let query = match ViewQuery::new(request.plane, request.viewport, request.target_downsample)
         .map_err(|error| error.to_string())
         .and_then(|view| opened.query.query(&view).map_err(|error| error.to_string()))
@@ -371,10 +421,8 @@ fn process_view(
         if events.send(event).is_err() {
             return None;
         }
-        match commands.try_recv() {
-            Ok(newer) => return Some(newer),
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => return None,
+        if let Some(newer) = take_newer_command(commands) {
+            return Some(newer);
         }
     }
     let _ = events.send(WorkerEvent::ViewFinished {
@@ -491,34 +539,36 @@ impl Default for Camera {
 }
 
 impl Camera {
-    #[allow(clippy::cast_precision_loss)]
-    fn world_center(bounds: SpatialRect) -> egui::Pos2 {
-        egui::pos2(
-            ((bounds.min_x as f64 + bounds.max_x as f64) * 0.5) as f32,
-            ((bounds.min_y as f64 + bounds.max_y as f64) * 0.5) as f32,
+    fn world_center(bounds: SpatialRect) -> (f64, f64) {
+        (
+            (bounds.min_x as f64 + bounds.max_x as f64) * 0.5,
+            (bounds.min_y as f64 + bounds.max_y as f64) * 0.5,
         )
     }
 
-    #[allow(clippy::cast_precision_loss)]
-    fn world_to_screen(
+    fn world_to_screen_xy(
         self,
-        world: egui::Pos2,
+        world: (f64, f64),
         canvas: egui::Rect,
         bounds: SpatialRect,
     ) -> egui::Pos2 {
-        let center = Self::world_center(bounds);
-        canvas.center() + self.pan + (world - center) * self.zoom as f32
+        let (center_x, center_y) = Self::world_center(bounds);
+        let delta_x = ((world.0 - center_x) * self.zoom) as f32;
+        let delta_y = ((world.1 - center_y) * self.zoom) as f32;
+        canvas.center() + self.pan + egui::vec2(delta_x, delta_y)
     }
 
-    fn screen_to_world(
+    fn screen_to_world_xy(
         self,
         screen: egui::Pos2,
         canvas: egui::Rect,
         bounds: SpatialRect,
-    ) -> egui::Pos2 {
-        let center = Self::world_center(bounds);
-        let world = (screen - canvas.center() - self.pan) / self.zoom as f32 + center.to_vec2();
-        egui::pos2(world.x, world.y)
+    ) -> (f64, f64) {
+        let (center_x, center_y) = Self::world_center(bounds);
+        (
+            center_x + f64::from(screen.x - canvas.center().x - self.pan.x) / self.zoom,
+            center_y + f64::from(screen.y - canvas.center().y - self.pan.y) / self.zoom,
+        )
     }
 
     fn zoom_at(
@@ -528,10 +578,13 @@ impl Camera {
         canvas: egui::Rect,
         bounds: SpatialRect,
     ) {
-        let anchor = self.screen_to_world(cursor, canvas, bounds);
+        let anchor = self.screen_to_world_xy(cursor, canvas, bounds);
         self.zoom = (self.zoom * factor).clamp(0.000_001, 1_000_000.0);
-        let center = Self::world_center(bounds);
-        self.pan = cursor - canvas.center() - (anchor - center) * self.zoom as f32;
+        let (center_x, center_y) = Self::world_center(bounds);
+        self.pan = egui::vec2(
+            cursor.x - canvas.center().x - ((anchor.0 - center_x) * self.zoom) as f32,
+            cursor.y - canvas.center().y - ((anchor.1 - center_y) * self.zoom) as f32,
+        );
     }
 
     fn fit(&mut self, canvas: egui::Rect, bounds: SpatialRect) {
@@ -547,14 +600,13 @@ impl Camera {
         *self = Self::default();
     }
 
-    #[allow(clippy::cast_precision_loss)]
     fn viewport(self, canvas: egui::Rect, bounds: SpatialRect) -> Option<SpatialRect> {
-        let minimum = self.screen_to_world(canvas.min, canvas, bounds);
-        let maximum = self.screen_to_world(canvas.max, canvas, bounds);
-        let min_x = floor_i64(minimum.x as f64)?;
-        let min_y = floor_i64(minimum.y as f64)?;
-        let max_x = ceil_i64(maximum.x as f64)?;
-        let max_y = ceil_i64(maximum.y as f64)?;
+        let minimum = self.screen_to_world_xy(canvas.min, canvas, bounds);
+        let maximum = self.screen_to_world_xy(canvas.max, canvas, bounds);
+        let min_x = floor_i64(minimum.0)?;
+        let min_y = floor_i64(minimum.1)?;
+        let max_x = ceil_i64(maximum.0)?;
+        let max_y = ceil_i64(maximum.1)?;
         SpatialRect::new(min_x, min_y, max_x.max(min_x), max_y.max(min_y)).ok()
     }
 }
@@ -637,6 +689,7 @@ struct TextureEntry {
 
 struct TextureCache {
     entries: HashMap<TextureKey, TextureEntry>,
+    protected: HashSet<TextureKey>,
     bytes: usize,
     clock: u64,
     budget: usize,
@@ -646,6 +699,7 @@ impl TextureCache {
     fn new(budget: usize) -> Self {
         Self {
             entries: HashMap::new(),
+            protected: HashSet::new(),
             bytes: 0,
             clock: 0,
             budget,
@@ -654,6 +708,7 @@ impl TextureCache {
 
     fn clear(&mut self) {
         self.entries.clear();
+        self.protected.clear();
         self.bytes = 0;
     }
 
@@ -661,15 +716,22 @@ impl TextureCache {
         for entry in self.entries.values_mut() {
             entry.visible = false;
         }
+        self.protected.clear();
         self.evict_non_visible();
     }
 
-    fn resident_tile_ids(&self, source_generation: u64, plane: PlaneKey) -> Vec<TileId> {
-        self.entries
+    fn begin_view(&mut self, source_generation: u64, plane: PlaneKey) -> Vec<TileId> {
+        self.protected = self
+            .entries
             .keys()
             .filter(|key| key.source_generation == source_generation && key.plane == plane)
-            .map(|key| key.tile_id)
-            .collect()
+            .copied()
+            .collect();
+        for entry in self.entries.values_mut() {
+            entry.visible = false;
+        }
+        self.evict_non_visible();
+        self.protected.iter().map(|key| key.tile_id).collect()
     }
 
     fn insert(
@@ -699,6 +761,7 @@ impl TextureCache {
     }
 
     fn finish_view(&mut self, source_generation: u64, plane: PlaneKey, visible: &[TileId]) {
+        self.protected.clear();
         let visible = visible.iter().copied().collect::<HashSet<_>>();
         for (key, entry) in &mut self.entries {
             entry.visible = key.source_generation == source_generation
@@ -713,7 +776,7 @@ impl TextureCache {
             let candidate = self
                 .entries
                 .iter()
-                .filter(|(_, entry)| !entry.visible)
+                .filter(|(key, entry)| !entry.visible && !self.protected.contains(key))
                 .min_by_key(|(_, entry)| entry.last_used)
                 .map(|(key, _)| *key);
             let Some(key) = candidate else {
@@ -732,18 +795,20 @@ impl TextureCache {
         }
     }
 
-    fn current_counts(&self, source_generation: u64, plane: PlaneKey) -> (usize, usize) {
+    fn current_counts(&self, source_generation: u64, plane: PlaneKey) -> (usize, usize, usize) {
         let entries = self
             .entries
             .iter()
             .filter(|(key, _)| key.source_generation == source_generation && key.plane == plane);
         let mut resident = 0;
         let mut visible = 0;
+        let mut bytes: usize = 0;
         for (_, entry) in entries {
             resident += 1;
             visible += usize::from(entry.visible);
+            bytes = bytes.saturating_add(entry.bytes);
         }
-        (visible, resident)
+        (visible, resident, bytes)
     }
 }
 
@@ -774,6 +839,7 @@ pub struct ViewerApp {
     camera: Camera,
     fit_pending: bool,
     last_request: Option<(PlaneKey, SpatialRect, u64)>,
+    pending_open: Option<(PathBuf, u64)>,
 }
 
 impl ViewerApp {
@@ -798,6 +864,7 @@ impl ViewerApp {
             camera: Camera::default(),
             fit_pending: false,
             last_request: None,
+            pending_open: None,
         };
         if initial_path.is_some() {
             app.open_current_path();
@@ -828,10 +895,27 @@ impl ViewerApp {
         self.last_request = None;
         self.fit_pending = false;
         self.status = Status::normal(format!("Opening {}…", path.display()));
+        let pending = (path.clone(), source_generation);
         if let Err(error) = self.worker.send(WorkerCommand::Open {
             path,
             source_generation,
         }) {
+            self.pending_open = Some(pending);
+            self.status = Status::error(error);
+        } else {
+            self.pending_open = None;
+        }
+    }
+
+    fn retry_pending_open(&mut self) {
+        let Some((path, source_generation)) = self.pending_open.take() else {
+            return;
+        };
+        if let Err(error) = self.worker.send(WorkerCommand::Open {
+            path: path.clone(),
+            source_generation,
+        }) {
+            self.pending_open = Some((path, source_generation));
             self.status = Status::error(error);
         }
     }
@@ -847,10 +931,7 @@ impl ViewerApp {
             return;
         }
         let view_generation = self.generations.begin_view();
-        self.cache.clear_visibility();
-        let resident_tile_ids = self
-            .cache
-            .resident_tile_ids(self.generations.source, plane.key());
+        let resident_tile_ids = self.cache.begin_view(self.generations.source, plane.key());
         let request = ViewRequest {
             source_generation: self.generations.source,
             view_generation,
@@ -925,6 +1006,9 @@ impl ViewerApp {
                     .accepts_view(source_generation, view_generation)
                     && plane == self.selection.key() =>
                 {
+                    if !self.visible_tile_ids.contains(&tile_id) {
+                        self.visible_tile_ids.push(tile_id);
+                    }
                     self.pending_tiles.push(PendingTile {
                         tile_id,
                         plane,
@@ -951,12 +1035,14 @@ impl ViewerApp {
                     self.visible_tile_ids = visible_tile_ids;
                     self.cache
                         .finish_view(source_generation, plane, &self.visible_tile_ids);
-                    let (visible, resident) = self.cache.current_counts(source_generation, plane);
+                    let (visible, resident, bytes) =
+                        self.cache.current_counts(source_generation, plane);
                     self.status = Status::normal(format!(
-                        "Scale {}× · {} visible · {} resident",
+                        "Scale {}× · {} visible · {} resident · {} cache",
                         format_scale(scale),
                         visible,
-                        resident
+                        resident,
+                        format_bytes(bytes)
                     ));
                 }
                 Ok(WorkerEvent::ViewFailed {
@@ -1109,17 +1195,23 @@ impl ViewerApp {
         visible.sort_unstable_by_key(|(paint_order, _)| *paint_order);
         let has_visible = !visible.is_empty();
         for (_, entry) in &visible {
-            let min = egui::pos2(
-                entry.logical_rect.min_x as f32,
-                entry.logical_rect.min_y as f32,
-            );
-            let max = egui::pos2(
-                entry.logical_rect.max_x as f32,
-                entry.logical_rect.max_y as f32,
-            );
             let image_rect = egui::Rect::from_min_max(
-                self.camera.world_to_screen(min, response.rect, bounds),
-                self.camera.world_to_screen(max, response.rect, bounds),
+                self.camera.world_to_screen_xy(
+                    (
+                        entry.logical_rect.min_x as f64,
+                        entry.logical_rect.min_y as f64,
+                    ),
+                    response.rect,
+                    bounds,
+                ),
+                self.camera.world_to_screen_xy(
+                    (
+                        entry.logical_rect.max_x as f64,
+                        entry.logical_rect.max_y as f64,
+                    ),
+                    response.rect,
+                    bounds,
+                ),
             );
             painter.with_clip_rect(response.rect).image(
                 entry.texture.id(),
@@ -1131,6 +1223,16 @@ impl ViewerApp {
         if !has_visible {
             canvas_message(&painter, response.rect, "Loading visible tiles…");
         }
+    }
+}
+
+fn format_bytes(bytes: usize) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -1160,9 +1262,11 @@ fn canvas_message(painter: &egui::Painter, rect: egui::Rect, message: &str) {
 }
 
 impl eframe::App for ViewerApp {
+    #[allow(clippy::too_many_lines)]
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_dropped_files(context);
         self.handle_worker_events();
+        self.retry_pending_open();
 
         egui::TopBottomPanel::top("open_bar").show(context, |ui| {
             ui.horizontal(|ui| {
@@ -1192,6 +1296,7 @@ impl eframe::App for ViewerApp {
             .default_width(300.0)
             .show(context, |ui| {
                 ui.heading("Dataset");
+                let before_selection = self.selection;
                 let selection_changed = if let Some(dataset) = self.dataset.as_ref() {
                     ui.label(dataset.path.display().to_string());
                     ui.label(format!("{} indexed tile(s)", dataset.tile_count));
@@ -1205,6 +1310,15 @@ impl eframe::App for ViewerApp {
                     false
                 };
                 if selection_changed {
+                    let changed = [
+                        before_selection.c != self.selection.c,
+                        before_selection.scene != self.selection.scene,
+                        before_selection.z != self.selection.z,
+                        before_selection.t != self.selection.t,
+                    ];
+                    if let Some(dataset) = self.dataset.as_ref() {
+                        self.selection = dataset.repair_selection(self.selection, changed);
+                    }
                     self.cache.clear();
                     self.invalidate_view();
                     self.fit_pending = true;
@@ -1224,10 +1338,13 @@ impl eframe::App for ViewerApp {
                     ui.label(format!("Selected pyramid scale: {}×", format_scale(scale)));
                 }
                 if let Some(dataset) = self.dataset.as_ref() {
-                    let (visible, resident) = self
+                    let (visible, resident, bytes) = self
                         .cache
                         .current_counts(self.generations.source, self.selection.key());
-                    ui.label(format!("Visible: {visible} · Resident: {resident}"));
+                    ui.label(format!(
+                        "Visible: {visible} · Resident: {resident} · Cache: {}",
+                        format_bytes(bytes)
+                    ));
                     if let Some(plane) = dataset.plane(self.selection) {
                         ui.label(format!(
                             "World bounds: [{}, {})..[{}, {})",
@@ -1433,16 +1550,17 @@ mod tests {
         let mut camera = Camera::default();
         camera.fit(canvas, bounds);
         let world = egui::pos2(-37.0, 21.0);
-        let screen = camera.world_to_screen(world, canvas, bounds);
-        let round_trip = camera.screen_to_world(screen, canvas, bounds);
-        assert!((round_trip.x - world.x).abs() < 0.001);
-        assert!((round_trip.y - world.y).abs() < 0.001);
+        let screen =
+            camera.world_to_screen_xy((f64::from(world.x), f64::from(world.y)), canvas, bounds);
+        let (round_trip_x, round_trip_y) = camera.screen_to_world_xy(screen, canvas, bounds);
+        assert!((round_trip_x - f64::from(world.x)).abs() < 0.001);
+        assert!((round_trip_y - f64::from(world.y)).abs() < 0.001);
         let cursor = egui::pos2(150.0, 80.0);
-        let before = camera.screen_to_world(cursor, canvas, bounds);
+        let before = camera.screen_to_world_xy(cursor, canvas, bounds);
         camera.zoom_at(cursor, 1.5, canvas, bounds);
-        let after = camera.screen_to_world(cursor, canvas, bounds);
-        assert!((before.x - after.x).abs() < 0.001);
-        assert!((before.y - after.y).abs() < 0.001);
+        let after = camera.screen_to_world_xy(cursor, canvas, bounds);
+        assert!((before.0 - after.0).abs() < 0.001);
+        assert!((before.1 - after.1).abs() < 0.001);
         camera.one_to_one();
         assert_eq!(camera, Camera::default());
     }

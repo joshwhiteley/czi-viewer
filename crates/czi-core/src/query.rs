@@ -8,6 +8,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::ops::Deref;
 
 use thiserror::Error;
 
@@ -212,14 +213,14 @@ impl SpatialRect {
 
     /// Return the width when it fits in an unsigned 64-bit value.
     #[must_use]
-    pub const fn width(self) -> u64 {
-        (self.max_x - self.min_x).unsigned_abs()
+    pub fn width(self) -> u64 {
+        u64::try_from(i128::from(self.max_x) - i128::from(self.min_x)).unwrap_or(u64::MAX)
     }
 
     /// Return the height when it fits in an unsigned 64-bit value.
     #[must_use]
-    pub const fn height(self) -> u64 {
-        (self.max_y - self.min_y).unsigned_abs()
+    pub fn height(self) -> u64 {
+        u64::try_from(i128::from(self.max_y) - i128::from(self.min_y)).unwrap_or(u64::MAX)
     }
 }
 
@@ -333,6 +334,14 @@ pub struct TileHit {
     pub paint_order: usize,
 }
 
+impl TileHit {
+    /// Return the physical stored X/Y dimensions.
+    #[must_use]
+    pub const fn stored_size(self) -> PhysicalSize {
+        self.physical_stored_size
+    }
+}
+
 /// A viewport request for one exact plane and one target downsample.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewQuery {
@@ -378,6 +387,49 @@ impl ViewQueryResult {
     #[must_use]
     pub fn hits(&self) -> &[TileHit] {
         &self.hits
+    }
+
+    /// Return the number of visible tile hits.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.hits.len()
+    }
+
+    /// Return whether no tiles intersect the viewport.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.hits.is_empty()
+    }
+
+    /// Iterate over visible tile hits.
+    pub fn iter(&self) -> std::slice::Iter<'_, TileHit> {
+        self.hits.iter()
+    }
+}
+
+impl Deref for ViewQueryResult {
+    type Target = [TileHit];
+
+    fn deref(&self) -> &Self::Target {
+        &self.hits
+    }
+}
+
+impl IntoIterator for ViewQueryResult {
+    type Item = TileHit;
+    type IntoIter = std::vec::IntoIter<TileHit>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.hits.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a ViewQueryResult {
+    type Item = &'a TileHit;
+    type IntoIter = std::slice::Iter<'a, TileHit>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.hits.iter()
     }
 }
 
@@ -509,6 +561,11 @@ impl fmt::Display for PlaneSelector {
 }
 
 impl TileQueryIndex {
+    /// Build an immutable geometry index. This is an alias for [`Self::new`].
+    pub fn build(index: &DatasetIndex) -> Result<Self, TileQueryError> {
+        Self::new(index)
+    }
+
     /// Return the number of geometry-indexed tiles.
     #[must_use]
     pub fn tile_count(&self) -> usize {
@@ -663,6 +720,11 @@ impl TileQueryIndex {
     /// Alias for [`Self::query`] with a name that makes viewport filtering explicit.
     pub fn query_viewport(&self, query: &ViewQuery) -> Result<ViewQueryResult, TileQueryError> {
         self.query(query)
+    }
+
+    /// Return only the visible hits for a viewport query.
+    pub fn query_hits(&self, query: &ViewQuery) -> Result<Vec<TileHit>, TileQueryError> {
+        Ok(self.query(query)?.hits)
     }
 
     /// Return the level that would be selected for a target downsample.
@@ -883,11 +945,35 @@ mod tests {
     }
 
     #[test]
+    fn noncanonical_dimension_order_is_modeled_by_dimension_code() {
+        let dimensions = vec![
+            dimension(DimensionCode::M, 8, 1, 1),
+            dimension(DimensionCode::T, 6, 1, 1),
+            dimension(DimensionCode::Y, -20, 40, 20),
+            dimension(DimensionCode::C, 2, 1, 1),
+            dimension(DimensionCode::X, -30, 60, 30),
+            dimension(DimensionCode::S, 4, 1, 1),
+            dimension(DimensionCode::Z, -3, 1, 1),
+        ];
+        let query = TileQueryIndex::new(&index(vec![tile(dimensions, PyramidType::None)]))
+            .expect("geometry index");
+        let plane = PlaneSelector::new(2, SceneId::Explicit(4), -3, 6);
+        let info = query.plane(plane).expect("plane");
+        assert_eq!(
+            info.world_bounds,
+            SpatialRect::new(-30, -20, 30, 20).unwrap()
+        );
+        assert_eq!(info.scales, vec![PyramidScale::new(2, 1).unwrap()]);
+    }
+
+    #[test]
     fn negative_coordinates_and_half_open_intersections_are_checked() {
         let rect = SpatialRect::from_start_size(-10, -4, 10, 4).expect("rect");
         assert!(rect.intersects(SpatialRect::new(-1, -1, 1, 1).expect("rect")));
         assert!(!rect.intersects(SpatialRect::new(0, 0, 2, 2).expect("rect")));
         assert!(SpatialRect::new(1, 0, 0, 1).is_err());
+        let extreme = SpatialRect::new(i64::MIN, i64::MIN, i64::MAX, i64::MAX).unwrap();
+        assert_eq!(extreme.width(), u64::MAX);
         assert!(SpatialRect::from_start_size(i64::MAX, 0, 1, 1).is_err());
     }
 
