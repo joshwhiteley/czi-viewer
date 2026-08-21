@@ -208,6 +208,7 @@ fn validates_profiles_and_locations() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn command_builders_keep_paths_out_of_argv_and_preserve_host_checks() {
     let base = std::env::temp_dir().join(format!("czi-ssh-test-{}", std::process::id()));
     std::fs::create_dir_all(&base).unwrap();
@@ -240,7 +241,23 @@ fn command_builders_keep_paths_out_of_argv_and_preserve_host_checks() {
     );
     assert!(
         argv.windows(2)
-            .any(|pair| pair == ["-o", "StrictHostKeyChecking=ask"])
+            .any(|pair| pair == ["-o", "StrictHostKeyChecking=yes"])
+    );
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair == ["-o", "ConnectTimeout=15"])
+    );
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair == ["-o", "ServerAliveInterval=30"])
+    );
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair == ["-o", "ServerAliveCountMax=3"])
+    );
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair == ["-o", "NumberOfPasswordPrompts=0"])
     );
     assert!(
         argv.windows(2)
@@ -276,9 +293,46 @@ fn command_builders_keep_paths_out_of_argv_and_preserve_host_checks() {
             .windows(2)
             .any(|pair| pair == [OsString::from("-o"), OsString::from("BatchMode=yes")])
     );
+    assert!(master.windows(2).any(|pair| {
+        pair == [
+            OsString::from("-o"),
+            OsString::from("StrictHostKeyChecking=yes"),
+        ]
+    }));
+    assert!(
+        master
+            .windows(2)
+            .any(|pair| { pair == [OsString::from("-o"), OsString::from("ConnectTimeout=15")] })
+    );
+    assert!(master.windows(2).any(|pair| {
+        pair == [
+            OsString::from("-o"),
+            OsString::from("ServerAliveInterval=30"),
+        ]
+    }));
+    assert!(master.windows(2).any(|pair| {
+        pair == [
+            OsString::from("-o"),
+            OsString::from("ServerAliveCountMax=3"),
+        ]
+    }));
+    assert!(master.windows(2).any(|pair| {
+        pair == [
+            OsString::from("-o"),
+            OsString::from("NumberOfPasswordPrompts=0"),
+        ]
+    }));
+    assert!(!master.iter().any(|argument| {
+        let argument = argument.to_string_lossy();
+        argument.contains("HostKeyChecking=no")
+            || argument.contains("HostKeyChecking=accept-new")
+            || argument.starts_with("UserKnownHostsFile=")
+            || argument.starts_with("GlobalKnownHostsFile=")
+    }));
     let terminal = config.terminal_bootstrap_command(&destination).unwrap();
     assert!(terminal.contains("'BatchMode=no'"));
     assert!(terminal.contains("'StrictHostKeyChecking=ask'"));
+    assert!(!terminal.contains("'NumberOfPasswordPrompts=0'"));
     assert!(terminal.contains("'\"'\"'"));
     assert!(!terminal.contains(remote.as_str()));
     assert!(!terminal.contains("HostKeyChecking=no"));

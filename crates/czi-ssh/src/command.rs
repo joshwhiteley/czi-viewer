@@ -156,9 +156,10 @@ impl OpenSshConfig {
 
     /// Build the production `/usr/bin/ssh` argument vector for an SFTP subsystem child.
     ///
-    /// This always uses `BatchMode=yes`, disables agent and forwarding features, requests no TTY,
-    /// and passes only the destination and `sftp` subsystem after the SSH options. Remote paths
-    /// belong in SFTP packets and cannot enter this vector.
+    /// This always uses `BatchMode=yes`, strict known-host verification, bounded connection
+    /// settings, disables agent and forwarding features, requests no TTY, and passes only the
+    /// destination and `sftp` subsystem after the SSH options. Remote paths belong in SFTP
+    /// packets and cannot enter this vector.
     #[must_use]
     pub fn sftp_argv(&self, profile: &SshProfile) -> Vec<OsString> {
         let mut argv = common_argv(true);
@@ -172,8 +173,9 @@ impl OpenSshConfig {
 
     /// Build a noninteractive foreground OpenSSH master command argument vector.
     ///
-    /// The command uses `BatchMode=yes`; callers can launch it directly and retain its child
-    /// process. A configured private control path is required.
+    /// The command uses `BatchMode=yes`, strict known-host verification, and bounded connection
+    /// settings; callers can launch it directly and retain its child process. A configured
+    /// private control path is required.
     ///
     /// # Errors
     ///
@@ -247,7 +249,20 @@ fn common_argv(batch_mode: bool) -> Vec<OsString> {
     push_option(&mut argv, "ForwardX11=no");
     push_option(&mut argv, "ClearAllForwardings=yes");
     push_option(&mut argv, "PermitLocalCommand=no");
-    push_option(&mut argv, "StrictHostKeyChecking=ask");
+    push_option(
+        &mut argv,
+        if batch_mode {
+            "StrictHostKeyChecking=yes"
+        } else {
+            "StrictHostKeyChecking=ask"
+        },
+    );
+    if batch_mode {
+        push_option(&mut argv, "ConnectTimeout=15");
+        push_option(&mut argv, "ServerAliveInterval=30");
+        push_option(&mut argv, "ServerAliveCountMax=3");
+        push_option(&mut argv, "NumberOfPasswordPrompts=0");
+    }
     argv
 }
 
