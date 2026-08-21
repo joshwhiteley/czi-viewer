@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
@@ -8,6 +7,11 @@ use czi_core::{RandomAccessSource, SourceError};
 
 #[cfg(unix)]
 use crate::command::SOCKET_PATH_LIMIT;
+#[cfg(unix)]
+use crate::{
+    BridgeCancellation, BridgeListener, authenticate_bridge_client, authenticate_bridge_server,
+    connect_bridge_socket,
+};
 use crate::{
     ControlPath, OPENSSH_PATH, OpenSshConfig, OpenSshConfigError, SftpError, SftpLocation,
     SftpLocationError, SftpProtocolError, SftpSession, SftpSource, SshProfile, SshProfileError,
@@ -264,10 +268,6 @@ fn command_builders_keep_paths_out_of_argv_and_preserve_host_checks() {
         argv.windows(2)
             .any(|pair| pair == ["-o", "NumberOfPasswordPrompts=0"])
     );
-    assert!(
-        argv.windows(2)
-            .any(|pair| pair == ["-o", "ControlPersist=no"])
-    );
     assert!(argv.windows(2).any(|pair| pair == ["-T", "-s"]));
     assert_eq!(argv.last(), Some(&"sftp".to_owned()));
     assert!(!argv.iter().any(|argument| argument == remote.as_str()));
@@ -291,58 +291,54 @@ fn command_builders_keep_paths_out_of_argv_and_preserve_host_checks() {
             .iter()
             .any(|argument| argument.starts_with("GlobalKnownHostsFile="))
     );
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair == ["-o", "ControlMaster=no"])
+    );
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair == ["-o", "ControlPath=none"])
+    );
 
-    let master = config.noninteractive_master_argv(&destination).unwrap();
+    let interactive = OpenSshConfig::interactive_sftp_argv(&destination)
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
     assert!(
-        master
+        interactive
             .windows(2)
-            .any(|pair| pair == [OsString::from("-o"), OsString::from("BatchMode=yes")])
+            .any(|pair| pair == ["-o", "BatchMode=no"])
     );
-    assert!(master.windows(2).any(|pair| {
-        pair == [
-            OsString::from("-o"),
-            OsString::from("StrictHostKeyChecking=yes"),
-        ]
-    }));
     assert!(
-        master
+        interactive
             .windows(2)
-            .any(|pair| { pair == [OsString::from("-o"), OsString::from("ConnectTimeout=15")] })
+            .any(|pair| pair == ["-o", "StrictHostKeyChecking=ask"])
     );
-    assert!(master.windows(2).any(|pair| {
-        pair == [
-            OsString::from("-o"),
-            OsString::from("ServerAliveInterval=30"),
-        ]
-    }));
-    assert!(master.windows(2).any(|pair| {
-        pair == [
-            OsString::from("-o"),
-            OsString::from("ServerAliveCountMax=3"),
-        ]
-    }));
-    assert!(master.windows(2).any(|pair| {
-        pair == [
-            OsString::from("-o"),
-            OsString::from("NumberOfPasswordPrompts=0"),
-        ]
-    }));
-    assert!(!master.iter().any(|argument| {
-        let argument = argument.to_string_lossy();
-        argument.contains("HostKeyChecking=no")
-            || argument.contains("HostKeyChecking=accept-new")
-            || argument.starts_with("UserKnownHostsFile=")
-            || argument.starts_with("GlobalKnownHostsFile=")
-    }));
-    let terminal = config.terminal_bootstrap_command(&destination).unwrap();
-    assert!(terminal.contains("'BatchMode=no'"));
-    assert!(terminal.contains("'StrictHostKeyChecking=ask'"));
-    assert!(!terminal.contains("'NumberOfPasswordPrompts=0'"));
-    assert!(terminal.contains("'\"'\"'"));
-    assert!(!terminal.contains(remote.as_str()));
-    assert!(!terminal.contains("HostKeyChecking=no"));
-    assert!(!terminal.contains("HostKeyChecking=accept-new"));
-    assert!(!terminal.contains("KnownHostsFile="));
+    assert!(interactive.windows(2).any(|pair| pair == ["-T", "-s"]));
+    assert!(
+        interactive
+            .windows(2)
+            .any(|pair| pair == ["-o", "ControlMaster=no"])
+    );
+    assert!(
+        interactive
+            .windows(2)
+            .any(|pair| pair == ["-o", "ControlPath=none"])
+    );
+
+    let bridge = config
+        .terminal_bridge_command(
+            std::path::Path::new("/tmp/czi viewer"),
+            "--czi-sftp-bridge",
+            &destination,
+        )
+        .unwrap();
+    assert!(bridge.contains("'/tmp/czi viewer'"));
+    assert!(bridge.contains("'--czi-sftp-bridge'"));
+    assert!(bridge.contains("'alice@example.test'"));
+    assert!(bridge.contains("'\"'\"'"));
+    assert!(!bridge.contains(remote.as_str()));
+    assert!(!bridge.contains("ControlMaster"));
 
     #[cfg(unix)]
     {
@@ -381,10 +377,126 @@ fn create_private_uses_a_short_socket_without_changing_tmpdir() {
     std::fs::remove_dir_all(directory).expect("remove private control path");
 }
 
+#[cfg(unix)]
 #[test]
-fn master_command_requires_a_control_path() {
+fn bridge_socket_requires_a_private_path_and_never_clobbers_an_existing_file() {
+    let control_path = ControlPath::create_private().expect("private control path");
+    let directory = control_path.directory().to_path_buf();
+    let socket_path = control_path.socket_path().to_path_buf();
+    std::fs::write(&socket_path, b"do not replace").expect("sentinel socket path");
+    assert!(matches!(
+        BridgeListener::bind(&socket_path),
+        Err(SftpError::InvalidConfig(
+            OpenSshConfigError::BridgeSocketAlreadyExists
+        ))
+    ));
+    assert_eq!(std::fs::read(&socket_path).unwrap(), b"do not replace");
+    assert!(matches!(
+        BridgeListener::bind("/tmp/not-a-czi-bridge/s"),
+        Err(SftpError::InvalidConfig(
+            OpenSshConfigError::BridgeSocketPathInvalid
+        ))
+    ));
+    std::fs::remove_dir_all(directory).expect("remove private control path");
+}
+
+#[cfg(unix)]
+#[test]
+fn bridge_socket_lifecycle_and_unix_sftp_protocol_are_strict() {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    let control_path = ControlPath::create_private().expect("private control path");
+    let directory = control_path.directory().to_path_buf();
+    let socket_path = control_path.socket_path().to_path_buf();
+    let listener = BridgeListener::bind(&socket_path).expect("bridge listener");
+    let metadata = std::fs::symlink_metadata(&socket_path).expect("bridge socket metadata");
+    assert!(metadata.file_type().is_socket());
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+
+    let config = OpenSshConfig::new().with_control_path(control_path);
+    let worker = thread::spawn(move || {
+        let mut stream = listener.accept().expect("bridge accept");
+        authenticate_bridge_server(&mut stream, &profile("bridge-host")).expect("bridge handshake");
+        let mut header = [0_u8; 4];
+        stream.read_exact(&mut header).expect("SFTP header");
+        let length = usize::try_from(u32::from_be_bytes(header)).expect("SFTP length");
+        let mut frame = vec![0_u8; length];
+        stream.read_exact(&mut frame).expect("SFTP init");
+        assert_eq!(frame, [SSH_FXP_INIT, 0, 0, 0, 3]);
+        let response = [SSH_FXP_VERSION, 0, 0, 0, 3];
+        stream
+            .write_all(&u32::try_from(response.len()).unwrap().to_be_bytes())
+            .expect("SFTP version length");
+        stream.write_all(&response).expect("SFTP version");
+        stream.flush().expect("SFTP version flush");
+    });
+
+    let session = SftpSession::connect_preferred(&profile("bridge-host"), &config)
+        .expect("SFTP session over bridge socket");
+    assert!(
+        !socket_path.exists(),
+        "bridge listener path is removed after accept"
+    );
+    drop(session);
+    worker.join().expect("bridge worker");
+    assert!(
+        connect_bridge_socket(config.control_path().unwrap())
+            .expect("missing bridge is not an error")
+            .is_none()
+    );
+    drop(config);
+    std::fs::remove_dir_all(directory).expect("remove private control path");
+}
+
+#[cfg(unix)]
+#[test]
+fn bridge_handshake_rejects_a_different_profile_before_sftp() {
+    use std::os::unix::net::UnixStream;
+
+    let (mut client, mut server) = UnixStream::pair().expect("Unix stream pair");
+    let worker = thread::spawn(move || {
+        assert!(authenticate_bridge_server(&mut server, &profile("profile-a")).is_err());
+    });
+    assert!(authenticate_bridge_client(&mut client, &profile("profile-b")).is_err());
+    worker.join().expect("bridge handshake worker");
+}
+
+#[cfg(unix)]
+#[test]
+fn bridge_cancellation_closes_a_blocked_stream() {
+    use std::os::unix::net::UnixStream;
+
+    let (stream, mut peer) = UnixStream::pair().expect("Unix stream pair");
+    let cancellation = BridgeCancellation::default();
+    cancellation
+        .register(&stream)
+        .expect("register bridge stream");
+    drop(stream);
+    cancellation.cancel();
+    let (result_tx, result_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut byte = [0_u8; 1];
+        result_tx
+            .send(peer.read(&mut byte))
+            .expect("send bridge EOF");
+    });
+    assert_eq!(
+        result_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("bridge cancellation result")
+            .expect("bridge EOF"),
+        0
+    );
+}
+
+#[test]
+fn bridge_command_requires_a_control_path() {
     let error = OpenSshConfig::new()
-        .noninteractive_master_argv(&profile("host"))
+        .terminal_bridge_command(
+            std::path::Path::new("/tmp/czi-viewer"),
+            "--czi-sftp-bridge",
+            &profile("host"),
+        )
         .unwrap_err();
     assert_eq!(error, OpenSshConfigError::MissingControlPath);
 }

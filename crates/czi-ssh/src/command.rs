@@ -16,10 +16,10 @@ pub const OPENSSH_PATH: &str = "/usr/bin/ssh";
 pub(crate) const SOCKET_PATH_LIMIT: usize = 80;
 
 #[cfg(unix)]
-const PRIVATE_CONTROL_BASE: &str = "/tmp";
-const PRIVATE_SOCKET_NAME: &str = "s";
+pub(crate) const PRIVATE_CONTROL_BASE: &str = "/tmp";
+pub(crate) const PRIVATE_SOCKET_NAME: &str = "s";
 
-/// An application-private directory and socket for OpenSSH connection multiplexing.
+/// An application-private directory and socket for interactive SFTP bridging.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControlPath {
     directory: PathBuf,
@@ -115,7 +115,7 @@ impl ControlPath {
         &self.directory
     }
 
-    /// Return the exact socket path passed to OpenSSH.
+    /// Return the exact private Unix-socket path used by the interactive SFTP bridge.
     #[must_use]
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
@@ -149,7 +149,7 @@ fn set_private_permissions(_directory: &Path) -> Result<(), SftpError> {
     Ok(())
 }
 
-/// OpenSSH settings used by SFTP and optional connection-master commands.
+/// OpenSSH settings used by SFTP and interactive bridge commands.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OpenSshConfig {
     control_path: Option<ControlPath>,
@@ -162,14 +162,14 @@ impl OpenSshConfig {
         Self::default()
     }
 
-    /// Attach an application-private control socket to this configuration.
+    /// Attach an application-private bridge socket to this configuration.
     #[must_use]
     pub fn with_control_path(mut self, control_path: ControlPath) -> Self {
         self.control_path = Some(control_path);
         self
     }
 
-    /// Return the configured private control socket, if any.
+    /// Return the configured private bridge socket, if any.
     #[must_use]
     pub fn control_path(&self) -> Option<&ControlPath> {
         self.control_path.as_ref()
@@ -179,12 +179,11 @@ impl OpenSshConfig {
     ///
     /// This always uses `BatchMode=yes`, strict known-host verification, bounded connection
     /// settings, disables agent and forwarding features, requests no TTY, and passes only the
-    /// destination and `sftp` subsystem after the SSH options. Remote paths belong in SFTP
-    /// packets and cannot enter this vector.
+    /// destination and `sftp` subsystem after the SSH options. It deliberately does not use
+    /// `ControlMaster`; remote paths belong in SFTP packets and cannot enter this vector.
     #[must_use]
     pub fn sftp_argv(&self, profile: &SshProfile) -> Vec<OsString> {
         let mut argv = common_argv(true);
-        self.push_client_control_options(&mut argv);
         argv.push(OsString::from("-T"));
         argv.push(OsString::from("-s"));
         argv.push(OsString::from(profile.as_str()));
@@ -192,67 +191,50 @@ impl OpenSshConfig {
         argv
     }
 
-    /// Build a noninteractive foreground OpenSSH master command argument vector.
+    /// Build an interactive direct OpenSSH SFTP-subsystem argument vector for a Terminal bridge.
     ///
-    /// The command uses `BatchMode=yes`, strict known-host verification, and bounded connection
-    /// settings; callers can launch it directly and retain its child process. A configured
-    /// private control path is required.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when no private control path is configured.
-    pub fn noninteractive_master_argv(
-        &self,
-        profile: &SshProfile,
-    ) -> Result<Vec<OsString>, OpenSshConfigError> {
-        self.master_argv(profile, true)
+    /// SSH stdin and stdout are reserved for binary SFTP packets. OpenSSH retains the controlling
+    /// terminal through stderr and `/dev/tty` for host-key, password, and 2FA prompts. This never
+    /// configures `ControlMaster` or a control path.
+    #[must_use]
+    pub fn interactive_sftp_argv(profile: &SshProfile) -> Vec<OsString> {
+        let mut argv = common_argv(false);
+        argv.push(OsString::from("-T"));
+        argv.push(OsString::from("-s"));
+        argv.push(OsString::from(profile.as_str()));
+        argv.push(OsString::from("sftp"));
+        argv
     }
 
-    /// Build a safely shell-quoted command a user can paste into Terminal to bootstrap a master.
+    /// Build a safely shell-quoted command that starts the same executable's interactive SFTP
+    /// bridge in a visible Terminal.
     ///
-    /// This is intentionally the only shell-form command exposed by the crate. It uses
-    /// `BatchMode=no` so OpenSSH can prompt in the visible terminal. Production SFTP sessions
-    /// continue to use an argument vector and `BatchMode=yes`.
+    /// The command passes only a validated profile and this configuration's private socket path;
+    /// remote paths cannot enter it.
     ///
     /// # Errors
     ///
-    /// Returns an error when no private control path is configured or it is not UTF-8.
-    pub fn terminal_bootstrap_command(
+    /// Returns an error when no private socket is configured or an argument is not UTF-8.
+    pub fn terminal_bridge_command(
         &self,
+        executable: &Path,
+        bridge_mode: &str,
         profile: &SshProfile,
     ) -> Result<String, OpenSshConfigError> {
-        let argv = self.master_argv(profile, false)?;
-        argv.iter()
-            .map(|argument| quote_for_posix_shell(argument.as_os_str()))
-            .collect::<Result<Vec<_>, _>>()
-            .map(|arguments| arguments.join(" "))
-    }
-
-    fn master_argv(
-        &self,
-        profile: &SshProfile,
-        batch_mode: bool,
-    ) -> Result<Vec<OsString>, OpenSshConfigError> {
         let control_path = self
             .control_path
             .as_ref()
             .ok_or(OpenSshConfigError::MissingControlPath)?;
-        let mut argv = common_argv(batch_mode);
-        push_option(&mut argv, "ControlMaster=yes");
-        push_option(&mut argv, "ControlPersist=no");
-        push_path_option(&mut argv, "ControlPath", control_path.socket_path());
-        argv.push(OsString::from("-M"));
-        argv.push(OsString::from("-N"));
-        argv.push(OsString::from(profile.as_str()));
-        Ok(argv)
-    }
-
-    fn push_client_control_options(&self, argv: &mut Vec<OsString>) {
-        if let Some(control_path) = &self.control_path {
-            push_option(argv, "ControlMaster=auto");
-            push_option(argv, "ControlPersist=no");
-            push_path_option(argv, "ControlPath", control_path.socket_path());
-        }
+        [
+            executable.as_os_str(),
+            OsStr::new(bridge_mode),
+            OsStr::new(profile.as_str()),
+            control_path.socket_path().as_os_str(),
+        ]
+        .iter()
+        .map(|argument| quote_for_posix_shell(argument))
+        .collect::<Result<Vec<_>, _>>()
+        .map(|arguments| arguments.join(" "))
     }
 }
 
@@ -270,6 +252,8 @@ fn common_argv(batch_mode: bool) -> Vec<OsString> {
     push_option(&mut argv, "ForwardX11=no");
     push_option(&mut argv, "ClearAllForwardings=yes");
     push_option(&mut argv, "PermitLocalCommand=no");
+    push_option(&mut argv, "ControlMaster=no");
+    push_option(&mut argv, "ControlPath=none");
     push_option(
         &mut argv,
         if batch_mode {
@@ -290,14 +274,6 @@ fn common_argv(batch_mode: bool) -> Vec<OsString> {
 fn push_option(argv: &mut Vec<OsString>, value: &str) {
     argv.push(OsString::from("-o"));
     argv.push(OsString::from(value));
-}
-
-fn push_path_option(argv: &mut Vec<OsString>, name: &str, path: &Path) {
-    let mut value = OsString::from(name);
-    value.push("=");
-    value.push(path.as_os_str());
-    argv.push(OsString::from("-o"));
-    argv.push(value);
 }
 
 fn quote_for_posix_shell(value: &OsStr) -> Result<String, OpenSshConfigError> {

@@ -69,7 +69,7 @@ impl Error for SftpLocationError {}
 /// Why an OpenSSH control socket configuration was rejected.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OpenSshConfigError {
-    /// A master command needs a control socket.
+    /// An interactive bridge command needs a private socket.
     MissingControlPath,
     /// A control socket path cannot be copied safely into a terminal command.
     NonUtf8ControlPath,
@@ -82,14 +82,18 @@ pub enum OpenSshConfigError {
     ControlDirectoryNotDirectory,
     /// A unique private control directory could not be created.
     ControlDirectoryUnavailable,
+    /// A bridge socket was not in an expected application-private directory.
+    BridgeSocketPathInvalid,
+    /// A bridge socket already exists and must not be overwritten.
+    BridgeSocketAlreadyExists,
+    /// A bridge socket or its parent has unsafe permissions or type.
+    BridgeSocketUnsafe,
 }
 
 impl fmt::Display for OpenSshConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingControlPath => {
-                formatter.write_str("a control path is required for a master")
-            }
+            Self::MissingControlPath => formatter.write_str("a private bridge socket is required"),
             Self::NonUtf8ControlPath => {
                 formatter.write_str("control path must be UTF-8 for a copyable terminal command")
             }
@@ -102,6 +106,15 @@ impl fmt::Display for OpenSshConfigError {
             }
             Self::ControlDirectoryUnavailable => {
                 formatter.write_str("could not create a unique private control directory")
+            }
+            Self::BridgeSocketPathInvalid => formatter.write_str(
+                "bridge socket must be /tmp/cz-.../s inside an application-private directory",
+            ),
+            Self::BridgeSocketAlreadyExists => {
+                formatter.write_str("bridge socket already exists and will not be overwritten")
+            }
+            Self::BridgeSocketUnsafe => {
+                formatter.write_str("bridge socket or its private directory is unsafe")
             }
         }
     }

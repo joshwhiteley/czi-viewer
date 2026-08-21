@@ -41,24 +41,23 @@ The remote viewer uses your normal macOS OpenSSH configuration and profiles from
 5. Choose a directory to enter it, or choose a `.czi` file to fill the remote path. Directory entries end in `/`.
 6. Click **Connect**.
 
-Remote browsing runs in the dataset worker over the same read-only SFTP/OpenSSH control configuration as opening a CZI. It resolves home with `REALPATH('.')`, reads only the requested directory, scans at most 4,096 entries, filters unsafe names, and shows at most 200 sorted directories and CZI files. The viewer validates the selected profile and path in its dataset worker, wraps an opened CZI in a 1 MiB block cache with a 256 MiB budget, and indexes and decodes only the ranges it needs.
+Remote browsing runs in the dataset worker over the same read-only SFTP configuration as opening a CZI. It resolves home with `REALPATH('.')`, reads only the requested directory, scans at most 4,096 entries, filters unsafe names, and shows at most 200 sorted directories and CZI files. The viewer validates the selected profile and path in its dataset worker, wraps an opened CZI in a 1 MiB block cache with a 256 MiB budget, and indexes and decodes only the ranges it needs.
 
 ### Authenticate in Terminal when needed
 
-GUI SFTP children never prompt. They run with `BatchMode=yes`, `StrictHostKeyChecking=yes`, `NumberOfPasswordPrompts=0`, a 15-second connection timeout, and SSH keepalives. This prevents an invisible GUI process from accepting a host key or asking for credentials.
+The viewer first tries direct batch SFTP for existing key-based OpenSSH setups. It uses `BatchMode=yes`, `StrictHostKeyChecking=yes`, `NumberOfPasswordPrompts=0`, a 15-second connection timeout, and SSH keepalives. It never uses `ControlMaster`, so hosts that reject multiplexed session channels remain supported.
 
-If a remote open fails, the SSH form shows the sanitized underlying error and a selectable, copyable bootstrap command for the same profile and private control socket.
+If password, 2FA, or host-key interaction is needed, the SSH form shows the sanitized underlying error and a selectable, copyable interactive SFTP bridge command for the same profile and private socket.
 
 1. Copy the command with **Copy command**.
-2. Open Terminal yourself.
-3. Paste and run the command in Terminal.
-4. Complete any normal password, 2FA, or host-key confirmation prompt there.
-5. Leave the Terminal master command running.
-6. Return to the viewer and click **Retry**.
+2. Open Terminal yourself and paste/run it.
+3. The bridge prints that it is waiting. Return to the viewer and click **Retry**, **Home**, or **Browse**.
+4. Complete any normal password, 2FA, or host-key confirmation prompt in Terminal.
+5. Keep that Terminal occupied and open while browsing or viewing the remote CZI.
 
-The Terminal master uses normal interactive OpenSSH behavior with `StrictHostKeyChecking=ask`. The viewer does not run a shell, parse prompts, automate Terminal, prefill commands, use `SSH_ASKPASS`, or store credentials, passwords, or one-time codes.
+The bridge starts only `/usr/bin/ssh` with normal interactive authentication and `StrictHostKeyChecking=ask`. SSH stdin/stdout carry only binary SFTP packets; prompts and bridge instructions stay on the controlling Terminal/stderr. When the viewer closes its SFTP stream, the bridge terminates its SSH child and removes its socket. Closing Terminal also ends the remote session.
 
-One private OpenSSH control-path directory is created lazily under `/tmp` for each Unix viewer session. Its compact socket path is limited to 80 bytes so macOS OpenSSH has room for its temporary listener suffix. Close the Terminal master when you are done. Closing the viewer stops its worker sessions and removes that local control directory. The viewer never writes to the remote host.
+The viewer does not launch a shell, parse prompts, automate Terminal, prefill commands, use `SSH_ASKPASS`, or store credentials, passwords, or one-time codes. One private Unix-socket directory is created lazily under `/tmp` for each Unix viewer session. Its compact socket path is limited to 80 bytes. Closing the viewer stops its worker sessions and removes that local directory. The viewer never writes to the remote host.
 
 A real Tufts connection is out of scope until a user provides a remote path and is present to authenticate.
 

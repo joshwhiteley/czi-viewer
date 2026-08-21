@@ -4,6 +4,8 @@
     clippy::cast_precision_loss
 )]
 
+mod bridge;
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
@@ -16,9 +18,12 @@ use czi_core::{
     SpatialRect, TileHit, TileId, TileIndex, TileQueryIndex, ViewQuery,
 };
 use czi_ssh::{
-    ControlPath, OpenSshConfig, RemoteDirEntry, SftpLocation, SftpSession, SftpSource, SshProfile,
+    BridgeCancellation, ControlPath, OpenSshConfig, RemoteDirEntry, SftpLocation, SftpSession,
+    SftpSource, SshProfile,
 };
 use eframe::egui;
+
+use bridge::BRIDGE_MODE;
 
 const CHANNEL_CAPACITY: usize = 8;
 const METADATA_PREVIEW_CHARS: usize = 4_096;
@@ -28,6 +33,17 @@ const MAX_REMOTE_DIRECTORY_ENTRIES: usize = 4_096;
 const S_IFMT: u32 = 0o170_000;
 const S_IFDIR: u32 = 0o040_000;
 const S_IFREG: u32 = 0o100_000;
+
+/// Run the hidden interactive SFTP bridge when requested by its exact CLI mode.
+///
+/// Returns `Ok(false)` for a normal GUI invocation.
+///
+/// # Errors
+///
+/// Returns malformed bridge-argument or local bridge I/O errors.
+pub fn run_interactive_sftp_bridge_if_requested() -> Result<bool, Box<dyn std::error::Error>> {
+    bridge::run_if_requested()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DimensionChoices {
@@ -120,7 +136,13 @@ fn remote_failure(
 ) -> OpenFailure {
     let terminal_bootstrap_command = SshProfile::new(profile.to_owned())
         .ok()
-        .and_then(|profile| config.terminal_bootstrap_command(&profile).ok());
+        .and_then(|profile| {
+            std::env::current_exe().ok().and_then(|executable| {
+                config
+                    .terminal_bridge_command(&executable, BRIDGE_MODE, &profile)
+                    .ok()
+            })
+        });
     OpenFailure {
         message: sanitize_error(error),
         terminal_bootstrap_command,
@@ -396,6 +418,7 @@ enum WorkerCommand {
         config: OpenSshConfig,
         browse_generation: u64,
     },
+    ClearBrowse,
     View(ViewRequest),
     Shutdown,
 }
@@ -450,9 +473,16 @@ struct WorkerDataset {
     query: TileQueryIndex,
 }
 
+struct WorkerBrowseSession {
+    profile: String,
+    config: OpenSshConfig,
+    session: SftpSession,
+}
+
 struct DatasetWorker {
     commands: SyncSender<WorkerCommand>,
     events: Receiver<WorkerEvent>,
+    bridge_cancellation: BridgeCancellation,
     join: Option<JoinHandle<()>>,
 }
 
@@ -460,13 +490,16 @@ impl DatasetWorker {
     fn spawn() -> Self {
         let (commands, command_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let (event_tx, events) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let bridge_cancellation = BridgeCancellation::default();
+        let worker_cancellation = bridge_cancellation.clone();
         let join = thread::Builder::new()
             .name(String::from("czi-dataset-worker"))
-            .spawn(move || worker_loop(&command_rx, &event_tx))
+            .spawn(move || worker_loop(&command_rx, &event_tx, &worker_cancellation))
             .expect("start CZI dataset worker");
         Self {
             commands,
             events,
+            bridge_cancellation,
             join: Some(join),
         }
     }
@@ -481,6 +514,7 @@ impl DatasetWorker {
         if self.join.is_none() {
             return;
         }
+        self.bridge_cancellation.cancel();
         let mut sent = self.commands.try_send(WorkerCommand::Shutdown).is_ok();
         while self.events.try_recv().is_ok() {}
         if !sent {
@@ -501,8 +535,13 @@ impl Drop for DatasetWorker {
     }
 }
 
-fn worker_loop(commands: &Receiver<WorkerCommand>, events: &SyncSender<WorkerEvent>) {
+fn worker_loop(
+    commands: &Receiver<WorkerCommand>,
+    events: &SyncSender<WorkerEvent>,
+    bridge_cancellation: &BridgeCancellation,
+) {
     let mut dataset = None;
+    let mut browse_session = None;
     let mut active_source_generation = 0;
     let mut pending_command = None;
     loop {
@@ -519,8 +558,11 @@ fn worker_loop(commands: &Receiver<WorkerCommand>, events: &SyncSender<WorkerEve
                 source_generation,
             } => {
                 active_source_generation = source_generation;
-                let (next_dataset, sent) =
-                    send_open_result(events, open_dataset(locator), source_generation);
+                let (next_dataset, sent) = send_open_result(
+                    events,
+                    open_dataset(locator, &mut browse_session, bridge_cancellation),
+                    source_generation,
+                );
                 if !sent {
                     break;
                 }
@@ -533,11 +575,19 @@ fn worker_loop(commands: &Receiver<WorkerCommand>, events: &SyncSender<WorkerEve
                 config,
                 browse_generation,
             } => {
-                let result = browse_remote_paths(&profile, &path, home, &config);
+                let result = browse_remote_paths(
+                    &profile,
+                    &path,
+                    home,
+                    &config,
+                    &mut browse_session,
+                    bridge_cancellation,
+                );
                 if !send_remote_browse_result(events, result, browse_generation) {
                     break;
                 }
             }
+            WorkerCommand::ClearBrowse => browse_session = None,
             WorkerCommand::View(request) => {
                 if request.source_generation != active_source_generation {
                     if events
@@ -635,6 +685,8 @@ fn browse_remote_paths(
     path: &str,
     home: bool,
     config: &OpenSshConfig,
+    browse_session: &mut Option<WorkerBrowseSession>,
+    bridge_cancellation: &BridgeCancellation,
 ) -> Result<RemoteBrowseResult, OpenFailure> {
     let profile = SshProfile::new(profile.to_owned()).map_err(validation_failure)?;
     let target = remote_browse_target(path, home).map_err(validation_failure)?;
@@ -644,8 +696,41 @@ fn browse_remote_paths(
             Some((SftpLocation::new(path).map_err(validation_failure)?, prefix))
         }
     };
-    let mut session = SftpSession::connect(&profile, config)
-        .map_err(|error| remote_failure(profile.as_str(), config, error))?;
+    let matches_existing = browse_session
+        .as_ref()
+        .is_some_and(|existing| existing.profile == profile.as_str() && existing.config == *config);
+    if !matches_existing {
+        *browse_session = None;
+        let session =
+            SftpSession::connect_preferred_with_cancellation(&profile, config, bridge_cancellation)
+                .map_err(|error| remote_failure(profile.as_str(), config, error))?;
+        *browse_session = Some(WorkerBrowseSession {
+            profile: profile.as_str().to_owned(),
+            config: config.clone(),
+            session,
+        });
+    }
+    let result = browse_with_session(
+        &mut browse_session
+            .as_mut()
+            .expect("browse session was created or matched")
+            .session,
+        target,
+        &profile,
+        config,
+    );
+    if result.is_err() {
+        *browse_session = None;
+    }
+    result
+}
+
+fn browse_with_session(
+    session: &mut SftpSession,
+    target: Option<(SftpLocation, String)>,
+    profile: &SshProfile,
+    config: &OpenSshConfig,
+) -> Result<RemoteBrowseResult, OpenFailure> {
     let (directory, prefix, home) = match target {
         None => {
             let current_directory =
@@ -671,9 +756,12 @@ fn browse_remote_paths(
 
 fn open_dataset(
     locator: DatasetLocator,
+    browse_session: &mut Option<WorkerBrowseSession>,
+    bridge_cancellation: &BridgeCancellation,
 ) -> Result<(CziDataset, TileQueryIndex, DatasetInfo), OpenFailure> {
     match locator {
         DatasetLocator::Local(path) => {
+            *browse_session = None;
             let source_label = path.display().to_string();
             let opened = LocalFileSource::open(&path)
                 .map_err(czi_core::CziError::from)
@@ -692,8 +780,24 @@ fn open_dataset(
             let (profile, location, config) = remote
                 .remote_parts()
                 .map_err(|error| remote.open_failure(error))?;
-            let source = SftpSource::open(&profile, &location, config)
-                .map_err(|error| remote.open_failure(error))?;
+            let source = if browse_session.as_ref().is_some_and(|existing| {
+                existing.profile == profile.as_str() && existing.config == *config
+            }) {
+                let session = browse_session
+                    .take()
+                    .expect("matching browse session is present")
+                    .session;
+                SftpSource::open_with_session(session, &location)
+            } else {
+                *browse_session = None;
+                SftpSession::connect_preferred_with_cancellation(
+                    &profile,
+                    config,
+                    bridge_cancellation,
+                )
+                .and_then(|session| SftpSource::open_with_session(session, &location))
+            }
+            .map_err(|error| remote.open_failure(error))?;
             let cache =
                 BlockCache::with_defaults(source).map_err(|error| remote.open_failure(error))?;
             let opened = CziDataset::open(cache).map_err(|error| remote.open_failure(error))?;
@@ -719,6 +823,7 @@ fn take_newer_command(commands: &Receiver<WorkerCommand>) -> Option<WorkerComman
             Ok(
                 command @ (WorkerCommand::Open { .. }
                 | WorkerCommand::Browse { .. }
+                | WorkerCommand::ClearBrowse
                 | WorkerCommand::Shutdown),
             ) => {
                 return Some(command);
@@ -1317,6 +1422,7 @@ impl ViewerApp {
         self.remote_suggestions.clear();
         self.remote_browse_pending = false;
         self.terminal_bootstrap_command = None;
+        let _ = self.worker.send(WorkerCommand::ClearBrowse);
     }
 
     fn browse_remote_path(&mut self, home: bool) {
@@ -1357,7 +1463,10 @@ impl ViewerApp {
             }
             RemotePathKind::CziFile => {
                 self.remote_path_input = suggestion.path;
-                self.invalidate_remote_browse();
+                self.generations.begin_browse();
+                self.remote_browse_directory = None;
+                self.remote_suggestions.clear();
+                self.remote_browse_pending = false;
             }
         }
     }
@@ -1829,8 +1938,11 @@ impl eframe::App for ViewerApp {
 
         egui::TopBottomPanel::top("open_bar").show(context, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.open_mode, OpenMode::Local, "Local");
+                let local_mode = ui.selectable_value(&mut self.open_mode, OpenMode::Local, "Local");
                 ui.selectable_value(&mut self.open_mode, OpenMode::Ssh, "SSH");
+                if local_mode.changed() && self.open_mode == OpenMode::Local {
+                    self.invalidate_remote_browse();
+                }
             });
             match self.open_mode {
                 OpenMode::Local => {
@@ -1918,7 +2030,7 @@ impl eframe::App for ViewerApp {
                     }
                     if let Some(command) = &self.terminal_bootstrap_command {
                         ui.separator();
-                        ui.label("SSH needs authentication or host-key confirmation:");
+                        ui.label("SSH needs an interactive SFTP bridge:");
                         ui.add(
                             egui::Label::new(egui::RichText::new(command).monospace())
                                 .selectable(true)
@@ -1928,10 +2040,10 @@ impl eframe::App for ViewerApp {
                             context.copy_text(command.clone());
                         }
                         ui.weak(
-                            "Paste and run this command in Terminal. Finish password, 2FA, or host-key prompts there; leave the master running, then click Retry.",
+                            "Paste and run this command in Terminal. It waits for Retry, Home, or Browse; finish password, 2FA, or host-key prompts there. Keep Terminal open while the remote file is in use.",
                         );
                         ui.weak(
-                            "The control socket is private to this app session. Close the Terminal master when finished; closing the viewer removes its local control directory. The viewer never writes to the remote host.",
+                            "The private bridge socket accepts one SFTP stream and closes when that stream ends. Closing the viewer removes its local bridge directory. The viewer never writes to the remote host.",
                         );
                     }
                 }
@@ -2324,7 +2436,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_command_is_only_returned_for_remote_open_failures() {
+    fn bridge_command_is_only_returned_for_remote_open_failures() {
         let control_path = ControlPath::create_private().expect("private control path");
         let directory = control_path.directory().to_path_buf();
         let remote = DatasetLocator::Remote {
@@ -2342,9 +2454,10 @@ mod tests {
         assert_eq!(remote_failure.message, "remote open failed");
         let command = remote_failure
             .terminal_bootstrap_command
-            .expect("remote bootstrap command");
+            .expect("remote bridge command");
         assert!(command.contains("'research-cluster'"));
-        assert!(command.contains("'BatchMode=no'"));
+        assert!(command.contains("'--czi-sftp-bridge'"));
+        assert!(!command.contains("/data/image.czi"));
         drop(remote);
         std::fs::remove_dir_all(directory).expect("remove private control path");
     }

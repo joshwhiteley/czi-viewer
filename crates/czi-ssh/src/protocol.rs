@@ -2,6 +2,9 @@ use std::io::{self, Read, Write};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread::{self, JoinHandle};
 
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+
 use crate::{
     OpenSshConfig, RemoteDirEntry, SftpAttributes, SftpError, SftpExtendedAttribute, SftpLocation,
     SftpProtocolError, SshProfile,
@@ -98,6 +101,80 @@ impl SftpSession {
         let result = session.initialize_inner();
         session.finish(result)?;
         Ok(session)
+    }
+
+    /// Connect through a waiting interactive bridge when available, otherwise use direct batch
+    /// SFTP. A connected bridge is never replaced with an OpenSSH multiplexed channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an available bridge or direct batch SFTP connection cannot complete
+    /// strict SFTP v3 negotiation.
+    pub fn connect_preferred(
+        profile: &SshProfile,
+        config: &OpenSshConfig,
+    ) -> Result<Self, SftpError> {
+        #[cfg(unix)]
+        if let Some(session) = Self::connect_bridge(profile, config, None)? {
+            return Ok(session);
+        }
+        Self::connect(profile, config)
+    }
+
+    /// Connect through a bridge when available and register it for out-of-band cancellation.
+    ///
+    /// Direct batch SFTP remains the fallback when no interactive bridge is listening.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a bridge or direct batch SFTP connection cannot negotiate strict v3.
+    pub fn connect_preferred_with_cancellation(
+        profile: &SshProfile,
+        config: &OpenSshConfig,
+        cancellation: &crate::BridgeCancellation,
+    ) -> Result<Self, SftpError> {
+        #[cfg(unix)]
+        if let Some(session) = Self::connect_bridge(profile, config, Some(cancellation))? {
+            return Ok(session);
+        }
+        Self::connect(profile, config)
+    }
+
+    #[cfg(unix)]
+    fn connect_bridge(
+        profile: &SshProfile,
+        config: &OpenSshConfig,
+        cancellation: Option<&crate::BridgeCancellation>,
+    ) -> Result<Option<Self>, SftpError> {
+        let Some(control_path) = config.control_path() else {
+            return Ok(None);
+        };
+        let Some(mut stream) = crate::connect_bridge_socket(control_path)? else {
+            return Ok(None);
+        };
+        if let Some(cancellation) = cancellation {
+            cancellation.register(&stream)?;
+        }
+        if let Err(error) = crate::authenticate_bridge_client(&mut stream, profile) {
+            if let Some(cancellation) = cancellation {
+                cancellation.clear();
+            }
+            return Err(error);
+        }
+        let reader = stream
+            .try_clone()
+            .map_err(|source| SftpError::io("clone bridge socket", source))?;
+        let mut session = Self {
+            transport: Transport::Unix {
+                reader: Some(reader),
+                writer: Some(stream),
+                cancellation: cancellation.cloned(),
+            },
+            next_request_id: Some(1),
+        };
+        let result = session.initialize_inner();
+        session.finish(result)?;
+        Ok(Some(session))
     }
 
     /// Resolve an SFTP path and return the server's canonical UTF-8 path.
@@ -666,6 +743,12 @@ enum Transport {
         stdout: Option<ChildStdout>,
         stderr: Option<JoinHandle<io::Result<Vec<u8>>>>,
     },
+    #[cfg(unix)]
+    Unix {
+        reader: Option<UnixStream>,
+        writer: Option<UnixStream>,
+        cancellation: Option<crate::BridgeCancellation>,
+    },
     #[cfg(test)]
     Test {
         reader: Option<std::net::TcpStream>,
@@ -679,6 +762,16 @@ impl Transport {
             Self::Process { stdin, .. } => stdin.as_mut().map_or_else(
                 || Err(io::Error::new(io::ErrorKind::BrokenPipe, "stdin closed")),
                 |stdin| stdin.write_all(bytes),
+            ),
+            #[cfg(unix)]
+            Self::Unix { writer, .. } => writer.as_mut().map_or_else(
+                || {
+                    Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "bridge writer closed",
+                    ))
+                },
+                |writer| writer.write_all(bytes),
             ),
             #[cfg(test)]
             Self::Test { writer, .. } => writer.as_mut().map_or_else(
@@ -699,6 +792,16 @@ impl Transport {
             Self::Process { stdin, .. } => stdin.as_mut().map_or_else(
                 || Err(io::Error::new(io::ErrorKind::BrokenPipe, "stdin closed")),
                 ChildStdin::flush,
+            ),
+            #[cfg(unix)]
+            Self::Unix { writer, .. } => writer.as_mut().map_or_else(
+                || {
+                    Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "bridge writer closed",
+                    ))
+                },
+                Write::flush,
             ),
             #[cfg(test)]
             Self::Test { writer, .. } => writer.as_mut().map_or_else(
@@ -739,6 +842,16 @@ impl Transport {
                     SftpError::io(
                         operation,
                         io::Error::new(io::ErrorKind::UnexpectedEof, "stdout closed"),
+                    )
+                })?
+                .read_exact(bytes),
+            #[cfg(unix)]
+            Self::Unix { reader, .. } => reader
+                .as_mut()
+                .ok_or_else(|| {
+                    SftpError::io(
+                        operation,
+                        io::Error::new(io::ErrorKind::UnexpectedEof, "bridge reader closed"),
                     )
                 })?
                 .read_exact(bytes),
@@ -789,6 +902,11 @@ impl Transport {
                     stderr,
                 }
             }
+            #[cfg(unix)]
+            Self::Unix { .. } => SftpError::io(
+                operation,
+                io::Error::new(io::ErrorKind::UnexpectedEof, "interactive bridge ended"),
+            ),
             #[cfg(test)]
             Self::Test { .. } => SftpError::io(
                 operation,
@@ -810,6 +928,18 @@ impl Transport {
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = collect_stderr(stderr);
+            }
+            #[cfg(unix)]
+            Self::Unix {
+                reader,
+                writer,
+                cancellation,
+            } => {
+                drop(reader.take());
+                drop(writer.take());
+                if let Some(cancellation) = cancellation {
+                    cancellation.clear();
+                }
             }
             #[cfg(test)]
             Self::Test { reader, writer } => {

@@ -21,7 +21,8 @@ pub struct SftpSource {
 }
 
 impl SftpSource {
-    /// Connect through `/usr/bin/ssh`, resolve `location`, and open the canonical path read-only.
+    /// Prefer an available interactive bridge, otherwise connect through direct `/usr/bin/ssh`,
+    /// then resolve `location` and open the canonical path read-only.
     ///
     /// The SFTP server must return v3 FSTAT attributes containing both size and modification time.
     ///
@@ -33,7 +34,22 @@ impl SftpSource {
         location: &SftpLocation,
         config: &OpenSshConfig,
     ) -> Result<Self, SftpError> {
-        Self::open_session(SftpSession::connect(profile, config)?, location)
+        Self::open_session(SftpSession::connect_preferred(profile, config)?, location)
+    }
+
+    /// Open a read-only source from an already authenticated strict SFTP session.
+    ///
+    /// This consumes the session so a worker can retain one interactive bridge session while
+    /// browsing, then transfer it to the selected CZI source without opening a second channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if path resolution, read-only open, or FSTAT fails.
+    pub fn open_with_session(
+        session: SftpSession,
+        location: &SftpLocation,
+    ) -> Result<Self, SftpError> {
+        Self::open_session(session, location)
     }
 
     fn open_session(mut session: SftpSession, location: &SftpLocation) -> Result<Self, SftpError> {
