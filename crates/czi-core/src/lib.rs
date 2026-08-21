@@ -1,6 +1,7 @@
 //! Pure-Rust building blocks for reading and examining CZI image documents.
 
 mod parser;
+mod query;
 mod source;
 
 pub use parser::{
@@ -8,6 +9,10 @@ pub use parser::{
     DecodedPixels, DecodedTile, DimensionCode, DimensionEntry, DirectoryEntry, FileHeader,
     MetadataIndex, ParseOptions, PixelType, PyramidType, SegmentHeader, SegmentKind, TileIndex,
     TilePayload,
+};
+pub use query::{
+    PhysicalSize, PlaneInfo, PlaneKey, PlaneSelector, PyramidScale, SceneId, SparseAxisChoices,
+    SpatialRect, TileHit, TileId, TileQueryError, TileQueryIndex, ViewQuery, ViewQueryResult,
 };
 pub use source::{LocalFileSource, MemorySource, RandomAccessSource, SourceError, SourceInfo};
 
