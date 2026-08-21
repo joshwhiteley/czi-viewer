@@ -154,6 +154,18 @@ pub enum SftpProtocolError {
         /// Full flags word from the packet.
         flags: u32,
     },
+    /// FSTAT omitted a value required to create a stable random-access source.
+    MissingRequiredAttribute {
+        /// Required v3 attribute name.
+        attribute: &'static str,
+    },
+    /// A NAME response did not contain the required number of entries.
+    UnexpectedNameCount {
+        /// Number of entries expected for this operation.
+        expected: u32,
+        /// Number of entries received.
+        actual: u32,
+    },
     /// A DATA response was larger than the matching READ request.
     DataTooLong {
         /// Number of requested bytes.
@@ -167,6 +179,8 @@ pub enum SftpProtocolError {
     UnexpectedEof,
     /// A request counter would reuse an SFTP request ID.
     RequestIdExhausted,
+    /// A READDIR response contained no entries instead of `SSH_FX_EOF`.
+    EmptyNameResponse,
     /// A fallible packet allocation failed.
     Allocation {
         /// Requested allocation size.
@@ -202,6 +216,16 @@ impl fmt::Display for SftpProtocolError {
                     "SFTP v3 attributes have unknown flags {flags:#010x}"
                 )
             }
+            Self::MissingRequiredAttribute { attribute } => {
+                write!(
+                    formatter,
+                    "SFTP FSTAT omitted required {attribute} attribute"
+                )
+            }
+            Self::UnexpectedNameCount { expected, actual } => write!(
+                formatter,
+                "SFTP NAME had {actual} entries; expected {expected}"
+            ),
             Self::DataTooLong { requested, actual } => write!(
                 formatter,
                 "SFTP DATA had {actual} bytes for a {requested}-byte READ"
@@ -211,6 +235,9 @@ impl fmt::Display for SftpProtocolError {
                 formatter.write_str("SFTP source ended before its captured length")
             }
             Self::RequestIdExhausted => formatter.write_str("SFTP request ID space is exhausted"),
+            Self::EmptyNameResponse => {
+                formatter.write_str("SFTP NAME response contained no directory entries")
+            }
             Self::Allocation { size } => write!(formatter, "cannot allocate {size} bytes for SFTP"),
         }
     }
@@ -268,8 +295,8 @@ impl SftpError {
         Self::Io { context, source }
     }
 
-    pub(crate) fn as_source_io(self) -> io::Error {
-        io::Error::other(self.to_string())
+    pub(crate) fn into_source_io(self) -> io::Error {
+        io::Error::other(self)
     }
 }
 

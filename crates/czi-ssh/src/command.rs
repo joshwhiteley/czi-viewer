@@ -1,5 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,11 +24,20 @@ impl ControlPath {
     ///
     /// The directory permissions are set to `0700` on Unix platforms. The returned socket is
     /// named `master.sock` and is constrained to a portable Unix-domain socket path length.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the directory or its permissions cannot be created.
     pub fn create_private() -> Result<Self, SftpError> {
         Self::create_private_in(std::env::temp_dir())
     }
 
     /// Create a unique application-private socket directory below `base`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `base` cannot contain a private directory or no unique name is
+    /// available.
     pub fn create_private_in(base: impl AsRef<Path>) -> Result<Self, SftpError> {
         let base = base.as_ref();
         fs::create_dir_all(base)
@@ -41,12 +51,12 @@ impl ControlPath {
             .map_or(0, |duration| duration.as_nanos());
         for counter in 0..256_u16 {
             let directory = base.join(format!("czi-ssh-{}-{nanos}-{counter}", process::id()));
-            match fs::create_dir(&directory) {
+            match create_private_directory(&directory) {
                 Ok(()) => {
                     set_private_permissions(&directory)?;
                     return Self::from_private_directory(directory);
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(source) => {
                     return Err(SftpError::io("create private control directory", source));
                 }
@@ -56,6 +66,11 @@ impl ControlPath {
     }
 
     /// Use `directory/master.sock` as a control socket after setting the directory to `0700`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `directory` is not a directory, its permissions cannot be changed,
+    /// or the socket path is too long.
     pub fn from_private_directory(directory: impl Into<PathBuf>) -> Result<Self, SftpError> {
         let directory = directory.into();
         if !directory.is_dir() {
@@ -74,14 +89,30 @@ impl ControlPath {
     }
 
     /// Return the private socket directory.
+    #[must_use]
     pub fn directory(&self) -> &Path {
         &self.directory
     }
 
     /// Return the exact socket path passed to OpenSSH.
+    #[must_use]
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }
+}
+
+#[cfg(unix)]
+fn create_private_directory(directory: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(directory)
+}
+
+#[cfg(not(unix))]
+fn create_private_directory(directory: &Path) -> io::Result<()> {
+    fs::create_dir(directory)
 }
 
 #[cfg(unix)]
@@ -118,6 +149,7 @@ impl OpenSshConfig {
     }
 
     /// Return the configured private control socket, if any.
+    #[must_use]
     pub fn control_path(&self) -> Option<&ControlPath> {
         self.control_path.as_ref()
     }
@@ -142,6 +174,10 @@ impl OpenSshConfig {
     ///
     /// The command uses `BatchMode=yes`; callers can launch it directly and retain its child
     /// process. A configured private control path is required.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no private control path is configured.
     pub fn noninteractive_master_argv(
         &self,
         profile: &SshProfile,
@@ -154,6 +190,10 @@ impl OpenSshConfig {
     /// This is intentionally the only shell-form command exposed by the crate. It uses
     /// `BatchMode=no` so OpenSSH can prompt in the visible terminal. Production SFTP sessions
     /// continue to use an argument vector and `BatchMode=yes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no private control path is configured or it is not UTF-8.
     pub fn terminal_bootstrap_command(
         &self,
         profile: &SshProfile,
@@ -187,6 +227,7 @@ impl OpenSshConfig {
     fn push_client_control_options(&self, argv: &mut Vec<OsString>) {
         if let Some(control_path) = &self.control_path {
             push_option(argv, "ControlMaster=auto");
+            push_option(argv, "ControlPersist=no");
             push_path_option(argv, "ControlPath", control_path.socket_path());
         }
     }
@@ -203,6 +244,7 @@ fn common_argv(batch_mode: bool) -> Vec<OsString> {
         },
     );
     push_option(&mut argv, "ForwardAgent=no");
+    push_option(&mut argv, "ForwardX11=no");
     push_option(&mut argv, "ClearAllForwardings=yes");
     push_option(&mut argv, "PermitLocalCommand=no");
     push_option(&mut argv, "StrictHostKeyChecking=yes");

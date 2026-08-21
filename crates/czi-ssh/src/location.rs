@@ -11,6 +11,10 @@ impl SshProfile {
     ///
     /// A profile must be nonempty, at most 255 UTF-8 bytes, contain no NUL byte, and not begin
     /// with `-` so it cannot be interpreted as an OpenSSH option.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `value` violates one of these constraints.
     pub fn new(value: impl Into<String>) -> Result<Self, SshProfileError> {
         let value = value.into();
         if value.is_empty() {
@@ -31,6 +35,7 @@ impl SshProfile {
     }
 
     /// Return the validated destination text.
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -52,6 +57,10 @@ impl SftpLocation {
     /// Validate a UTF-8 remote SFTP path.
     ///
     /// The path must be nonempty, at most 4096 UTF-8 bytes, and contain no NUL byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `value` violates one of these constraints.
     pub fn new(value: impl Into<String>) -> Result<Self, SftpLocationError> {
         let value = value.into();
         if value.is_empty() {
@@ -69,6 +78,7 @@ impl SftpLocation {
     }
 
     /// Return the validated UTF-8 path.
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }

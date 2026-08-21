@@ -6,6 +6,8 @@
 mod command;
 mod error;
 mod location;
+mod protocol;
+mod source;
 
 pub use command::{ControlPath, OPENSSH_PATH, OpenSshConfig};
 pub use error::{
@@ -14,3 +16,5 @@ pub use error::{
 pub use location::{
     RemoteDirEntry, SftpAttributes, SftpExtendedAttribute, SftpLocation, SshProfile,
 };
+pub use protocol::SftpSession;
+pub use source::SftpSource;
