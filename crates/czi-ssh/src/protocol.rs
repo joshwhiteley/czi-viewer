@@ -750,7 +750,12 @@ impl Transport {
             } => {
                 drop(stdin.take());
                 drop(stdout.take());
-                let status = child.wait().ok();
+                let status = if let Ok(Some(status)) = child.try_wait() {
+                    Some(status)
+                } else {
+                    let _ = child.kill();
+                    child.wait().ok()
+                };
                 let stderr = collect_stderr(stderr);
                 SftpError::ChildExited {
                     operation,

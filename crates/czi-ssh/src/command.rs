@@ -247,7 +247,7 @@ fn common_argv(batch_mode: bool) -> Vec<OsString> {
     push_option(&mut argv, "ForwardX11=no");
     push_option(&mut argv, "ClearAllForwardings=yes");
     push_option(&mut argv, "PermitLocalCommand=no");
-    push_option(&mut argv, "StrictHostKeyChecking=yes");
+    push_option(&mut argv, "StrictHostKeyChecking=ask");
     argv
 }
 

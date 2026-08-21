@@ -240,7 +240,7 @@ fn command_builders_keep_paths_out_of_argv_and_preserve_host_checks() {
     );
     assert!(
         argv.windows(2)
-            .any(|pair| pair == ["-o", "StrictHostKeyChecking=yes"])
+            .any(|pair| pair == ["-o", "StrictHostKeyChecking=ask"])
     );
     assert!(
         argv.windows(2)
@@ -257,7 +257,17 @@ fn command_builders_keep_paths_out_of_argv_and_preserve_host_checks() {
     assert!(
         !argv
             .iter()
-            .any(|argument| argument.contains("UserKnownHostsFile=/dev/null"))
+            .any(|argument| argument.contains("HostKeyChecking=accept-new"))
+    );
+    assert!(
+        !argv
+            .iter()
+            .any(|argument| argument.starts_with("UserKnownHostsFile="))
+    );
+    assert!(
+        !argv
+            .iter()
+            .any(|argument| argument.starts_with("GlobalKnownHostsFile="))
     );
 
     let master = config.noninteractive_master_argv(&destination).unwrap();
@@ -268,8 +278,12 @@ fn command_builders_keep_paths_out_of_argv_and_preserve_host_checks() {
     );
     let terminal = config.terminal_bootstrap_command(&destination).unwrap();
     assert!(terminal.contains("'BatchMode=no'"));
+    assert!(terminal.contains("'StrictHostKeyChecking=ask'"));
     assert!(terminal.contains("'\"'\"'"));
     assert!(!terminal.contains(remote.as_str()));
+    assert!(!terminal.contains("HostKeyChecking=no"));
+    assert!(!terminal.contains("HostKeyChecking=accept-new"));
+    assert!(!terminal.contains("KnownHostsFile="));
 
     #[cfg(unix)]
     {
