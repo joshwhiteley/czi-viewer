@@ -6,6 +6,7 @@
 /test-data/local-fixtures.toml
 /test-data/cache/
 
-# Application caches and temporary output.
+# Application caches, temporary output, and local agent state.
 *.czi.tmp
 *.partial
+/.pi/
