@@ -3,6 +3,8 @@
 //! This module intentionally reads only [`DatasetIndex`] metadata. It never resolves a tile
 //! payload, allocates pixel buffers, or assembles a dense plane.
 
+#![allow(clippy::missing_errors_doc)]
+
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -36,18 +38,13 @@ impl TileId {
 }
 
 /// Scene identity distinguishes an absent S dimension from an explicit S=0 scene.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum SceneId {
     /// The tile has no S dimension.
+    #[default]
     Implicit,
     /// The tile contains an S dimension with this sparse start value.
     Explicit(i32),
-}
-
-impl Default for SceneId {
-    fn default() -> Self {
-        Self::Implicit
-    }
 }
 
 /// Exact sparse C/S/Z/T identity of a plane.
@@ -181,6 +178,7 @@ impl SpatialRect {
     }
 
     /// Return the checked union of two rectangles.
+    #[must_use]
     pub const fn union(self, other: Self) -> Self {
         Self {
             min_x: if self.min_x < other.min_x {
@@ -215,13 +213,13 @@ impl SpatialRect {
     /// Return the width when it fits in an unsigned 64-bit value.
     #[must_use]
     pub const fn width(self) -> u64 {
-        (self.max_x - self.min_x) as u64
+        (self.max_x - self.min_x).unsigned_abs()
     }
 
     /// Return the height when it fits in an unsigned 64-bit value.
     #[must_use]
     pub const fn height(self) -> u64 {
-        (self.max_y - self.min_y) as u64
+        (self.max_y - self.min_y).unsigned_abs()
     }
 }
 
@@ -511,6 +509,18 @@ impl fmt::Display for PlaneSelector {
 }
 
 impl TileQueryIndex {
+    /// Return the number of geometry-indexed tiles.
+    #[must_use]
+    pub fn tile_count(&self) -> usize {
+        self.tiles.len()
+    }
+
+    /// Return the number of exact sparse planes.
+    #[must_use]
+    pub fn plane_count(&self) -> usize {
+        self.planes.len()
+    }
+
     /// Build an immutable geometry index without reading any tile payloads.
     pub fn new(index: &DatasetIndex) -> Result<Self, TileQueryError> {
         let mut tiles = Vec::with_capacity(index.tiles.len());
@@ -584,7 +594,6 @@ impl TileQueryIndex {
     }
 
     /// Return all exact plane descriptions in stable key order.
-    #[must_use]
     pub fn planes(&self) -> impl Iterator<Item = &PlaneInfo> {
         self.planes.values()
     }
@@ -649,6 +658,11 @@ impl TileQueryIndex {
             hit.paint_order = paint_order;
         }
         Ok(ViewQueryResult { plane, scale, hits })
+    }
+
+    /// Alias for [`Self::query`] with a name that makes viewport filtering explicit.
+    pub fn query_viewport(&self, query: &ViewQuery) -> Result<ViewQueryResult, TileQueryError> {
+        self.query(query)
     }
 
     /// Return the level that would be selected for a target downsample.
@@ -750,10 +764,7 @@ fn index_tile(tile_id: TileId, tile: &TileIndex) -> Result<IndexedTile, TileQuer
     })
 }
 
-fn dimension<'a>(
-    dimensions: &'a [DimensionEntry],
-    code: DimensionCode,
-) -> Option<&'a DimensionEntry> {
+fn dimension(dimensions: &[DimensionEntry], code: DimensionCode) -> Option<&DimensionEntry> {
     dimensions.iter().find(|dimension| dimension.code == code)
 }
 
@@ -908,6 +919,53 @@ mod tests {
         assert_eq!(
             query.select_scale(selector, 0.5).unwrap(),
             PyramidScale::new(1, 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn query_filters_exact_plane_level_and_half_open_viewport() {
+        let mut selected = base(0, 0, 10, 10);
+        selected.push(dimension(DimensionCode::C, 3, 1, 1));
+        let other_plane = {
+            let mut dimensions = base(10, 0, 10, 10);
+            dimensions.push(dimension(DimensionCode::C, 4, 1, 1));
+            dimensions
+        };
+        let level_2 = base(0, 0, 10, 5);
+        let query = TileQueryIndex::new(&index(vec![
+            tile(selected, PyramidType::None),
+            tile(other_plane, PyramidType::None),
+            tile(level_2, PyramidType::None),
+        ]))
+        .expect("geometry index");
+        let viewport = SpatialRect::new(0, 0, 10, 10).unwrap();
+        let result = query
+            .query(
+                &ViewQuery::new(
+                    PlaneSelector::new(3, SceneId::Implicit, 0, 0),
+                    viewport,
+                    1.5,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(result.scale, PyramidScale::new(1, 1).unwrap());
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].tile_id, TileId(0));
+        assert_eq!(result.hits[0].physical_stored_size.width, 10);
+        assert!(
+            query
+                .query(
+                    &ViewQuery::new(
+                        PlaneSelector::new(3, SceneId::Implicit, 0, 0),
+                        SpatialRect::new(10, 0, 20, 10).unwrap(),
+                        1.0,
+                    )
+                    .unwrap()
+                )
+                .unwrap()
+                .hits
+                .is_empty()
         );
     }
 
