@@ -641,7 +641,6 @@ enum Transport {
         stderr: Option<JoinHandle<io::Result<Vec<u8>>>>,
     },
     #[cfg(test)]
-    #[allow(dead_code)]
     Test {
         reader: Option<std::net::TcpStream>,
         writer: Option<std::net::TcpStream>,
@@ -1055,7 +1054,6 @@ impl<'a> Cursor<'a> {
 
 #[cfg(test)]
 impl SftpSession {
-    #[allow(dead_code)]
     pub(crate) fn with_test_transport(stream: std::net::TcpStream) -> Result<Self, SftpError> {
         let reader = stream
             .try_clone()
@@ -1072,3 +1070,7 @@ impl SftpSession {
         Ok(session)
     }
 }
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;

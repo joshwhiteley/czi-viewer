@@ -158,7 +158,6 @@ fn check_range(offset: u64, size: usize, length: u64) -> Result<(), SourceError>
 
 #[cfg(test)]
 impl SftpSource {
-    #[allow(dead_code)]
     pub(crate) fn open_with_test_session(
         session: SftpSession,
         location: &SftpLocation,
@@ -166,7 +165,6 @@ impl SftpSource {
         Self::open_session(session, location)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn test_source_version(path: &SftpLocation, size: u64, mtime: u32) -> u64 {
         source_version(path, size, mtime)
     }
