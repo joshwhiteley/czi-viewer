@@ -116,7 +116,22 @@ impl SftpSession {
     ///
     /// Returns an error if the server rejects a request or sends a malformed response.
     pub fn read_dir(&mut self, location: &SftpLocation) -> Result<Vec<RemoteDirEntry>, SftpError> {
-        let result = self.read_dir_inner(location);
+        let result = self.read_dir_inner(location, None);
+        self.finish(result)
+    }
+
+    /// List a directory using OPENDIR and READDIR, rejecting listings above `max_entries`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects a request, sends a malformed response, or returns
+    /// more entries than `max_entries`.
+    pub fn read_dir_limited(
+        &mut self,
+        location: &SftpLocation,
+        max_entries: usize,
+    ) -> Result<Vec<RemoteDirEntry>, SftpError> {
+        let result = self.read_dir_inner(location, Some(max_entries));
         self.finish(result)
     }
 
@@ -351,9 +366,10 @@ impl SftpSession {
     fn read_dir_inner(
         &mut self,
         location: &SftpLocation,
+        max_entries: Option<usize>,
     ) -> Result<Vec<RemoteDirEntry>, SftpError> {
         let handle = self.open_dir_inner(location)?;
-        let result = self.read_dir_entries_inner(&handle);
+        let result = self.read_dir_entries_inner(&handle, max_entries);
         match result {
             Ok(entries) => {
                 self.close_inner(&handle)?;
@@ -368,7 +384,11 @@ impl SftpSession {
         self.receive_handle(request_id, "OPENDIR")
     }
 
-    fn read_dir_entries_inner(&mut self, handle: &[u8]) -> Result<Vec<RemoteDirEntry>, SftpError> {
+    fn read_dir_entries_inner(
+        &mut self,
+        handle: &[u8],
+        max_entries: Option<usize>,
+    ) -> Result<Vec<RemoteDirEntry>, SftpError> {
         let mut entries = Vec::new();
         loop {
             let request_id = self.send_handle_request(SSH_FXP_READDIR, handle, "READDIR")?;
@@ -378,6 +398,12 @@ impl SftpSession {
                     let mut page = parse_name_packet(packet.payload(), request_id, "READDIR")?;
                     if page.is_empty() {
                         return Err(SftpProtocolError::EmptyNameResponse.into());
+                    }
+                    if max_entries.is_some_and(|limit| entries.len() + page.len() > limit) {
+                        return Err(SftpProtocolError::DirectoryEntryLimit {
+                            limit: max_entries.expect("checked above"),
+                        }
+                        .into());
                     }
                     entries
                         .try_reserve(page.len())

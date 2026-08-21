@@ -15,12 +15,19 @@ use czi_core::{
     PhysicalSize, PixelType, PlaneInfo, PlaneKey, PlaneSelector, PyramidScale, SceneId,
     SpatialRect, TileHit, TileId, TileIndex, TileQueryIndex, ViewQuery,
 };
-use czi_ssh::{ControlPath, OpenSshConfig, SftpLocation, SftpSource, SshProfile};
+use czi_ssh::{
+    ControlPath, OpenSshConfig, RemoteDirEntry, SftpLocation, SftpSession, SftpSource, SshProfile,
+};
 use eframe::egui;
 
 const CHANNEL_CAPACITY: usize = 8;
 const METADATA_PREVIEW_CHARS: usize = 4_096;
 const TEXTURE_CACHE_LIMIT: usize = 256 * 1024 * 1024;
+const MAX_REMOTE_SUGGESTIONS: usize = 200;
+const MAX_REMOTE_DIRECTORY_ENTRIES: usize = 4_096;
+const S_IFMT: u32 = 0o170_000;
+const S_IFDIR: u32 = 0o040_000;
+const S_IFREG: u32 = 0o100_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DimensionChoices {
@@ -82,17 +89,14 @@ impl DatasetLocator {
     }
 
     fn open_failure(&self, error: impl std::fmt::Display) -> OpenFailure {
-        let terminal_bootstrap_command = match self {
-            Self::Local(_) => None,
+        match self {
+            Self::Local(_) => OpenFailure {
+                message: sanitize_error(error),
+                terminal_bootstrap_command: None,
+            },
             Self::Remote {
                 profile, config, ..
-            } => SshProfile::new(profile.clone())
-                .ok()
-                .and_then(|profile| config.terminal_bootstrap_command(&profile).ok()),
-        };
-        OpenFailure {
-            message: sanitize_error(error),
-            terminal_bootstrap_command,
+            } => remote_failure(profile, config, error),
         }
     }
 }
@@ -100,6 +104,27 @@ impl DatasetLocator {
 struct OpenFailure {
     message: String,
     terminal_bootstrap_command: Option<String>,
+}
+
+fn validation_failure(error: impl std::fmt::Display) -> OpenFailure {
+    OpenFailure {
+        message: sanitize_error(error),
+        terminal_bootstrap_command: None,
+    }
+}
+
+fn remote_failure(
+    profile: &str,
+    config: &OpenSshConfig,
+    error: impl std::fmt::Display,
+) -> OpenFailure {
+    let terminal_bootstrap_command = SshProfile::new(profile.to_owned())
+        .ok()
+        .and_then(|profile| config.terminal_bootstrap_command(&profile).ok());
+    OpenFailure {
+        message: sanitize_error(error),
+        terminal_bootstrap_command,
+    }
 }
 
 fn sanitize_error(error: impl std::fmt::Display) -> String {
@@ -115,6 +140,120 @@ fn sanitize_error(error: impl std::fmt::Display) -> String {
         sanitized.push('…');
     }
     sanitized
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RemotePathKind {
+    Directory,
+    CziFile,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RemotePathSuggestion {
+    name: String,
+    path: String,
+    kind: RemotePathKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RemoteBrowseTarget {
+    Home,
+    Directory { path: String, prefix: String },
+}
+
+#[derive(Debug)]
+struct RemoteBrowseResult {
+    directory: String,
+    suggestions: Vec<RemotePathSuggestion>,
+    home: bool,
+}
+
+fn remote_browse_target(path: &str, home: bool) -> Result<RemoteBrowseTarget, String> {
+    let path = path.trim();
+    if home || path.is_empty() {
+        return Ok(RemoteBrowseTarget::Home);
+    }
+    if !path.starts_with('/') {
+        return Err(String::from("remote browser path must be absolute"));
+    }
+    if path.ends_with('/') {
+        let directory = path.trim_end_matches('/');
+        return Ok(RemoteBrowseTarget::Directory {
+            path: if directory.is_empty() {
+                String::from("/")
+            } else {
+                directory.to_owned()
+            },
+            prefix: String::new(),
+        });
+    }
+    let (directory, prefix) = path
+        .rsplit_once('/')
+        .expect("an absolute path always contains a slash");
+    Ok(RemoteBrowseTarget::Directory {
+        path: if directory.is_empty() {
+            String::from("/")
+        } else {
+            directory.to_owned()
+        },
+        prefix: prefix.to_owned(),
+    })
+}
+
+fn remote_path_suggestions(
+    directory: &str,
+    prefix: &str,
+    entries: Vec<RemoteDirEntry>,
+) -> Vec<RemotePathSuggestion> {
+    let mut suggestions = entries
+        .into_iter()
+        .filter_map(|entry| {
+            let name = entry.path.as_str();
+            let kind = remote_path_kind(name, entry.attributes.permissions)?;
+            (safe_remote_name(name) && name.starts_with(prefix)).then(|| RemotePathSuggestion {
+                name: name.to_owned(),
+                path: join_remote_path(directory, name),
+                kind,
+            })
+        })
+        .collect::<Vec<_>>();
+    suggestions.sort_by(|left, right| left.name.cmp(&right.name));
+    suggestions.truncate(MAX_REMOTE_SUGGESTIONS);
+    suggestions
+}
+
+fn remote_path_kind(name: &str, permissions: Option<u32>) -> Option<RemotePathKind> {
+    let file_type = permissions.map(|permissions| permissions & S_IFMT);
+    if file_type == Some(S_IFDIR) {
+        return Some(RemotePathKind::Directory);
+    }
+    let is_regular_or_unknown =
+        file_type.is_none() || file_type == Some(0) || file_type == Some(S_IFREG);
+    (is_regular_or_unknown && name.to_ascii_lowercase().ends_with(".czi"))
+        .then_some(RemotePathKind::CziFile)
+}
+
+fn safe_remote_name(name: &str) -> bool {
+    !name.is_empty()
+        && !matches!(name, "." | "..")
+        && !name.contains(['/', '\\'])
+        && !name.chars().any(char::is_control)
+}
+
+fn join_remote_path(directory: &str, name: &str) -> String {
+    if directory == "/" {
+        format!("/{name}")
+    } else {
+        format!("{}/{}", directory.trim_end_matches('/'), name)
+    }
+}
+
+fn directory_path(path: &str) -> String {
+    if path == "/" {
+        String::from("/")
+    } else {
+        format!("{}/", path.trim_end_matches('/'))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -202,6 +341,7 @@ type PlaneSelection = PlaneSelector;
 struct Generations {
     source: u64,
     view: u64,
+    browse: u64,
 }
 
 impl Generations {
@@ -223,6 +363,15 @@ impl Generations {
     fn accepts_view(&self, source: u64, view: u64) -> bool {
         self.accepts_source(source) && view == self.view
     }
+
+    fn begin_browse(&mut self) -> u64 {
+        self.browse = self.browse.wrapping_add(1);
+        self.browse
+    }
+
+    fn accepts_browse(&self, browse: u64) -> bool {
+        browse == self.browse
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -240,6 +389,13 @@ enum WorkerCommand {
         locator: DatasetLocator,
         source_generation: u64,
     },
+    Browse {
+        profile: String,
+        path: String,
+        home: bool,
+        config: OpenSshConfig,
+        browse_generation: u64,
+    },
     View(ViewRequest),
     Shutdown,
 }
@@ -253,6 +409,17 @@ enum WorkerEvent {
         message: String,
         terminal_bootstrap_command: Option<String>,
         source_generation: u64,
+    },
+    RemotePaths {
+        directory: String,
+        suggestions: Vec<RemotePathSuggestion>,
+        home: bool,
+        browse_generation: u64,
+    },
+    RemotePathsFailed {
+        message: String,
+        terminal_bootstrap_command: Option<String>,
+        browse_generation: u64,
     },
     TileLoaded {
         tile_id: TileId,
@@ -352,39 +519,23 @@ fn worker_loop(commands: &Receiver<WorkerCommand>, events: &SyncSender<WorkerEve
                 source_generation,
             } => {
                 active_source_generation = source_generation;
-                dataset = None;
-                let result = open_dataset(locator);
-                match result {
-                    Ok((opened, query, info)) => {
-                        dataset = Some(WorkerDataset {
-                            dataset: opened,
-                            query,
-                        });
-                        if events
-                            .send(WorkerEvent::Opened {
-                                info,
-                                source_generation,
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(OpenFailure {
-                        message,
-                        terminal_bootstrap_command,
-                    }) => {
-                        if events
-                            .send(WorkerEvent::OpenFailed {
-                                message,
-                                terminal_bootstrap_command,
-                                source_generation,
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
+                let (next_dataset, sent) =
+                    send_open_result(events, open_dataset(locator), source_generation);
+                if !sent {
+                    break;
+                }
+                dataset = next_dataset;
+            }
+            WorkerCommand::Browse {
+                profile,
+                path,
+                home,
+                config,
+                browse_generation,
+            } => {
+                let result = browse_remote_paths(&profile, &path, home, &config);
+                if !send_remote_browse_result(events, result, browse_generation) {
+                    break;
                 }
             }
             WorkerCommand::View(request) => {
@@ -415,6 +566,107 @@ fn worker_loop(commands: &Receiver<WorkerCommand>, events: &SyncSender<WorkerEve
             WorkerCommand::Shutdown => break,
         }
     }
+}
+
+fn send_open_result(
+    events: &SyncSender<WorkerEvent>,
+    result: Result<(CziDataset, TileQueryIndex, DatasetInfo), OpenFailure>,
+    source_generation: u64,
+) -> (Option<WorkerDataset>, bool) {
+    match result {
+        Ok((dataset, query, info)) => {
+            let sent = events
+                .send(WorkerEvent::Opened {
+                    info,
+                    source_generation,
+                })
+                .is_ok();
+            (sent.then_some(WorkerDataset { dataset, query }), sent)
+        }
+        Err(OpenFailure {
+            message,
+            terminal_bootstrap_command,
+        }) => (
+            None,
+            events
+                .send(WorkerEvent::OpenFailed {
+                    message,
+                    terminal_bootstrap_command,
+                    source_generation,
+                })
+                .is_ok(),
+        ),
+    }
+}
+
+fn send_remote_browse_result(
+    events: &SyncSender<WorkerEvent>,
+    result: Result<RemoteBrowseResult, OpenFailure>,
+    browse_generation: u64,
+) -> bool {
+    match result {
+        Ok(RemoteBrowseResult {
+            directory,
+            suggestions,
+            home,
+        }) => events
+            .send(WorkerEvent::RemotePaths {
+                directory,
+                suggestions,
+                home,
+                browse_generation,
+            })
+            .is_ok(),
+        Err(OpenFailure {
+            message,
+            terminal_bootstrap_command,
+        }) => events
+            .send(WorkerEvent::RemotePathsFailed {
+                message,
+                terminal_bootstrap_command,
+                browse_generation,
+            })
+            .is_ok(),
+    }
+}
+
+fn browse_remote_paths(
+    profile: &str,
+    path: &str,
+    home: bool,
+    config: &OpenSshConfig,
+) -> Result<RemoteBrowseResult, OpenFailure> {
+    let profile = SshProfile::new(profile.to_owned()).map_err(validation_failure)?;
+    let target = remote_browse_target(path, home).map_err(validation_failure)?;
+    let target = match target {
+        RemoteBrowseTarget::Home => None,
+        RemoteBrowseTarget::Directory { path, prefix } => {
+            Some((SftpLocation::new(path).map_err(validation_failure)?, prefix))
+        }
+    };
+    let mut session = SftpSession::connect(&profile, config)
+        .map_err(|error| remote_failure(profile.as_str(), config, error))?;
+    let (directory, prefix, home) = match target {
+        None => {
+            let current_directory =
+                SftpLocation::new(".").expect("the fixed SFTP current-directory location is valid");
+            let home = session
+                .realpath(&current_directory)
+                .map_err(|error| remote_failure(profile.as_str(), config, error))?;
+            (home, String::new(), true)
+        }
+        Some((directory, prefix)) => (directory, prefix, false),
+    };
+    let entries = session
+        .read_dir_limited(&directory, MAX_REMOTE_DIRECTORY_ENTRIES)
+        .map_err(|error| remote_failure(profile.as_str(), config, error))?;
+    let directory = directory.as_str().trim_end_matches('/');
+    let directory = if directory.is_empty() { "/" } else { directory };
+    Ok(RemoteBrowseResult {
+        directory: directory.to_owned(),
+        suggestions: remote_path_suggestions(directory, &prefix, entries),
+        home,
+    })
 }
 
 fn open_dataset(
@@ -464,7 +716,11 @@ fn take_newer_command(commands: &Receiver<WorkerCommand>) -> Option<WorkerComman
     loop {
         match commands.try_recv() {
             Ok(WorkerCommand::View(request)) => latest_view = Some(WorkerCommand::View(request)),
-            Ok(command @ (WorkerCommand::Open { .. } | WorkerCommand::Shutdown)) => {
+            Ok(
+                command @ (WorkerCommand::Open { .. }
+                | WorkerCommand::Browse { .. }
+                | WorkerCommand::Shutdown),
+            ) => {
                 return Some(command);
             }
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => return latest_view,
@@ -956,6 +1212,9 @@ pub struct ViewerApp {
     ssh_profile_input: String,
     remote_path_input: String,
     ssh_config: Option<OpenSshConfig>,
+    remote_browse_directory: Option<String>,
+    remote_suggestions: Vec<RemotePathSuggestion>,
+    remote_browse_pending: bool,
     dataset: Option<DatasetInfo>,
     selection: PlaneSelection,
     generations: Generations,
@@ -986,6 +1245,9 @@ impl ViewerApp {
             ssh_profile_input: String::new(),
             remote_path_input: String::new(),
             ssh_config: None,
+            remote_browse_directory: None,
+            remote_suggestions: Vec::new(),
+            remote_browse_pending: false,
             dataset: None,
             selection: PlaneSelection::default(),
             generations: Generations::default(),
@@ -1047,6 +1309,57 @@ impl ViewerApp {
         let config = OpenSshConfig::new().with_control_path(control_path);
         self.ssh_config = Some(config.clone());
         Ok(config)
+    }
+
+    fn invalidate_remote_browse(&mut self) {
+        self.generations.begin_browse();
+        self.remote_browse_directory = None;
+        self.remote_suggestions.clear();
+        self.remote_browse_pending = false;
+        self.terminal_bootstrap_command = None;
+    }
+
+    fn browse_remote_path(&mut self, home: bool) {
+        let config = match self.ssh_config() {
+            Ok(config) => config,
+            Err(error) => {
+                self.status = Status::error(error);
+                return;
+            }
+        };
+        let browse_generation = self.generations.begin_browse();
+        self.remote_browse_directory = None;
+        self.remote_suggestions.clear();
+        self.remote_browse_pending = true;
+        self.terminal_bootstrap_command = None;
+        self.status = Status::normal(if home {
+            String::from("Finding remote home directory…")
+        } else {
+            String::from("Listing remote paths…")
+        });
+        if let Err(error) = self.worker.send(WorkerCommand::Browse {
+            profile: self.ssh_profile_input.trim().to_owned(),
+            path: self.remote_path_input.trim().to_owned(),
+            home,
+            config,
+            browse_generation,
+        }) {
+            self.remote_browse_pending = false;
+            self.status = Status::error(error);
+        }
+    }
+
+    fn select_remote_suggestion(&mut self, suggestion: RemotePathSuggestion) {
+        match suggestion.kind {
+            RemotePathKind::Directory => {
+                self.remote_path_input = directory_path(&suggestion.path);
+                self.browse_remote_path(false);
+            }
+            RemotePathKind::CziFile => {
+                self.remote_path_input = suggestion.path;
+                self.invalidate_remote_browse();
+            }
+        }
     }
 
     fn open_locator(&mut self, locator: DatasetLocator) {
@@ -1144,21 +1457,7 @@ impl ViewerApp {
             WorkerEvent::Opened {
                 info,
                 source_generation,
-            } if self.generations.accepts_source(source_generation) => {
-                self.terminal_bootstrap_command = None;
-                self.selection = info.default_selection();
-                self.levels = Levels::default_for(info.pixel_type);
-                self.status = Status::normal(format!(
-                    "Indexed {} tile(s); choose a plane or view the mosaic.",
-                    info.tile_count
-                ));
-                self.dataset = Some(info);
-                self.cache.clear();
-                self.pending_tiles.clear();
-                self.visible_tile_ids.clear();
-                self.fit_pending = true;
-                self.invalidate_view();
-            }
+            } => self.handle_opened(info, source_generation),
             WorkerEvent::OpenFailed {
                 message,
                 terminal_bootstrap_command,
@@ -1167,6 +1466,21 @@ impl ViewerApp {
                 self.status = Status::error(message);
                 self.terminal_bootstrap_command = terminal_bootstrap_command;
             }
+            WorkerEvent::RemotePaths {
+                directory,
+                suggestions,
+                home,
+                browse_generation,
+            } => self.handle_remote_paths(directory, suggestions, home, browse_generation),
+            WorkerEvent::RemotePathsFailed {
+                message,
+                terminal_bootstrap_command,
+                browse_generation,
+            } => self.handle_remote_paths_failed(
+                message,
+                terminal_bootstrap_command,
+                browse_generation,
+            ),
             WorkerEvent::TileLoaded {
                 tile_id,
                 plane,
@@ -1230,12 +1544,67 @@ impl ViewerApp {
             {
                 self.status = Status::error(message);
             }
-            WorkerEvent::Opened { .. }
-            | WorkerEvent::OpenFailed { .. }
+            WorkerEvent::OpenFailed { .. }
             | WorkerEvent::TileLoaded { .. }
             | WorkerEvent::ViewFinished { .. }
             | WorkerEvent::ViewFailed { .. } => {}
         }
+    }
+
+    fn handle_opened(&mut self, info: DatasetInfo, source_generation: u64) {
+        if !self.generations.accepts_source(source_generation) {
+            return;
+        }
+        self.terminal_bootstrap_command = None;
+        self.selection = info.default_selection();
+        self.levels = Levels::default_for(info.pixel_type);
+        self.status = Status::normal(format!(
+            "Indexed {} tile(s); choose a plane or view the mosaic.",
+            info.tile_count
+        ));
+        self.dataset = Some(info);
+        self.cache.clear();
+        self.pending_tiles.clear();
+        self.visible_tile_ids.clear();
+        self.fit_pending = true;
+        self.invalidate_view();
+    }
+
+    fn handle_remote_paths(
+        &mut self,
+        directory: String,
+        suggestions: Vec<RemotePathSuggestion>,
+        home: bool,
+        browse_generation: u64,
+    ) {
+        if !self.generations.accepts_browse(browse_generation) {
+            return;
+        }
+        if home {
+            self.remote_path_input = directory_path(&directory);
+        }
+        self.status = Status::normal(format!(
+            "Listed {} remote path suggestion(s).",
+            suggestions.len()
+        ));
+        self.remote_browse_directory = Some(directory);
+        self.remote_suggestions = suggestions;
+        self.remote_browse_pending = false;
+        self.terminal_bootstrap_command = None;
+    }
+
+    fn handle_remote_paths_failed(
+        &mut self,
+        message: String,
+        terminal_bootstrap_command: Option<String>,
+        browse_generation: u64,
+    ) {
+        if !self.generations.accepts_browse(browse_generation) {
+            return;
+        }
+        self.status = Status::error(message);
+        self.terminal_bootstrap_command = terminal_bootstrap_command;
+        self.remote_browse_pending = false;
     }
 
     fn refresh_textures(&mut self, context: &egui::Context) {
@@ -1483,7 +1852,7 @@ impl eframe::App for ViewerApp {
                 OpenMode::Ssh => {
                     ui.horizontal(|ui| {
                         ui.label("Profile / host alias:");
-                        ui.add(
+                        let profile_response = ui.add(
                             egui::TextEdit::singleline(&mut self.ssh_profile_input)
                                 .hint_text("my-ssh-profile")
                                 .desired_width(220.0),
@@ -1492,8 +1861,17 @@ impl eframe::App for ViewerApp {
                         let response = ui.add(
                             egui::TextEdit::singleline(&mut self.remote_path_input)
                                 .hint_text("/absolute/path/image.czi")
-                                .desired_width(f32::INFINITY),
+                                .desired_width(360.0),
                         );
+                        if profile_response.changed() || response.changed() {
+                            self.invalidate_remote_browse();
+                        }
+                        if ui.button("Home").clicked() {
+                            self.browse_remote_path(true);
+                        }
+                        if ui.button("Browse").clicked() {
+                            self.browse_remote_path(false);
+                        }
                         let connect = ui.button("Connect").clicked()
                             || (response.lost_focus()
                                 && ui.input(|input| input.key_pressed(egui::Key::Enter)));
@@ -1507,6 +1885,37 @@ impl eframe::App for ViewerApp {
                     ui.weak(
                         "Read-only SFTP range reads · 1 MiB blocks · 256 MiB source cache · GUI connections never prompt.",
                     );
+                    if self.remote_browse_pending {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.weak("Listing remote paths…");
+                        });
+                    }
+                    if let Some(directory) = &self.remote_browse_directory {
+                        ui.label(format!("Remote suggestions in {directory}"));
+                        let mut selected_suggestion = None;
+                        egui::ScrollArea::vertical()
+                            .max_height(180.0)
+                            .show(ui, |ui| {
+                                for suggestion in &self.remote_suggestions {
+                                    let label = match suggestion.kind {
+                                        RemotePathKind::Directory => {
+                                            format!("{}/", suggestion.name)
+                                        }
+                                        RemotePathKind::CziFile => suggestion.name.clone(),
+                                    };
+                                    if ui.button(label).clicked() {
+                                        selected_suggestion = Some(suggestion.clone());
+                                    }
+                                }
+                                if self.remote_suggestions.is_empty() {
+                                    ui.weak("No matching directories or .czi files.");
+                                }
+                            });
+                        if let Some(suggestion) = selected_suggestion {
+                            self.select_remote_suggestion(suggestion);
+                        }
+                    }
                     if let Some(command) = &self.terminal_bootstrap_command {
                         ui.separator();
                         ui.label("SSH needs authentication or host-key confirmation:");
@@ -1744,6 +2153,122 @@ mod tests {
         let second_source = generations.begin_source();
         assert_ne!(first_source, second_source);
         assert!(!generations.accepts_view(first_source, second_view));
+    }
+
+    #[test]
+    fn browse_generations_drop_stale_results() {
+        let mut generations = Generations::default();
+        let first = generations.begin_browse();
+        assert!(generations.accepts_browse(first));
+        let second = generations.begin_browse();
+        assert!(!generations.accepts_browse(first));
+        assert!(generations.accepts_browse(second));
+    }
+
+    #[test]
+    fn remote_browser_splits_parent_prefix_and_home_targets() {
+        assert_eq!(
+            remote_browse_target("", false),
+            Ok(RemoteBrowseTarget::Home)
+        );
+        assert_eq!(
+            remote_browse_target("/ignored", true),
+            Ok(RemoteBrowseTarget::Home)
+        );
+        assert_eq!(
+            remote_browse_target("/data/images/", false),
+            Ok(RemoteBrowseTarget::Directory {
+                path: String::from("/data/images"),
+                prefix: String::new(),
+            })
+        );
+        assert_eq!(
+            remote_browse_target("/data/images/sample", false),
+            Ok(RemoteBrowseTarget::Directory {
+                path: String::from("/data/images"),
+                prefix: String::from("sample"),
+            })
+        );
+        assert_eq!(
+            remote_browse_target("sample", false),
+            Err(String::from("remote browser path must be absolute"))
+        );
+    }
+
+    #[test]
+    fn remote_browser_filters_sorts_and_bounds_safe_suggestions() {
+        fn entry(name: &str, permissions: Option<u32>) -> RemoteDirEntry {
+            RemoteDirEntry {
+                path: SftpLocation::new(name).expect("test path"),
+                long_name: String::new(),
+                attributes: czi_ssh::SftpAttributes {
+                    permissions,
+                    ..Default::default()
+                },
+            }
+        }
+
+        let suggestions = remote_path_suggestions(
+            "/data",
+            "",
+            vec![
+                entry("zeta.czi", Some(S_IFREG | 0o644)),
+                entry("folder.czi", Some(S_IFDIR | 0o755)),
+                entry("beta.CZI", None),
+                entry("not-a-czi.txt", Some(S_IFREG | 0o644)),
+                entry("socket.czi", Some(0o140_000)),
+                entry(".", Some(S_IFDIR | 0o755)),
+                entry("..", Some(S_IFDIR | 0o755)),
+                entry("nested/name.czi", Some(S_IFREG | 0o644)),
+                entry("line\nbreak.czi", Some(S_IFREG | 0o644)),
+            ],
+        );
+        assert_eq!(
+            suggestions,
+            vec![
+                RemotePathSuggestion {
+                    name: String::from("beta.CZI"),
+                    path: String::from("/data/beta.CZI"),
+                    kind: RemotePathKind::CziFile,
+                },
+                RemotePathSuggestion {
+                    name: String::from("folder.czi"),
+                    path: String::from("/data/folder.czi"),
+                    kind: RemotePathKind::Directory,
+                },
+                RemotePathSuggestion {
+                    name: String::from("zeta.czi"),
+                    path: String::from("/data/zeta.czi"),
+                    kind: RemotePathKind::CziFile,
+                },
+            ]
+        );
+
+        let entries = (0..=MAX_REMOTE_SUGGESTIONS)
+            .map(|index| entry(&format!("{index:03}.czi"), Some(S_IFREG | 0o644)))
+            .collect();
+        let bounded = remote_path_suggestions("/data", "", entries);
+        assert_eq!(bounded.len(), MAX_REMOTE_SUGGESTIONS);
+        assert_eq!(
+            bounded.first().map(|entry| entry.name.as_str()),
+            Some("000.czi")
+        );
+        assert_eq!(
+            bounded.last().map(|entry| entry.name.as_str()),
+            Some("199.czi")
+        );
+    }
+
+    #[test]
+    fn remote_browse_paths_never_enter_openssh_argv() {
+        let remote_path = "/data/; never-an-ssh-argument.czi";
+        let profile = SshProfile::new("research-cluster").expect("profile");
+        let argv = OpenSshConfig::new()
+            .sftp_argv(&profile)
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(!argv.iter().any(|argument| argument == remote_path));
     }
 
     #[test]

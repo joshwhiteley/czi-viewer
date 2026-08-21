@@ -183,6 +183,11 @@ pub enum SftpProtocolError {
     RequestIdExhausted,
     /// A READDIR response contained no entries instead of `SSH_FX_EOF`.
     EmptyNameResponse,
+    /// A directory listing exceeded its caller-provided entry limit.
+    DirectoryEntryLimit {
+        /// Maximum permitted entries.
+        limit: usize,
+    },
     /// A fallible packet allocation failed.
     Allocation {
         /// Requested allocation size.
@@ -239,6 +244,12 @@ impl fmt::Display for SftpProtocolError {
             Self::RequestIdExhausted => formatter.write_str("SFTP request ID space is exhausted"),
             Self::EmptyNameResponse => {
                 formatter.write_str("SFTP NAME response contained no directory entries")
+            }
+            Self::DirectoryEntryLimit { limit } => {
+                write!(
+                    formatter,
+                    "SFTP directory listing exceeds the {limit}-entry limit"
+                )
             }
             Self::Allocation { size } => write!(formatter, "cannot allocate {size} bytes for SFTP"),
         }

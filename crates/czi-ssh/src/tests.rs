@@ -756,6 +756,35 @@ fn readdir_reaches_eof_and_closes_handle() {
 }
 
 #[test]
+fn readdir_limit_rejects_a_page_that_exceeds_the_budget() {
+    let directory = location("/data");
+    let (mut session, worker) = fake_session(|fake| {
+        fake.expect_init();
+        fake.send_version(false);
+        let open = fake.read_request();
+        fake.send_handle(request_id(&open), b"dir");
+        let page = fake.read_request();
+        assert_eq!(page.packet_type, SSH_FXP_READDIR);
+        send_name(
+            fake,
+            request_id(&page),
+            &[
+                ("one.czi", "one", 0_u32.to_be_bytes().to_vec()),
+                ("two.czi", "two", 0_u32.to_be_bytes().to_vec()),
+            ],
+        );
+    });
+    assert!(matches!(
+        session.read_dir_limited(&directory, 1),
+        Err(SftpError::Protocol(
+            SftpProtocolError::DirectoryEntryLimit { limit: 1 }
+        ))
+    ));
+    drop(session);
+    worker.join().unwrap();
+}
+
+#[test]
 fn readdir_rejects_an_empty_name_page() {
     let directory = location("/data");
     let (mut session, worker) = fake_session(|fake| {

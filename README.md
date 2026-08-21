@@ -37,10 +37,11 @@ The remote viewer uses your normal macOS OpenSSH configuration and profiles from
 1. Start the viewer with `cargo run --release -p czi-viewer`.
 2. Choose **SSH** in the open bar.
 3. Enter an existing OpenSSH profile or host alias, such as `lab-czi`. This is only an example; do not enter a password or one-time code in the viewer.
-4. Enter the absolute remote CZI path, such as `/absolute/path/image.czi`.
-5. Click **Connect**.
+4. Click **Home** to discover your remote home directory, or type an absolute directory or partial path and click **Browse**.
+5. Choose a directory to enter it, or choose a `.czi` file to fill the remote path. Directory entries end in `/`.
+6. Click **Connect**.
 
-The viewer validates the profile and path in its dataset worker, opens the file as read-only SFTP, wraps it in a 1 MiB block cache with a 256 MiB budget, and indexes and decodes only the ranges it needs.
+Remote browsing runs in the dataset worker over the same read-only SFTP/OpenSSH control configuration as opening a CZI. It resolves home with `REALPATH('.')`, reads only the requested directory, scans at most 4,096 entries, filters unsafe names, and shows at most 200 sorted directories and CZI files. The viewer validates the selected profile and path in its dataset worker, wraps an opened CZI in a 1 MiB block cache with a 256 MiB budget, and indexes and decodes only the ranges it needs.
 
 ### Authenticate in Terminal when needed
 
