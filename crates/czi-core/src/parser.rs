@@ -165,6 +165,26 @@ pub enum CziError {
         /// Computed stored byte size.
         expected: u64,
     },
+    /// A pixel type has no decoded-tile representation in this build.
+    #[error("pixel type {pixel_type:?} is unsupported for decoded tiles")]
+    UnsupportedPixel {
+        /// Pixel type declared by the tile.
+        pixel_type: PixelType,
+    },
+    /// A compression mode has no decoder in this build.
+    #[error("compression {compression:?} is unsupported for decoded tiles")]
+    UnsupportedCompression {
+        /// Compression mode declared by the tile.
+        compression: CompressionMode,
+    },
+    /// A tile cannot be represented as one two-dimensional image.
+    #[error("stored dimension {code} has size {stored_size}, expected 1 for a decoded tile")]
+    UnsupportedTileDimensions {
+        /// Non-spatial dimension code.
+        code: DimensionCode,
+        /// Stored number of values in that dimension.
+        stored_size: u32,
+    },
 }
 
 /// Limits used while indexing a CZI source.
@@ -716,6 +736,29 @@ pub struct TilePayload {
     pub attachment_size: u64,
 }
 
+/// Pixels decoded from one CZI tile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecodedPixels {
+    /// Eight-bit grayscale values.
+    Gray8(Vec<u8>),
+    /// Sixteen-bit grayscale values decoded from CZI little-endian storage.
+    Gray16(Vec<u16>),
+}
+
+/// One decoded two-dimensional CZI tile.
+///
+/// This type deliberately represents one stored tile only. It does not assemble mosaics or
+/// request a dense plane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodedTile {
+    /// Stored X dimension in pixels.
+    pub width: u32,
+    /// Stored Y dimension in pixels.
+    pub height: u32,
+    /// Decoded grayscale pixels in row-major order.
+    pub pixels: DecodedPixels,
+}
+
 /// Global metadata XML and its segment location.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MetadataIndex {
@@ -923,6 +966,98 @@ impl CziDataset {
         self.source.read_at(tile.data_offset, &mut buffer[..size])?;
         Ok(size)
     }
+
+    /// Decode one uncompressed Gray8 or Gray16 tile.
+    ///
+    /// The subblock descriptor and payload are resolved only for the requested tile. X and Y
+    /// use their stored sizes; every other stored dimension must be one, so this method never
+    /// creates a dense multi-dimensional plane or mosaic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CziError::UnsupportedPixel`] for pixel types other than Gray8 and Gray16,
+    /// [`CziError::UnsupportedCompression`] for every compressed payload, or a structured
+    /// source/format/allocation error when the tile cannot safely be decoded.
+    pub fn decoded_tile(&self, index: usize) -> Result<DecodedTile, CziError> {
+        let tile = self.index.tiles.get(index).ok_or(CziError::Missing {
+            what: "tile",
+            offset: u64::try_from(index).map_err(|_| CziError::Overflow {
+                context: "tile index conversion",
+            })?,
+        })?;
+        let payload = self.tile_payload(index)?;
+        if !matches!(tile.entry.compression, CompressionMode::Uncompressed) {
+            return Err(CziError::UnsupportedCompression {
+                compression: tile.entry.compression,
+            });
+        }
+        let (width, height) = stored_xy_dimensions(&tile.entry)?;
+        let pixels = checked_mul(
+            u64::from(width),
+            u64::from(height),
+            "decoded tile pixel count",
+        )?;
+
+        match tile.entry.pixel_type {
+            PixelType::Gray8 => {
+                let bytes = read_vec(&self.source, payload.data_offset, payload.data_size)?;
+                Ok(DecodedTile {
+                    width,
+                    height,
+                    pixels: DecodedPixels::Gray8(bytes),
+                })
+            }
+            PixelType::Gray16 => {
+                let bytes = read_vec(&self.source, payload.data_offset, payload.data_size)?;
+                let pixel_count = usize::try_from(pixels).map_err(|_| CziError::Overflow {
+                    context: "decoded Gray16 pixel count conversion",
+                })?;
+                let mut values = Vec::new();
+                try_reserve_exact(
+                    &mut values,
+                    pixel_count,
+                    "decoded Gray16 pixels",
+                    checked_mul(pixels, 2, "decoded Gray16 byte count")?,
+                )?;
+                for value in bytes.chunks_exact(2) {
+                    values.push(u16::from_le_bytes([value[0], value[1]]));
+                }
+                Ok(DecodedTile {
+                    width,
+                    height,
+                    pixels: DecodedPixels::Gray16(values),
+                })
+            }
+            pixel_type => Err(CziError::UnsupportedPixel { pixel_type }),
+        }
+    }
+}
+
+fn stored_xy_dimensions(entry: &DirectoryEntry) -> Result<(u32, u32), CziError> {
+    let mut width = None;
+    let mut height = None;
+    for dimension in &entry.dimensions {
+        match dimension.code {
+            DimensionCode::X => width = Some(dimension.stored_size),
+            DimensionCode::Y => height = Some(dimension.stored_size),
+            code if dimension.stored_size != 1 => {
+                return Err(CziError::UnsupportedTileDimensions {
+                    code,
+                    stored_size: dimension.stored_size,
+                });
+            }
+            _ => {}
+        }
+    }
+    let width = width.ok_or(CziError::Missing {
+        what: "stored X dimension",
+        offset: entry.file_position,
+    })?;
+    let height = height.ok_or(CziError::Missing {
+        what: "stored Y dimension",
+        offset: entry.file_position,
+    })?;
+    Ok((width, height))
 }
 
 fn parse_index(

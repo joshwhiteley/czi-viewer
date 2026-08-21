@@ -1,6 +1,7 @@
 use czi_core::{
-    AttachmentIndex, CompressionMode, CziDataset, CziError, DimensionCode, LocalFileSource,
-    MemorySource, ParseOptions, PixelType, PyramidType, RandomAccessSource, SourceError,
+    AttachmentIndex, CompressionMode, CziDataset, CziError, DecodedPixels, DimensionCode,
+    LocalFileSource, MemorySource, ParseOptions, PixelType, PyramidType, RandomAccessSource,
+    SourceError,
 };
 use std::path::PathBuf;
 use std::sync::{
@@ -55,6 +56,73 @@ fn parses_tile_first_index_and_metadata_without_dense_pixels() {
         64
     );
     assert_eq!(&payload[..4], [1, 2, 3, 4]);
+}
+
+#[test]
+fn decodes_uncompressed_gray_tiles_with_stored_xy_dimensions() {
+    let mut gray16 = synthetic_file(false);
+    make_single_plane(&mut gray16, 1, 32);
+    let data = tile_data_range(&gray16);
+    gray16.bytes[data..data + 8].copy_from_slice(&[0x34, 0x12, 0xcd, 0xab, 0, 0, 0xff, 0xff]);
+    let tile = open(gray16.bytes).decoded_tile(0).expect("Gray16 tile");
+    assert_eq!((tile.width, tile.height), (8, 2));
+    assert_eq!(
+        tile.pixels,
+        DecodedPixels::Gray16(vec![
+            0x1234, 0xabcd, 0, 0xffff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        ])
+    );
+
+    let mut gray8 = synthetic_file(false);
+    make_single_plane(&mut gray8, 0, 16);
+    let data = tile_data_range(&gray8);
+    gray8.bytes[data..data + 16]
+        .copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 255]);
+    let tile = open(gray8.bytes).decoded_tile(0).expect("Gray8 tile");
+    assert_eq!((tile.width, tile.height), (8, 2));
+    assert_eq!(
+        tile.pixels,
+        DecodedPixels::Gray8(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 255])
+    );
+}
+
+#[test]
+fn decode_reports_unsupported_pixel_compression_and_dimensions() {
+    let dataset = open(synthetic_file(false).bytes);
+    let error = dataset
+        .decoded_tile(0)
+        .expect_err("non-spatial stored dimension");
+    assert!(matches!(
+        error,
+        CziError::UnsupportedTileDimensions {
+            code,
+            stored_size: 2,
+        } if code == DimensionCode::Unknown(*b"Q\0\0\0")
+    ));
+
+    let mut compressed = synthetic_file(false);
+    set_tile_compression(&mut compressed, 1);
+    let error = open(compressed.bytes)
+        .decoded_tile(0)
+        .expect_err("compressed tile");
+    assert!(matches!(
+        error,
+        CziError::UnsupportedCompression {
+            compression: CompressionMode::Jpeg,
+        }
+    ));
+
+    let mut unsupported = synthetic_file(false);
+    make_single_plane(&mut unsupported, 2, 64);
+    let error = open(unsupported.bytes)
+        .decoded_tile(0)
+        .expect_err("unsupported pixel type");
+    assert!(matches!(
+        error,
+        CziError::UnsupportedPixel {
+            pixel_type: PixelType::Gray32Float,
+        }
+    ));
 }
 
 #[test]
@@ -394,6 +462,32 @@ fn index_local_fixtures_without_pixel_allocation() {
 }
 
 #[test]
+#[ignore = "requires the local plate fixture and CZI_RUN_FIXTURES=1"]
+fn decodes_one_tile_from_local_plate_fixture() {
+    if std::env::var_os("CZI_RUN_FIXTURES").is_none() {
+        return;
+    }
+    let path = std::env::var_os("CZI_PLATE_FIXTURE").map_or_else(
+        || PathBuf::from("/Users/josh/Downloads/ts_04042026_Bb_plate1_rep1_ML-01 (1).czi"),
+        PathBuf::from,
+    );
+    if !path.exists() {
+        eprintln!("skipping missing fixture {}", path.display());
+        return;
+    }
+    let dataset = CziDataset::open(LocalFileSource::open(path).expect("fixture source"))
+        .expect("fixture index");
+    let tile = dataset.decoded_tile(0).expect("fixture tile");
+    assert!(tile.width > 0 && tile.height > 0);
+    let pixel_count = usize::try_from(u64::from(tile.width) * u64::from(tile.height))
+        .expect("fixture pixel count");
+    match tile.pixels {
+        DecodedPixels::Gray16(values) => assert_eq!(values.len(), pixel_count),
+        DecodedPixels::Gray8(_) => panic!("plate fixture should be Gray16"),
+    }
+}
+
+#[test]
 #[ignore = "requires the 2,700-tile HADA fixture and CZI_RUN_FIXTURES=1"]
 fn opening_hada_uses_bounded_source_reads() {
     if std::env::var_os("CZI_RUN_FIXTURES").is_none() {
@@ -549,6 +643,37 @@ fn synthetic_file(with_attachments: bool) -> SyntheticFile {
         subblock_offset,
         attachment_offset,
     }
+}
+
+fn make_single_plane(file: &mut SyntheticFile, pixel_type: i32, data_size: i64) {
+    for entry in [directory_entry_offset(file), inline_entry_offset(file)] {
+        file.bytes[entry + 2..entry + 6].copy_from_slice(&pixel_type.to_le_bytes());
+        let stored_size = entry + DV_FIXED_SIZE + 3 * DIMENSION_SIZE + 16;
+        file.bytes[stored_size..stored_size + 4].copy_from_slice(&1_i32.to_le_bytes());
+    }
+    let data_size_offset =
+        usize::try_from(file.subblock_offset).expect("offset") + SEGMENT_HEADER_SIZE + 8;
+    file.bytes[data_size_offset..data_size_offset + 8].copy_from_slice(&data_size.to_le_bytes());
+}
+
+fn set_tile_compression(file: &mut SyntheticFile, compression: i32) {
+    for entry in [directory_entry_offset(file), inline_entry_offset(file)] {
+        file.bytes[entry + 18..entry + 22].copy_from_slice(&compression.to_le_bytes());
+    }
+}
+
+fn directory_entry_offset(file: &SyntheticFile) -> usize {
+    usize::try_from(file.directory_offset).expect("offset")
+        + SEGMENT_HEADER_SIZE
+        + DIRECTORY_DATA_SIZE
+}
+
+fn inline_entry_offset(file: &SyntheticFile) -> usize {
+    usize::try_from(file.subblock_offset).expect("offset") + SEGMENT_HEADER_SIZE + 16
+}
+
+fn tile_data_range(file: &SyntheticFile) -> usize {
+    usize::try_from(file.subblock_offset).expect("offset") + SEGMENT_HEADER_SIZE + 256
 }
 
 fn directory_data(_subblock_offset: u64) -> Vec<u8> {
