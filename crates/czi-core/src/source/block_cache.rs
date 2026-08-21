@@ -78,6 +78,7 @@ pub struct CacheStats {
 enum BlockState {
     Loading {
         flight_id: u64,
+        reserved_bytes: usize,
         waiters: usize,
     },
     Ready {
@@ -92,6 +93,7 @@ enum BlockState {
 struct CacheState {
     blocks: HashMap<u64, BlockState>,
     resident_bytes: usize,
+    loading_bytes: usize,
     next_flight_id: u64,
     use_counter: u64,
     stats: CacheStats,
@@ -230,26 +232,25 @@ impl<S: RandomAccessSource> BlockCache<S> {
 
         debug_assert_eq!(bytes.len(), block_length);
         let mut state = self.lock_state()?;
-        let (flight_id, waiters) = match state.blocks.get(&block_index) {
-            Some(BlockState::Loading { flight_id, waiters }) => (*flight_id, *waiters),
-            _ => (0, 0),
-        };
-        while state.resident_bytes > self.max_bytes.saturating_sub(bytes.len()) {
-            let Some(victim) = least_recently_used(&state) else {
-                state = self.state_changed.wait(state).map_err(|_| {
-                    SourceError::Io(io::Error::other("block cache state lock was poisoned"))
-                })?;
-                continue;
-            };
-            if let Some(BlockState::Ready { bytes, .. }) = state.blocks.remove(&victim) {
-                state.resident_bytes = state.resident_bytes.saturating_sub(bytes.len());
-                state.stats.evictions = state.stats.evictions.saturating_add(1);
+        let (flight_id, reserved_bytes, waiters) = match state.blocks.get(&block_index) {
+            Some(BlockState::Loading {
+                flight_id,
+                reserved_bytes,
+                waiters,
+            }) => (*flight_id, *reserved_bytes, *waiters),
+            _ => {
+                return Err(SourceError::Io(io::Error::other(
+                    "block cache loading state disappeared",
+                )));
             }
-        }
-        state.resident_bytes = state
+        };
+        debug_assert_eq!(reserved_bytes, bytes.len());
+        let resident_bytes = state
             .resident_bytes
             .checked_add(bytes.len())
             .ok_or(SourceError::Allocation { size: bytes.len() })?;
+        state.loading_bytes = state.loading_bytes.saturating_sub(reserved_bytes);
+        state.resident_bytes = resident_bytes;
         let last_used = Self::next_use(&mut state);
         state.blocks.insert(
             block_index,
@@ -267,7 +268,11 @@ impl<S: RandomAccessSource> BlockCache<S> {
 
     fn clear_loading(&self, block_index: u64) {
         if let Ok(mut state) = self.state.lock() {
-            state.blocks.remove(&block_index);
+            if let Some(BlockState::Loading { reserved_bytes, .. }) =
+                state.blocks.remove(&block_index)
+            {
+                state.loading_bytes = state.loading_bytes.saturating_sub(reserved_bytes);
+            }
             drop(state);
             self.state_changed.notify_all();
         }
@@ -333,12 +338,31 @@ impl<S: RandomAccessSource> BlockCache<S> {
                 continue;
             }
 
+            let used_bytes = state.resident_bytes.saturating_add(state.loading_bytes);
+            let has_room =
+                used_bytes <= self.max_bytes && block_length_usize <= self.max_bytes - used_bytes;
+            if !has_room {
+                if let Some(victim) = least_recently_used(&state) {
+                    if let Some(BlockState::Ready { bytes, .. }) = state.blocks.remove(&victim) {
+                        state.resident_bytes = state.resident_bytes.saturating_sub(bytes.len());
+                        state.stats.evictions = state.stats.evictions.saturating_add(1);
+                    }
+                } else {
+                    state = self.state_changed.wait(state).map_err(|_| {
+                        SourceError::Io(io::Error::other("block cache state lock was poisoned"))
+                    })?;
+                }
+                continue;
+            }
+
+            state.loading_bytes += block_length_usize;
             state.next_flight_id = state.next_flight_id.saturating_add(1);
             let flight_id = state.next_flight_id;
             state.blocks.insert(
                 block_index,
                 BlockState::Loading {
                     flight_id,
+                    reserved_bytes: block_length_usize,
                     waiters: 0,
                 },
             );

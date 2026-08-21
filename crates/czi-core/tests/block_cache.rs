@@ -1,5 +1,5 @@
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -145,8 +145,9 @@ fn failed_loads_are_not_cached_and_can_recover() {
         cache.read_at(4, &mut bytes),
         Err(SourceError::Io(_))
     ));
-    cache.read_at(0, &mut bytes).expect("resident block");
-    assert_eq!(reads.load(Ordering::SeqCst), 3);
+    cache.read_at(4, &mut bytes).expect("retry failed block");
+    assert_eq!(bytes, [4, 5, 6, 7]);
+    assert_eq!(reads.load(Ordering::SeqCst), 4);
 }
 
 #[test]
@@ -186,6 +187,44 @@ fn concurrent_readers_single_flight_one_block_load() {
 }
 
 #[test]
+fn distinct_misses_reserve_the_one_block_budget() {
+    let mut source = InstrumentedSource::new(8, 7);
+    let gate = Arc::new(Gate::default());
+    source.gate = Some(Arc::clone(&gate));
+    let reads = Arc::clone(&source.reads);
+    let peak_active_bytes = Arc::clone(&source.peak_active_bytes);
+    let second_started = Arc::new(AtomicBool::new(false));
+    let cache = Arc::new(BlockCache::new(source, BlockCacheConfig::new(4, 4)).expect("cache"));
+
+    let first_cache = Arc::clone(&cache);
+    let first = thread::spawn(move || {
+        let mut bytes = [0; 4];
+        first_cache.read_at(0, &mut bytes)
+    });
+    gate.wait_until_started();
+
+    let second_cache = Arc::clone(&cache);
+    let second_started_flag = Arc::clone(&second_started);
+    let second = thread::spawn(move || {
+        second_started_flag.store(true, Ordering::SeqCst);
+        let mut bytes = [0; 4];
+        second_cache.read_at(4, &mut bytes)
+    });
+    while !second_started.load(Ordering::SeqCst) {
+        thread::yield_now();
+    }
+    thread::sleep(Duration::from_millis(20));
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+    assert_eq!(peak_active_bytes.load(Ordering::SeqCst), 4);
+
+    gate.release();
+    first.join().expect("first thread").expect("first read");
+    second.join().expect("second thread").expect("second read");
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    assert_eq!(peak_active_bytes.load(Ordering::SeqCst), 4);
+}
+
+#[test]
 fn snapshots_source_length_and_version() {
     let source = InstrumentedSource::new(8, 42);
     let info_calls = Arc::clone(&source.info_calls);
@@ -215,6 +254,8 @@ struct InstrumentedSource {
     inner: MemorySource,
     info_value: SourceInfo,
     reads: Arc<AtomicUsize>,
+    active_bytes: Arc<AtomicUsize>,
+    peak_active_bytes: Arc<AtomicUsize>,
     info_calls: Arc<AtomicUsize>,
     failures: Arc<AtomicUsize>,
     gate: Option<Arc<Gate>>,
@@ -232,6 +273,8 @@ impl InstrumentedSource {
                 version,
             },
             reads: Arc::new(AtomicUsize::new(0)),
+            active_bytes: Arc::new(AtomicUsize::new(0)),
+            peak_active_bytes: Arc::new(AtomicUsize::new(0)),
             info_calls: Arc::new(AtomicUsize::new(0)),
             failures: Arc::new(AtomicUsize::new(0)),
             gate: None,
@@ -247,19 +290,28 @@ impl RandomAccessSource for InstrumentedSource {
 
     fn read_at(&self, offset: u64, destination: &mut [u8]) -> Result<(), SourceError> {
         self.reads.fetch_add(1, Ordering::SeqCst);
-        if self
+        let active = self
+            .active_bytes
+            .fetch_add(destination.len(), Ordering::SeqCst)
+            .saturating_add(destination.len());
+        self.peak_active_bytes.fetch_max(active, Ordering::SeqCst);
+        let result = if self
             .failures
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok()
         {
-            return Err(SourceError::Io(io::Error::other("instrumented failure")));
-        }
-        if let Some(gate) = &self.gate {
-            gate.wait_for_release();
-        }
-        self.inner.read_at(offset, destination)
+            Err(SourceError::Io(io::Error::other("instrumented failure")))
+        } else {
+            if let Some(gate) = &self.gate {
+                gate.wait_for_release();
+            }
+            self.inner.read_at(offset, destination)
+        };
+        self.active_bytes
+            .fetch_sub(destination.len(), Ordering::SeqCst);
+        result
     }
 }
 
