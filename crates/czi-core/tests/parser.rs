@@ -1,7 +1,7 @@
 use czi_core::{
-    AttachmentIndex, CompressionMode, CziDataset, CziError, DecodedPixels, DimensionCode,
-    LocalFileSource, MemorySource, ParseOptions, PixelType, PyramidType, RandomAccessSource,
-    SourceError,
+    AttachmentIndex, BlockCache, CompressionMode, CziDataset, CziError, DecodedPixels,
+    DimensionCode, LocalFileSource, MemorySource, ParseOptions, PixelType, PyramidType,
+    RandomAccessSource, SourceError,
 };
 use std::path::PathBuf;
 use std::sync::{
@@ -56,6 +56,26 @@ fn parses_tile_first_index_and_metadata_without_dense_pixels() {
         64
     );
     assert_eq!(&payload[..4], [1, 2, 3, 4]);
+}
+
+#[test]
+fn block_cache_reuses_czi_parser_ranges_from_a_fake_source() {
+    let file = synthetic_file(false);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let source = CountingSource {
+        inner: Arc::new(MemorySource::new(file.bytes)),
+        reads: Arc::clone(&reads),
+    };
+    let cache = BlockCache::with_defaults(source).expect("default block cache");
+    let dataset = CziDataset::open(cache).expect("cached synthetic CZI");
+    let reads_after_open = reads.load(Ordering::Relaxed);
+    assert!(reads_after_open > 0);
+
+    dataset.tile_payload(0).expect("first tile parse");
+    let reads_after_first_parse = reads.load(Ordering::Relaxed);
+    dataset.tile_payload(0).expect("repeated tile parse");
+    assert_eq!(reads.load(Ordering::Relaxed), reads_after_first_parse);
+    assert_eq!(reads_after_first_parse, reads_after_open);
 }
 
 #[test]

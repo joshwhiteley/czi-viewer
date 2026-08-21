@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 czi-core = { path = "../czi-core" }
+czi-ssh = { path = "../czi-ssh" }
 eframe = { version = "=0.32.3", default-features = false, features = ["wgpu", "default_fonts"] }
 wgpu = { version = "=25.0.2", default-features = false, features = ["metal", "wgsl"] }
 

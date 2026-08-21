@@ -370,6 +370,7 @@ name = "czi-viewer"
 version = "0.1.0"
 dependencies = [
  "czi-core",
+ "czi-ssh",
  "eframe",
  "wgpu",
 ]

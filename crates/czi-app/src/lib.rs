@@ -11,10 +11,11 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use czi_core::{
-    CziDataset, DecodedPixels, DecodedTile, DimensionCode, LocalFileSource, PhysicalSize,
-    PixelType, PlaneInfo, PlaneKey, PlaneSelector, PyramidScale, SceneId, SpatialRect, TileHit,
-    TileId, TileIndex, TileQueryIndex, ViewQuery,
+    BlockCache, CziDataset, DecodedPixels, DecodedTile, DimensionCode, LocalFileSource,
+    PhysicalSize, PixelType, PlaneInfo, PlaneKey, PlaneSelector, PyramidScale, SceneId,
+    SpatialRect, TileHit, TileId, TileIndex, TileQueryIndex, ViewQuery,
 };
+use czi_ssh::{ControlPath, OpenSshConfig, SftpLocation, SftpSource, SshProfile};
 use eframe::egui;
 
 const CHANNEL_CAPACITY: usize = 8;
@@ -45,9 +46,80 @@ impl SceneChoices {
     }
 }
 
+#[derive(Clone, Debug)]
+enum DatasetLocator {
+    Local(PathBuf),
+    Remote {
+        profile: String,
+        path: String,
+        config: OpenSshConfig,
+    },
+}
+
+impl DatasetLocator {
+    fn display_label(&self) -> String {
+        match self {
+            Self::Local(path) => path.display().to_string(),
+            Self::Remote { profile, path, .. } => format!("SSH {profile}:{path}"),
+        }
+    }
+
+    fn remote_parts(&self) -> Result<(SshProfile, SftpLocation, &OpenSshConfig), String> {
+        let Self::Remote {
+            profile,
+            path,
+            config,
+        } = self
+        else {
+            return Err(String::from("local source is not an SSH locator"));
+        };
+        let profile = SshProfile::new(profile.clone()).map_err(|error| error.to_string())?;
+        let location = SftpLocation::new(path.clone()).map_err(|error| error.to_string())?;
+        if !location.as_str().starts_with('/') {
+            return Err(String::from("remote CZI path must be absolute"));
+        }
+        Ok((profile, location, config))
+    }
+
+    fn open_failure(&self, error: impl std::fmt::Display) -> OpenFailure {
+        let terminal_bootstrap_command = match self {
+            Self::Local(_) => None,
+            Self::Remote {
+                profile, config, ..
+            } => SshProfile::new(profile.clone())
+                .ok()
+                .and_then(|profile| config.terminal_bootstrap_command(&profile).ok()),
+        };
+        OpenFailure {
+            message: sanitize_error(error),
+            terminal_bootstrap_command,
+        }
+    }
+}
+
+struct OpenFailure {
+    message: String,
+    terminal_bootstrap_command: Option<String>,
+}
+
+fn sanitize_error(error: impl std::fmt::Display) -> String {
+    const MAX_ERROR_CHARS: usize = 4_096;
+
+    let message = error.to_string();
+    let mut sanitized = message
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+        .take(MAX_ERROR_CHARS)
+        .collect::<String>();
+    if message.chars().count() > MAX_ERROR_CHARS {
+        sanitized.push('…');
+    }
+    sanitized
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DatasetInfo {
-    path: PathBuf,
+    source_label: String,
     tile_count: usize,
     c: DimensionChoices,
     s: SceneChoices,
@@ -59,7 +131,7 @@ struct DatasetInfo {
 }
 
 impl DatasetInfo {
-    fn from_dataset(path: PathBuf, dataset: &CziDataset, query: &TileQueryIndex) -> Self {
+    fn from_dataset(source_label: String, dataset: &CziDataset, query: &TileQueryIndex) -> Self {
         let tiles = &dataset.index().tiles;
         let metadata_preview = dataset.index().metadata.as_ref().map_or_else(
             || String::from("No global metadata XML."),
@@ -69,7 +141,7 @@ impl DatasetInfo {
             .first()
             .map_or(PixelType::Gray8, |tile| tile.entry.pixel_type);
         Self {
-            path,
+            source_label,
             tile_count: tiles.len(),
             c: dimension_choices(tiles, DimensionCode::C),
             s: scene_choices(query),
@@ -165,7 +237,7 @@ struct ViewRequest {
 
 enum WorkerCommand {
     Open {
-        path: PathBuf,
+        locator: DatasetLocator,
         source_generation: u64,
     },
     View(ViewRequest),
@@ -179,6 +251,7 @@ enum WorkerEvent {
     },
     OpenFailed {
         message: String,
+        terminal_bootstrap_command: Option<String>,
         source_generation: u64,
     },
     TileLoaded {
@@ -275,24 +348,12 @@ fn worker_loop(commands: &Receiver<WorkerCommand>, events: &SyncSender<WorkerEve
         };
         match command {
             WorkerCommand::Open {
-                path,
+                locator,
                 source_generation,
             } => {
                 active_source_generation = source_generation;
                 dataset = None;
-                let result = match LocalFileSource::open(&path)
-                    .map_err(czi_core::CziError::from)
-                    .and_then(CziDataset::open)
-                {
-                    Err(error) => Err(error.to_string()),
-                    Ok(opened) => match TileQueryIndex::new(opened.index()) {
-                        Err(error) => Err(error.to_string()),
-                        Ok(query) => {
-                            let info = DatasetInfo::from_dataset(path, &opened, &query);
-                            Ok((opened, query, info))
-                        }
-                    },
-                };
+                let result = open_dataset(locator);
                 match result {
                     Ok((opened, query, info)) => {
                         dataset = Some(WorkerDataset {
@@ -309,10 +370,14 @@ fn worker_loop(commands: &Receiver<WorkerCommand>, events: &SyncSender<WorkerEve
                             break;
                         }
                     }
-                    Err(error) => {
+                    Err(OpenFailure {
+                        message,
+                        terminal_bootstrap_command,
+                    }) => {
                         if events
                             .send(WorkerEvent::OpenFailed {
-                                message: error.clone(),
+                                message,
+                                terminal_bootstrap_command,
                                 source_generation,
                             })
                             .is_err()
@@ -350,6 +415,48 @@ fn worker_loop(commands: &Receiver<WorkerCommand>, events: &SyncSender<WorkerEve
             WorkerCommand::Shutdown => break,
         }
     }
+}
+
+fn open_dataset(
+    locator: DatasetLocator,
+) -> Result<(CziDataset, TileQueryIndex, DatasetInfo), OpenFailure> {
+    match locator {
+        DatasetLocator::Local(path) => {
+            let source_label = path.display().to_string();
+            let opened = LocalFileSource::open(&path)
+                .map_err(czi_core::CziError::from)
+                .and_then(CziDataset::open)
+                .map_err(|error| OpenFailure {
+                    message: sanitize_error(error),
+                    terminal_bootstrap_command: None,
+                })?;
+            finish_open(source_label, opened).map_err(|error| OpenFailure {
+                message: sanitize_error(error),
+                terminal_bootstrap_command: None,
+            })
+        }
+        remote @ DatasetLocator::Remote { .. } => {
+            let source_label = remote.display_label();
+            let (profile, location, config) = remote
+                .remote_parts()
+                .map_err(|error| remote.open_failure(error))?;
+            let source = SftpSource::open(&profile, &location, config)
+                .map_err(|error| remote.open_failure(error))?;
+            let cache =
+                BlockCache::with_defaults(source).map_err(|error| remote.open_failure(error))?;
+            let opened = CziDataset::open(cache).map_err(|error| remote.open_failure(error))?;
+            finish_open(source_label, opened).map_err(|error| remote.open_failure(error))
+        }
+    }
+}
+
+fn finish_open(
+    source_label: String,
+    opened: CziDataset,
+) -> Result<(CziDataset, TileQueryIndex, DatasetInfo), String> {
+    let query = TileQueryIndex::new(opened.index()).map_err(|error| error.to_string())?;
+    let info = DatasetInfo::from_dataset(source_label, &opened, &query);
+    Ok((opened, query, info))
 }
 
 fn take_newer_command(commands: &Receiver<WorkerCommand>) -> Option<WorkerCommand> {
@@ -487,6 +594,13 @@ fn scene_choices(query: &TileQueryIndex) -> SceneChoices {
 struct Status {
     message: String,
     is_error: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum OpenMode {
+    #[default]
+    Local,
+    Ssh,
 }
 
 impl Status {
@@ -834,10 +948,14 @@ struct PendingTile {
     view_generation: u64,
 }
 
-/// The local CZI mosaic viewer.
+/// The local and SSH CZI mosaic viewer.
 pub struct ViewerApp {
     worker: DatasetWorker,
+    open_mode: OpenMode,
     path_input: String,
+    ssh_profile_input: String,
+    remote_path_input: String,
+    ssh_config: Option<OpenSshConfig>,
     dataset: Option<DatasetInfo>,
     selection: PlaneSelection,
     generations: Generations,
@@ -850,7 +968,8 @@ pub struct ViewerApp {
     camera: Camera,
     fit_pending: bool,
     last_request: Option<(PlaneKey, SpatialRect, u64)>,
-    pending_open: Option<(PathBuf, u64)>,
+    pending_open: Option<(DatasetLocator, u64)>,
+    terminal_bootstrap_command: Option<String>,
 }
 
 impl ViewerApp {
@@ -860,13 +979,17 @@ impl ViewerApp {
         let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
         let mut app = Self {
             worker: DatasetWorker::spawn(),
+            open_mode: OpenMode::Local,
             path_input: initial_path
                 .as_ref()
                 .map_or_else(String::new, |path| path.display().to_string()),
+            ssh_profile_input: String::new(),
+            remote_path_input: String::new(),
+            ssh_config: None,
             dataset: None,
             selection: PlaneSelection::default(),
             generations: Generations::default(),
-            status: Status::normal("Enter a local .czi path or drop a file from Finder."),
+            status: Status::normal("Choose Local or SSH, then open a .czi file."),
             cache: TextureCache::new(TEXTURE_CACHE_LIMIT),
             pending_tiles: Vec::new(),
             visible_tile_ids: Vec::new(),
@@ -876,9 +999,10 @@ impl ViewerApp {
             fit_pending: false,
             last_request: None,
             pending_open: None,
+            terminal_bootstrap_command: None,
         };
         if initial_path.is_some() {
-            app.open_current_path();
+            app.open_local_path();
         }
         app
     }
@@ -891,12 +1015,42 @@ impl ViewerApp {
         self.cache.clear_visibility();
     }
 
-    fn open_current_path(&mut self) {
+    fn open_local_path(&mut self) {
         let path = PathBuf::from(self.path_input.trim());
         if self.path_input.trim().is_empty() {
             self.status = Status::error("Enter a local .czi path first.");
             return;
         }
+        self.open_locator(DatasetLocator::Local(path));
+    }
+
+    fn open_remote_path(&mut self) {
+        let config = match self.ssh_config() {
+            Ok(config) => config,
+            Err(error) => {
+                self.status = Status::error(error);
+                return;
+            }
+        };
+        self.open_locator(DatasetLocator::Remote {
+            profile: self.ssh_profile_input.trim().to_owned(),
+            path: self.remote_path_input.trim().to_owned(),
+            config,
+        });
+    }
+
+    fn ssh_config(&mut self) -> Result<OpenSshConfig, String> {
+        if let Some(config) = &self.ssh_config {
+            return Ok(config.clone());
+        }
+        let control_path = ControlPath::create_private().map_err(sanitize_error)?;
+        let config = OpenSshConfig::new().with_control_path(control_path);
+        self.ssh_config = Some(config.clone());
+        Ok(config)
+    }
+
+    fn open_locator(&mut self, locator: DatasetLocator) {
+        let source_label = locator.display_label();
         let source_generation = self.generations.begin_source();
         self.dataset = None;
         self.cache.clear();
@@ -905,10 +1059,11 @@ impl ViewerApp {
         self.selected_scale = None;
         self.last_request = None;
         self.fit_pending = false;
-        self.status = Status::normal(format!("Opening {}…", path.display()));
-        let pending = (path.clone(), source_generation);
+        self.terminal_bootstrap_command = None;
+        self.status = Status::normal(format!("Opening {source_label}…"));
+        let pending = (locator.clone(), source_generation);
         if let Err(error) = self.worker.send(WorkerCommand::Open {
-            path,
+            locator,
             source_generation,
         }) {
             self.pending_open = Some(pending);
@@ -919,14 +1074,14 @@ impl ViewerApp {
     }
 
     fn retry_pending_open(&mut self) {
-        let Some((path, source_generation)) = self.pending_open.take() else {
+        let Some((locator, source_generation)) = self.pending_open.take() else {
             return;
         };
         if let Err(error) = self.worker.send(WorkerCommand::Open {
-            path: path.clone(),
+            locator: locator.clone(),
             source_generation,
         }) {
-            self.pending_open = Some((path, source_generation));
+            self.pending_open = Some((locator, source_generation));
             self.status = Status::error(error);
         }
     }
@@ -972,8 +1127,9 @@ impl ViewerApp {
                 .find_map(|file| file.path.clone())
         });
         if let Some(path) = path {
+            self.open_mode = OpenMode::Local;
             self.path_input = path.display().to_string();
-            self.open_current_path();
+            self.open_local_path();
         }
     }
 
@@ -989,6 +1145,7 @@ impl ViewerApp {
                 info,
                 source_generation,
             } if self.generations.accepts_source(source_generation) => {
+                self.terminal_bootstrap_command = None;
                 self.selection = info.default_selection();
                 self.levels = Levels::default_for(info.pixel_type);
                 self.status = Status::normal(format!(
@@ -1004,9 +1161,11 @@ impl ViewerApp {
             }
             WorkerEvent::OpenFailed {
                 message,
+                terminal_bootstrap_command,
                 source_generation,
             } if self.generations.accepts_source(source_generation) => {
                 self.status = Status::error(message);
+                self.terminal_bootstrap_command = terminal_bootstrap_command;
             }
             WorkerEvent::TileLoaded {
                 tile_id,
@@ -1244,6 +1403,19 @@ impl ViewerApp {
     }
 }
 
+impl Drop for ViewerApp {
+    fn drop(&mut self) {
+        self.worker.shutdown();
+        if let Some(control_path) = self
+            .ssh_config
+            .as_ref()
+            .and_then(OpenSshConfig::control_path)
+        {
+            let _ = std::fs::remove_dir_all(control_path.directory());
+        }
+    }
+}
+
 fn format_bytes(bytes: usize) -> String {
     if bytes >= 1024 * 1024 {
         format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
@@ -1288,19 +1460,73 @@ impl eframe::App for ViewerApp {
 
         egui::TopBottomPanel::top("open_bar").show(context, |ui| {
             ui.horizontal(|ui| {
-                ui.label("CZI path:");
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.path_input)
-                        .hint_text("/path/to/image.czi")
-                        .desired_width(f32::INFINITY),
-                );
-                let open = ui.button("Open").clicked()
-                    || (response.lost_focus()
-                        && ui.input(|input| input.key_pressed(egui::Key::Enter)));
-                if open {
-                    self.open_current_path();
-                }
+                ui.selectable_value(&mut self.open_mode, OpenMode::Local, "Local");
+                ui.selectable_value(&mut self.open_mode, OpenMode::Ssh, "SSH");
             });
+            match self.open_mode {
+                OpenMode::Local => {
+                    ui.horizontal(|ui| {
+                        ui.label("CZI path:");
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.path_input)
+                                .hint_text("/path/to/image.czi")
+                                .desired_width(f32::INFINITY),
+                        );
+                        let open = ui.button("Open").clicked()
+                            || (response.lost_focus()
+                                && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+                        if open {
+                            self.open_local_path();
+                        }
+                    });
+                }
+                OpenMode::Ssh => {
+                    ui.horizontal(|ui| {
+                        ui.label("Profile / host alias:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.ssh_profile_input)
+                                .hint_text("my-ssh-profile")
+                                .desired_width(220.0),
+                        );
+                        ui.label("Remote CZI path:");
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.remote_path_input)
+                                .hint_text("/absolute/path/image.czi")
+                                .desired_width(f32::INFINITY),
+                        );
+                        let connect = ui.button("Connect").clicked()
+                            || (response.lost_focus()
+                                && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+                        if connect {
+                            self.open_remote_path();
+                        }
+                        if ui.button("Retry").clicked() {
+                            self.open_remote_path();
+                        }
+                    });
+                    ui.weak(
+                        "Read-only SFTP range reads · 1 MiB blocks · 256 MiB source cache · GUI connections never prompt.",
+                    );
+                    if let Some(command) = &self.terminal_bootstrap_command {
+                        ui.separator();
+                        ui.label("SSH needs authentication or host-key confirmation:");
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(command).monospace())
+                                .selectable(true)
+                                .wrap(),
+                        );
+                        if ui.button("Copy command").clicked() {
+                            context.copy_text(command.clone());
+                        }
+                        ui.weak(
+                            "Paste and run this command in Terminal. Finish password, 2FA, or host-key prompts there; leave the master running, then click Retry.",
+                        );
+                        ui.weak(
+                            "The control socket is private to this app session. Close the Terminal master when finished; closing the viewer removes its local control directory. The viewer never writes to the remote host.",
+                        );
+                    }
+                }
+            }
             let color = if self.status.is_error {
                 egui::Color32::LIGHT_RED
             } else {
@@ -1316,7 +1542,7 @@ impl eframe::App for ViewerApp {
                 ui.heading("Dataset");
                 let before_selection = self.selection;
                 let selection_changed = if let Some(dataset) = self.dataset.as_ref() {
-                    ui.label(dataset.path.display().to_string());
+                    ui.label(&dataset.source_label);
                     ui.label(format!("{} indexed tile(s)", dataset.tile_count));
                     ui.separator();
                     selection_selector(ui, "C", &dataset.c, &mut self.selection.c)
@@ -1528,6 +1754,77 @@ mod tests {
     }
 
     #[test]
+    fn remote_locator_validates_profile_location_and_absolute_path() {
+        let config = OpenSshConfig::new();
+        let valid = DatasetLocator::Remote {
+            profile: String::from("research-cluster"),
+            path: String::from("/data/image.czi"),
+            config: config.clone(),
+        };
+        assert!(valid.remote_parts().is_ok());
+
+        let invalid_profile = DatasetLocator::Remote {
+            profile: String::from("-oProxyCommand=bad"),
+            path: String::from("/data/image.czi"),
+            config: config.clone(),
+        };
+        assert!(
+            invalid_profile
+                .remote_parts()
+                .is_err_and(|error| error.contains("must not begin"))
+        );
+
+        let invalid_location = DatasetLocator::Remote {
+            profile: String::from("research-cluster"),
+            path: String::from("/data\0image.czi"),
+            config: config.clone(),
+        };
+        assert!(
+            invalid_location
+                .remote_parts()
+                .is_err_and(|error| error.contains("must not contain NUL"))
+        );
+
+        let relative_location = DatasetLocator::Remote {
+            profile: String::from("research-cluster"),
+            path: String::from("data/image.czi"),
+            config,
+        };
+        assert_eq!(
+            relative_location
+                .remote_parts()
+                .expect_err("relative remote path"),
+            "remote CZI path must be absolute"
+        );
+    }
+
+    #[test]
+    fn bootstrap_command_is_only_returned_for_remote_open_failures() {
+        let control_path = ControlPath::create_private().expect("private control path");
+        let directory = control_path.directory().to_path_buf();
+        let remote = DatasetLocator::Remote {
+            profile: String::from("research-cluster"),
+            path: String::from("/data/image.czi"),
+            config: OpenSshConfig::new().with_control_path(control_path),
+        };
+
+        let local_failure = DatasetLocator::Local(PathBuf::from("/missing/image.czi"))
+            .open_failure("local open failed");
+        assert_eq!(local_failure.message, "local open failed");
+        assert!(local_failure.terminal_bootstrap_command.is_none());
+
+        let remote_failure = remote.open_failure("remote open failed");
+        assert_eq!(remote_failure.message, "remote open failed");
+        let command = remote_failure
+            .terminal_bootstrap_command
+            .expect("remote bootstrap command");
+        assert!(command.contains("'research-cluster'"));
+        assert!(command.contains("'BatchMode=no'"));
+        drop(remote);
+        std::fs::remove_dir_all(directory).expect("remove private control path");
+    }
+
+    #[test]
     fn worker_preserves_events_from_a_bounded_command_burst() {
         let mut worker = DatasetWorker::spawn();
         let count = u64::try_from(CHANNEL_CAPACITY + 1).expect("channel capacity fits u64");
@@ -1535,9 +1832,9 @@ mod tests {
             worker
                 .commands
                 .send(WorkerCommand::Open {
-                    path: PathBuf::from(format!(
+                    locator: DatasetLocator::Local(PathBuf::from(format!(
                         "/dev/null/czi-viewer-missing-{source_generation}.czi"
-                    )),
+                    ))),
                     source_generation,
                 })
                 .expect("bounded command burst");
@@ -1568,6 +1865,7 @@ mod tests {
             sender
                 .send(WorkerEvent::OpenFailed {
                     message: source_generation.to_string(),
+                    terminal_bootstrap_command: None,
                     source_generation: u64::try_from(source_generation).expect("generation"),
                 })
                 .expect("event channel capacity");
@@ -1576,6 +1874,7 @@ mod tests {
         sender
             .send(WorkerEvent::OpenFailed {
                 message: String::from("next"),
+                terminal_bootstrap_command: None,
                 source_generation: 0,
             })
             .expect("event channel capacity");
