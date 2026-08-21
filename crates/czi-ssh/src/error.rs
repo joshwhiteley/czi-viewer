@@ -2,6 +2,8 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 
+use crate::command::SOCKET_PATH_LIMIT;
+
 /// Why an SSH destination was rejected before a process was launched.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SshProfileError {
@@ -93,7 +95,7 @@ impl fmt::Display for OpenSshConfigError {
             }
             Self::SocketPathTooLong { length } => write!(
                 formatter,
-                "control socket path has {length} bytes; the portable limit is 100"
+                "control socket path has {length} bytes; the safe limit is {SOCKET_PATH_LIMIT} to reserve space for OpenSSH's temporary socket suffix"
             ),
             Self::ControlDirectoryNotDirectory => {
                 formatter.write_str("control path parent is not a directory")

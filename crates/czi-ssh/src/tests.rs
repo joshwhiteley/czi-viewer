@@ -6,6 +6,8 @@ use std::thread;
 
 use czi_core::{RandomAccessSource, SourceError};
 
+#[cfg(unix)]
+use crate::command::SOCKET_PATH_LIMIT;
 use crate::{
     ControlPath, OPENSSH_PATH, OpenSshConfig, OpenSshConfigError, SftpError, SftpLocation,
     SftpLocationError, SftpProtocolError, SftpSession, SftpSource, SshProfile, SshProfileError,
@@ -348,6 +350,32 @@ fn command_builders_keep_paths_out_of_argv_and_preserve_host_checks() {
         );
     }
     std::fs::remove_dir_all(base).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn create_private_uses_a_short_socket_without_changing_tmpdir() {
+    let simulated_long_tmpdir = std::path::PathBuf::from("/var/folders").join("x".repeat(90));
+    let socket_if_tmpdir_were_used = simulated_long_tmpdir.join("cz-1234-abcdef-0").join("s");
+    assert!(
+        socket_if_tmpdir_were_used.as_os_str().len() > SOCKET_PATH_LIMIT,
+        "the regression test needs a simulated TMPDIR that exceeds the safe limit"
+    );
+
+    let control_path = ControlPath::create_private().expect("private control path");
+    assert_eq!(
+        control_path.directory().parent(),
+        Some(std::path::Path::new("/tmp"))
+    );
+    assert_eq!(
+        control_path.socket_path().file_name(),
+        Some(std::ffi::OsStr::new("s"))
+    );
+    assert!(control_path.socket_path().as_os_str().len() <= SOCKET_PATH_LIMIT);
+
+    let directory = control_path.directory().to_path_buf();
+    drop(control_path);
+    std::fs::remove_dir_all(directory).expect("remove private control path");
 }
 
 #[test]

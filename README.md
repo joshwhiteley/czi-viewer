@@ -57,7 +57,7 @@ If a remote open fails, the SSH form shows the sanitized underlying error and a 
 
 The Terminal master uses normal interactive OpenSSH behavior with `StrictHostKeyChecking=ask`. The viewer does not run a shell, parse prompts, automate Terminal, prefill commands, use `SSH_ASKPASS`, or store credentials, passwords, or one-time codes.
 
-One private OpenSSH control-path directory is created lazily for each viewer session. Close the Terminal master when you are done. Closing the viewer stops its worker sessions and removes that local control directory. The viewer never writes to the remote host.
+One private OpenSSH control-path directory is created lazily under `/tmp` for each Unix viewer session. Its compact socket path is limited to 90 bytes so macOS OpenSSH has room for its temporary listener suffix. Close the Terminal master when you are done. Closing the viewer stops its worker sessions and removes that local control directory. The viewer never writes to the remote host.
 
 A real Tufts connection is out of scope until a user provides a remote path and is present to authenticate.
 

@@ -10,7 +10,14 @@ use crate::{OpenSshConfigError, SftpError, SshProfile};
 /// The only OpenSSH executable used by production connections.
 pub const OPENSSH_PATH: &str = "/usr/bin/ssh";
 
-const SOCKET_PATH_LIMIT: usize = 100;
+/// macOS has a 104-byte `sockaddr_un::sun_path`. OpenSSH creates its listener at a temporary
+/// `<ControlPath>.XXXXXXXXXXX` name before renaming it, so keep the configured name at 90 bytes.
+/// This leaves room for the 12-byte suffix, a NUL terminator, and one spare byte.
+pub(crate) const SOCKET_PATH_LIMIT: usize = 90;
+
+#[cfg(unix)]
+const PRIVATE_CONTROL_BASE: &str = "/tmp";
+const PRIVATE_SOCKET_NAME: &str = "s";
 
 /// An application-private directory and socket for OpenSSH connection multiplexing.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -20,14 +27,28 @@ pub struct ControlPath {
 }
 
 impl ControlPath {
-    /// Create a unique application-private socket directory below the system temporary directory.
+    /// Create a unique application-private socket directory below `/tmp` on Unix.
     ///
-    /// The directory permissions are set to `0700` on Unix platforms. The returned socket is
-    /// named `master.sock` and is constrained to a portable Unix-domain socket path length.
+    /// A deliberately short base avoids macOS `sun_path` limits and ignores `TMPDIR`. The private
+    /// child directory permissions are set to `0700` on Unix platforms. The returned socket has
+    /// a conservative 90-byte maximum that reserves space for OpenSSH's temporary socket suffix.
     ///
     /// # Errors
     ///
     /// Returns an error when the directory or its permissions cannot be created.
+    #[cfg(unix)]
+    pub fn create_private() -> Result<Self, SftpError> {
+        Self::create_private_in(PRIVATE_CONTROL_BASE)
+    }
+
+    /// Create a unique application-private socket directory below the system temporary directory.
+    ///
+    /// This fallback keeps the portable behavior for non-Unix platforms.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the directory or its permissions cannot be created.
+    #[cfg(not(unix))]
     pub fn create_private() -> Result<Self, SftpError> {
         Self::create_private_in(std::env::temp_dir())
     }
@@ -50,7 +71,7 @@ impl ControlPath {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
         for counter in 0..256_u16 {
-            let directory = base.join(format!("czi-ssh-{}-{nanos}-{counter}", process::id()));
+            let directory = base.join(format!("cz-{:x}-{nanos:x}-{counter:x}", process::id()));
             match create_private_directory(&directory) {
                 Ok(()) => {
                     set_private_permissions(&directory)?;
@@ -65,7 +86,7 @@ impl ControlPath {
         Err(OpenSshConfigError::ControlDirectoryUnavailable.into())
     }
 
-    /// Use `directory/master.sock` as a control socket after setting the directory to `0700`.
+    /// Use `directory/s` as a control socket after setting the directory to `0700`.
     ///
     /// # Errors
     ///
@@ -77,7 +98,7 @@ impl ControlPath {
             return Err(OpenSshConfigError::ControlDirectoryNotDirectory.into());
         }
         set_private_permissions(&directory)?;
-        let socket_path = directory.join("master.sock");
+        let socket_path = directory.join(PRIVATE_SOCKET_NAME);
         let length = socket_path.as_os_str().len();
         if length > SOCKET_PATH_LIMIT {
             return Err(OpenSshConfigError::SocketPathTooLong { length }.into());
