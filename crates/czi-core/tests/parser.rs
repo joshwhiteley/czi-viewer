@@ -1,9 +1,8 @@
-use std::path::PathBuf;
-
 use czi_core::{
     AttachmentIndex, CompressionMode, CziDataset, CziError, DimensionCode, LocalFileSource,
     MemorySource, ParseOptions, PixelType, PyramidType, RandomAccessSource, SourceError,
 };
+use std::path::PathBuf;
 
 const SEGMENT_HEADER_SIZE: usize = 32;
 const FILE_HEADER_DATA_SIZE: usize = 512;
@@ -15,6 +14,8 @@ const DIMENSION_SIZE: usize = 20;
 struct SyntheticFile {
     bytes: Vec<u8>,
     directory_offset: u64,
+    subblock_offset: u64,
+    attachment_offset: Option<u64>,
 }
 
 #[test]
@@ -44,9 +45,12 @@ fn parses_tile_first_index_and_metadata_without_dense_pixels() {
     );
     assert_eq!(tile.entry.stored_byte_size(), Some(64));
 
-    let mut payload = [0; 4];
-    assert_eq!(dataset.read_tile_data(0, &mut payload).expect("payload"), 4);
-    assert_eq!(payload, [1, 2, 3, 4]);
+    let mut payload = [0; 64];
+    assert_eq!(
+        dataset.read_tile_data(0, &mut payload).expect("payload"),
+        64
+    );
+    assert_eq!(&payload[..4], [1, 2, 3, 4]);
 }
 
 #[test]
@@ -71,7 +75,8 @@ fn rejects_bad_magic() {
 fn rejects_truncated_input() {
     let file = synthetic_file(false).bytes;
     let truncated = file[..file.len() - 1].to_vec();
-    let error = CziDataset::open(MemorySource::new(truncated)).expect_err("truncated");
+    let dataset = CziDataset::open(MemorySource::new(truncated)).expect("lazy open");
+    let error = dataset.tile_payload(0).expect_err("truncated tile");
     assert!(matches!(error, CziError::InvalidSegment { .. }));
 }
 
@@ -94,6 +99,11 @@ fn rejects_invalid_counts_and_sizes() {
         .copy_from_slice(&0_i32.to_le_bytes());
     let error = CziDataset::open(MemorySource::new(size_file.bytes)).expect_err("zero size");
     assert!(matches!(error, CziError::InvalidNumber { .. }));
+
+    let mut short_header = synthetic_file(false);
+    short_header.bytes[24..32].copy_from_slice(&80_i64.to_le_bytes());
+    let error = CziDataset::open(MemorySource::new(short_header.bytes)).expect_err("short header");
+    assert!(matches!(error, CziError::InvalidSegment { .. }));
 }
 
 #[test]
@@ -122,6 +132,177 @@ fn rejects_metadata_over_limit() {
     )
     .expect_err("metadata limit");
     assert!(matches!(error, CziError::MetadataTooLarge { .. }));
+
+    let file = synthetic_file(false);
+    let error = CziDataset::open_with_options(
+        MemorySource::new(file.bytes),
+        ParseOptions::default().with_max_total_dimensions(3),
+    )
+    .expect_err("aggregate dimension limit");
+    assert!(matches!(error, CziError::LimitExceeded { .. }));
+
+    let file = synthetic_file(false);
+    let error = CziDataset::open_with_options(
+        MemorySource::new(file.bytes),
+        ParseOptions::default().with_max_index_bytes(1),
+    )
+    .expect_err("index byte limit");
+    assert!(matches!(error, CziError::LimitExceeded { .. }));
+}
+
+#[test]
+fn defers_subblock_validation_and_reconciles_inline_dv() {
+    let mut file = synthetic_file(false);
+    let inline_pixel_type =
+        usize::try_from(file.subblock_offset).expect("offset") + SEGMENT_HEADER_SIZE + 16 + 2;
+    file.bytes[inline_pixel_type..inline_pixel_type + 4].copy_from_slice(&0_i32.to_le_bytes());
+    let dataset = open(file.bytes);
+    let error = dataset.tile_payload(0).expect_err("inline mismatch");
+    assert!(matches!(
+        error,
+        CziError::DescriptorMismatch { context: "DV", .. }
+    ));
+
+    let mut file = synthetic_file(false);
+    let inline_coordinate = usize::try_from(file.subblock_offset).expect("offset")
+        + SEGMENT_HEADER_SIZE
+        + 16
+        + DV_FIXED_SIZE
+        + 12;
+    file.bytes[inline_coordinate..inline_coordinate + 4]
+        .copy_from_slice(&1.0_f32.to_bits().to_le_bytes());
+    let dataset = open(file.bytes);
+    let error = dataset.tile_payload(0).expect_err("coordinate mismatch");
+    assert!(matches!(
+        error,
+        CziError::DescriptorMismatch {
+            field: "dimension coordinate",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn validates_uncompressed_payload_size_lazily() {
+    let mut file = synthetic_file(false);
+    let fixed_data_size =
+        usize::try_from(file.subblock_offset).expect("offset") + SEGMENT_HEADER_SIZE + 8;
+    file.bytes[fixed_data_size..fixed_data_size + 8].copy_from_slice(&63_i64.to_le_bytes());
+    let dataset = open(file.bytes);
+    let error = dataset.tile_payload(0).expect_err("payload mismatch");
+    assert!(matches!(
+        error,
+        CziError::PayloadSizeMismatch {
+            expected: 64,
+            actual: 63,
+            ..
+        }
+    ));
+
+    let mut file = synthetic_file(false);
+    let fixed_data_size =
+        usize::try_from(file.subblock_offset).expect("offset") + SEGMENT_HEADER_SIZE + 8;
+    file.bytes[fixed_data_size..fixed_data_size + 8].copy_from_slice(&(-1_i64).to_le_bytes());
+    let dataset = open(file.bytes);
+    let error = dataset.tile_payload(0).expect_err("negative payload size");
+    assert!(matches!(
+        error,
+        CziError::InvalidNumber {
+            kind: "subblock data size",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn rejects_update_pending_cross_part_duplicates_and_negative_signed_fields() {
+    let mut update = synthetic_file(false);
+    update.bytes[SEGMENT_HEADER_SIZE + 68..SEGMENT_HEADER_SIZE + 72]
+        .copy_from_slice(&1_i32.to_le_bytes());
+    let error = CziDataset::open(MemorySource::new(update.bytes)).expect_err("update pending");
+    assert!(matches!(error, CziError::UpdatePending { .. }));
+
+    let mut cross_part = synthetic_file(false);
+    let file_part = usize::try_from(cross_part.directory_offset).expect("offset")
+        + SEGMENT_HEADER_SIZE
+        + DIRECTORY_DATA_SIZE
+        + 14;
+    cross_part.bytes[file_part..file_part + 4].copy_from_slice(&1_i32.to_le_bytes());
+    let error = CziDataset::open(MemorySource::new(cross_part.bytes)).expect_err("cross part");
+    assert!(matches!(
+        error,
+        CziError::CrossFilePartReference {
+            context: "tile",
+            ..
+        }
+    ));
+
+    let mut duplicate = synthetic_file(false);
+    let duplicate_code = usize::try_from(duplicate.directory_offset).expect("offset")
+        + SEGMENT_HEADER_SIZE
+        + DIRECTORY_DATA_SIZE
+        + DV_FIXED_SIZE
+        + 3 * DIMENSION_SIZE;
+    duplicate.bytes[duplicate_code..duplicate_code + 4].copy_from_slice(b"X\0\0\0");
+    let error = CziDataset::open(MemorySource::new(duplicate.bytes)).expect_err("duplicate");
+    assert!(matches!(error, CziError::DuplicateDimension { .. }));
+
+    let mut negative_segment = synthetic_file(false);
+    negative_segment.bytes[16..24].copy_from_slice(&(-1_i64).to_le_bytes());
+    let error =
+        CziDataset::open(MemorySource::new(negative_segment.bytes)).expect_err("negative segment");
+    assert!(matches!(
+        error,
+        CziError::InvalidNumber {
+            kind: "segment allocated size",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn reconciles_inline_a1_and_rejects_signed_metadata_and_attachment_sizes() {
+    let mut file = synthetic_file(true);
+    let attachment_offset = file.attachment_offset.expect("attachment");
+    let name = usize::try_from(attachment_offset).expect("offset") + SEGMENT_HEADER_SIZE + 16 + 48;
+    file.bytes[name..name + 9].copy_from_slice(b"different");
+    let error = CziDataset::open(MemorySource::new(file.bytes)).expect_err("A1 mismatch");
+    assert!(matches!(
+        error,
+        CziError::DescriptorMismatch { context: "A1", .. }
+    ));
+
+    let mut metadata = synthetic_file(false);
+    let metadata_offset = metadata.bytes[SEGMENT_HEADER_SIZE + 60..SEGMENT_HEADER_SIZE + 68]
+        .try_into()
+        .map(i64::from_le_bytes)
+        .expect("metadata pointer");
+    let metadata_size = usize::try_from(u64::try_from(metadata_offset).expect("pointer"))
+        .expect("offset")
+        + SEGMENT_HEADER_SIZE;
+    metadata.bytes[metadata_size..metadata_size + 4].copy_from_slice(&(-1_i32).to_le_bytes());
+    let error = CziDataset::open(MemorySource::new(metadata.bytes)).expect_err("negative metadata");
+    assert!(matches!(
+        error,
+        CziError::InvalidNumber {
+            kind: "metadata XML size",
+            ..
+        }
+    ));
+
+    let mut attachment = synthetic_file(true);
+    let attachment_offset = attachment.attachment_offset.expect("attachment");
+    let data_size = usize::try_from(attachment_offset).expect("offset") + SEGMENT_HEADER_SIZE;
+    attachment.bytes[data_size..data_size + 4].copy_from_slice(&(-1_i32).to_le_bytes());
+    let error =
+        CziDataset::open(MemorySource::new(attachment.bytes)).expect_err("negative attachment");
+    assert!(matches!(
+        error,
+        CziError::InvalidNumber {
+            kind: "attachment data size",
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -131,10 +312,7 @@ fn checks_overflow_and_random_access_bounds() {
     file.bytes[header_offset + SEGMENT_HEADER_SIZE + 52..header_offset + SEGMENT_HEADER_SIZE + 60]
         .copy_from_slice(&(u64::MAX - 10).to_le_bytes());
     let error = CziDataset::open(MemorySource::new(file.bytes)).expect_err("overflow");
-    assert!(matches!(
-        error,
-        CziError::Source(SourceError::RangeOverflow { .. })
-    ));
+    assert!(matches!(error, CziError::InvalidNumber { .. }));
 
     let source = MemorySource::new(vec![0; 4]);
     let mut target = [0; 2];
@@ -185,7 +363,6 @@ fn index_local_fixtures_without_pixel_allocation() {
         assert_eq!(source.info().length, expected_length);
         let dataset = CziDataset::open(source).expect("fixture index");
         assert_eq!(dataset.index().tile_count(), expected_tiles);
-        assert!(dataset.index().tiles.iter().all(|tile| tile.data_size > 0));
         assert!(dataset.index().metadata.is_some());
         assert!(
             dataset
@@ -277,15 +454,30 @@ fn synthetic_file(with_attachments: bool) -> SyntheticFile {
         metadata_data(b"<ImageDocument/>", 0),
         None,
     );
-    let subblock_offset =
-        append_segment(&mut file, b"ZISRAWSUBBLOCK", subblock_data(), Some(256 + 4));
+    let subblock_offset = append_segment(
+        &mut file,
+        b"ZISRAWSUBBLOCK",
+        subblock_data(),
+        Some(256 + 64),
+    );
+    let mut attachment_offset = None;
     let attachment_directory_offset = if with_attachments {
-        let attachment_offset =
-            append_segment(&mut file, b"ZISRAWATTACH", attachment_data(), Some(256 + 3));
+        let attachment_position = append_segment(
+            &mut file,
+            b"ZISRAWATTACH",
+            attachment_data(0),
+            Some(256 + 3),
+        );
+        let attachment_offset_usize =
+            usize::try_from(attachment_position).expect("attachment offset");
+        let attachment_entry = attachment_offset_usize + SEGMENT_HEADER_SIZE + 16;
+        file[attachment_entry + 12..attachment_entry + 20]
+            .copy_from_slice(&attachment_position.to_le_bytes());
+        attachment_offset = Some(attachment_position);
         append_segment(
             &mut file,
             b"ZISRAWATTDIR",
-            attachment_directory_data(attachment_offset),
+            attachment_directory_data(attachment_position),
             None,
         )
     } else {
@@ -309,6 +501,8 @@ fn synthetic_file(with_attachments: bool) -> SyntheticFile {
     SyntheticFile {
         bytes: file,
         directory_offset,
+        subblock_offset,
+        attachment_offset,
     }
 }
 
@@ -329,8 +523,8 @@ fn directory_data(_subblock_offset: u64) -> Vec<u8> {
 }
 
 fn subblock_data() -> Vec<u8> {
-    let mut data = vec![0; 260];
-    data[8..16].copy_from_slice(&4_u64.to_le_bytes());
+    let mut data = vec![0; 320];
+    data[8..16].copy_from_slice(&64_i64.to_le_bytes());
     let entry = &mut data[16..16 + DV_FIXED_SIZE + 4 * DIMENSION_SIZE];
     entry[0..2].copy_from_slice(b"DV");
     entry[2..6].copy_from_slice(&1_i32.to_le_bytes());
@@ -341,6 +535,7 @@ fn subblock_data() -> Vec<u8> {
     dimension(entry, 1, *b"Y\0\0\0", 0, 4, 2);
     dimension(entry, 2, *b"M\0\0\0", 7, 1, 0);
     dimension(entry, 3, *b"Q\0\0\0", 3, 2, 0);
+    data[256..320].fill(0);
     data[256..260].copy_from_slice(&[1, 2, 3, 4]);
     data
 }
@@ -353,11 +548,12 @@ fn metadata_data(xml: &[u8], attachment_size: u32) -> Vec<u8> {
     data
 }
 
-fn attachment_data() -> Vec<u8> {
+fn attachment_data(file_position: u64) -> Vec<u8> {
     let mut data = vec![0; 259];
     data[0..4].copy_from_slice(&3_u32.to_le_bytes());
     let entry = &mut data[16..144];
     entry[0..2].copy_from_slice(b"A1");
+    entry[12..20].copy_from_slice(&file_position.to_le_bytes());
     entry[40..43].copy_from_slice(b"JPG");
     entry[48..57].copy_from_slice(b"thumbnail");
     data[256..259].copy_from_slice(b"jpg");

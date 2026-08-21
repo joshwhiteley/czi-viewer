@@ -9,7 +9,7 @@ use thiserror::Error;
 use crate::source::{RandomAccessSource, SourceError, SourceInfo};
 
 const SEGMENT_HEADER_SIZE: u64 = 32;
-const FILE_HEADER_DATA_SIZE: u64 = 80;
+const FILE_HEADER_DATA_SIZE: u64 = 512;
 const METADATA_FIXED_SIZE: u64 = 256;
 const DIRECTORY_FIXED_SIZE: u64 = 128;
 const ATTACHMENT_DIRECTORY_FIXED_SIZE: u64 = 256;
@@ -19,8 +19,10 @@ const DV_FIXED_SIZE: u64 = 32;
 const DIMENSION_ENTRY_SIZE: u64 = 20;
 const SUBBLOCK_MIN_DATA_SIZE: u64 = 256;
 const DEFAULT_MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
-const DEFAULT_MAX_DIRECTORY_ENTRIES: u64 = 10_000_000;
-const DEFAULT_MAX_DIMENSIONS: u64 = 1024;
+const DEFAULT_MAX_DIRECTORY_ENTRIES: u64 = 1_000_000;
+const DEFAULT_MAX_DIMENSIONS: u64 = 64;
+const DEFAULT_MAX_TOTAL_DIMENSIONS: u64 = 1_000_000;
+const DEFAULT_MAX_INDEX_BYTES: u64 = 256 * 1024 * 1024;
 
 const FILE_ID: &[u8; 16] = b"ZISRAWFILE\0\0\0\0\0\0";
 const DIRECTORY_ID: &[u8; 16] = b"ZISRAWDIRECTORY\0";
@@ -101,6 +103,68 @@ pub enum CziError {
         /// Expected offset.
         offset: u64,
     },
+    /// The file was marked as being updated and may have inconsistent indexes.
+    #[error("CZI file at offset {offset} is marked update-pending")]
+    UpdatePending {
+        /// File header offset.
+        offset: u64,
+    },
+    /// A reference points to a different file part than this dataset.
+    #[error("{context} references file part {actual}, expected part {expected}")]
+    CrossFilePartReference {
+        /// Reference kind.
+        context: &'static str,
+        /// Dataset file part.
+        expected: i32,
+        /// Referenced file part.
+        actual: i32,
+    },
+    /// A summary descriptor and its inline descriptor disagree.
+    #[error("{context} descriptor mismatch in {field} at offset {offset}")]
+    DescriptorMismatch {
+        /// Descriptor kind.
+        context: &'static str,
+        /// Mismatching field.
+        field: &'static str,
+        /// Descriptor offset.
+        offset: u64,
+    },
+    /// A dimension code occurs more than once in one DV descriptor.
+    #[error("duplicate dimension code {code} at offset {offset}")]
+    DuplicateDimension {
+        /// Dimension code.
+        code: String,
+        /// Descriptor offset.
+        offset: u64,
+    },
+    /// A configured resource limit was exceeded.
+    #[error("{kind} {value} exceeds configured maximum {maximum}")]
+    LimitExceeded {
+        /// Limited resource.
+        kind: &'static str,
+        /// Observed value.
+        value: u64,
+        /// Configured maximum.
+        maximum: u64,
+    },
+    /// An allocation failed before any unbounded memory growth occurred.
+    #[error("cannot allocate {size} bytes for {context}")]
+    Allocation {
+        /// Allocation context.
+        context: &'static str,
+        /// Requested bytes.
+        size: usize,
+    },
+    /// An uncompressed tile payload does not match its declared stored dimensions.
+    #[error("uncompressed tile payload is {actual} bytes, expected {expected} at offset {offset}")]
+    PayloadSizeMismatch {
+        /// Payload offset.
+        offset: u64,
+        /// Declared data size.
+        actual: u64,
+        /// Computed stored byte size.
+        expected: u64,
+    },
 }
 
 /// Limits used while indexing a CZI source.
@@ -112,6 +176,10 @@ pub struct ParseOptions {
     pub max_directory_entries: u64,
     /// Maximum dimensions in one DV entry.
     pub max_dimensions_per_entry: u64,
+    /// Maximum dimensions across the complete summary directory.
+    pub max_total_dimensions: u64,
+    /// Maximum bytes used by the complete summary directory payload.
+    pub max_index_bytes: u64,
 }
 
 impl Default for ParseOptions {
@@ -120,6 +188,8 @@ impl Default for ParseOptions {
             max_metadata_bytes: DEFAULT_MAX_METADATA_BYTES,
             max_directory_entries: DEFAULT_MAX_DIRECTORY_ENTRIES,
             max_dimensions_per_entry: DEFAULT_MAX_DIMENSIONS,
+            max_total_dimensions: DEFAULT_MAX_TOTAL_DIMENSIONS,
+            max_index_bytes: DEFAULT_MAX_INDEX_BYTES,
         }
     }
 }
@@ -143,6 +213,20 @@ impl ParseOptions {
     #[must_use]
     pub const fn with_max_dimensions_per_entry(mut self, maximum: u64) -> Self {
         self.max_dimensions_per_entry = maximum;
+        self
+    }
+
+    /// Set the aggregate dimension budget.
+    #[must_use]
+    pub const fn with_max_total_dimensions(mut self, maximum: u64) -> Self {
+        self.max_total_dimensions = maximum;
+        self
+    }
+
+    /// Set the summary-directory allocation budget.
+    #[must_use]
+    pub const fn with_max_index_bytes(mut self, maximum: u64) -> Self {
+        self.max_index_bytes = maximum;
         self
     }
 }
@@ -606,11 +690,16 @@ impl DirectoryEntry {
     }
 }
 
-/// Indexed location and sizes for one image subblock.
+/// Summary-directory information for one image tile.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TileIndex {
     /// The summary directory entry.
     pub entry: DirectoryEntry,
+}
+
+/// Lazily resolved location and sizes for one image subblock.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TilePayload {
     /// Validated subblock segment header.
     pub segment: SegmentHeader,
     /// Inline subblock metadata location.
@@ -708,6 +797,7 @@ impl DatasetIndex {
 pub struct CziDataset {
     source: Arc<dyn RandomAccessSource>,
     index: DatasetIndex,
+    options: ParseOptions,
 }
 
 impl fmt::Debug for CziDataset {
@@ -767,7 +857,11 @@ impl CziDataset {
         options: ParseOptions,
     ) -> Result<Self, CziError> {
         let index = parse_index(&source, options)?;
-        Ok(Self { source, index })
+        Ok(Self {
+            source,
+            index,
+            options,
+        })
     }
 
     /// Return the immutable tile-first index.
@@ -782,6 +876,30 @@ impl CziDataset {
         self.source.info()
     }
 
+    /// Resolve one tile's subblock header and inline DV descriptor on demand.
+    ///
+    /// Opening a dataset does not read subblock headers. This method performs the bounded reads
+    /// needed for one tile and validates its inline descriptor against the summary entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured parse or source error when the tile header, descriptor, or payload
+    /// extent is malformed.
+    pub fn tile_payload(&self, index: usize) -> Result<TilePayload, CziError> {
+        let tile = self.index.tiles.get(index).ok_or(CziError::Missing {
+            what: "tile",
+            offset: u64::try_from(index).map_err(|_| CziError::Overflow {
+                context: "tile index conversion",
+            })?,
+        })?;
+        parse_tile(
+            &self.source,
+            &tile.entry,
+            self.index.file_header.file_part,
+            self.options,
+        )
+    }
+
     /// Read one tile's pixel payload into a caller-provided buffer.
     ///
     /// The buffer must be at least the compressed/raw payload size. No codec or dense image
@@ -792,12 +910,7 @@ impl CziDataset {
     /// Returns an error when `index` is not a tile, the buffer is too small, or the source read
     /// fails.
     pub fn read_tile_data(&self, index: usize, buffer: &mut [u8]) -> Result<usize, CziError> {
-        let tile = self.index.tiles.get(index).ok_or(CziError::Missing {
-            what: "tile",
-            offset: u64::try_from(index).map_err(|_| CziError::Overflow {
-                context: "tile index conversion",
-            })?,
-        })?;
+        let tile = self.tile_payload(index)?;
         let size = usize::try_from(tile.data_size).map_err(|_| CziError::Overflow {
             context: "tile payload size conversion",
         })?;
@@ -818,6 +931,11 @@ fn parse_index(
 ) -> Result<DatasetIndex, CziError> {
     let source_info = source.info();
     let file_header = parse_file_header(source)?;
+    if file_header.update_pending {
+        return Err(CziError::UpdatePending {
+            offset: file_header.segment.offset,
+        });
+    }
     if file_header.directory_position == 0 {
         return Err(CziError::Missing {
             what: "subblock directory",
@@ -827,10 +945,19 @@ fn parse_index(
     let directory = parse_segment(source, file_header.directory_position)?;
     expect_kind(&directory, SegmentKind::Directory, "ZISRAWDIRECTORY")?;
     let entries = parse_directory(source, directory, options)?;
-    let mut tiles = Vec::with_capacity(entries.len());
-    for entry in entries {
-        tiles.push(parse_tile(source, entry)?);
+    for entry in &entries {
+        ensure_file_part("tile", file_header.file_part, entry.file_part)?;
     }
+    let mut tiles = Vec::new();
+    try_reserve_exact(
+        &mut tiles,
+        entries.len(),
+        "tile index",
+        u64::try_from(entries.len()).map_err(|_| CziError::Overflow {
+            context: "tile index count conversion",
+        })?,
+    )?;
+    tiles.extend(entries.into_iter().map(|entry| TileIndex { entry }));
     let metadata = if file_header.metadata_position == 0 {
         None
     } else {
@@ -843,7 +970,12 @@ fn parse_index(
     let attachments = if file_header.attachment_directory_position == 0 {
         Vec::new()
     } else {
-        parse_attachment_directory(source, file_header.attachment_directory_position, options)?
+        parse_attachment_directory(
+            source,
+            file_header.attachment_directory_position,
+            file_header.file_part,
+            options,
+        )?
     };
     Ok(DatasetIndex {
         source: source_info,
@@ -863,6 +995,10 @@ fn parse_file_header(source: &Arc<dyn RandomAccessSource>) -> Result<FileHeader,
     primary_file_guid.copy_from_slice(&data[16..32]);
     let mut file_guid = [0; 16];
     file_guid.copy_from_slice(&data[32..48]);
+    let directory_position = nonnegative_i64(le_i64(&data, 52), "directory position", 52)?;
+    let metadata_position = nonnegative_i64(le_i64(&data, 60), "metadata position", 60)?;
+    let attachment_directory_position =
+        nonnegative_i64(le_i64(&data, 72), "attachment directory position", 72)?;
     Ok(FileHeader {
         segment,
         major_version: le_u32(&data, 0),
@@ -870,21 +1006,29 @@ fn parse_file_header(source: &Arc<dyn RandomAccessSource>) -> Result<FileHeader,
         primary_file_guid,
         file_guid,
         file_part: le_i32(&data, 48),
-        directory_position: le_u64(&data, 52),
-        metadata_position: le_u64(&data, 60),
+        directory_position,
+        metadata_position,
         update_pending: le_i32(&data, 68) != 0,
-        attachment_directory_position: le_u64(&data, 72),
+        attachment_directory_position,
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_directory(
     source: &Arc<dyn RandomAccessSource>,
     segment: SegmentHeader,
     options: ParseOptions,
 ) -> Result<Vec<DirectoryEntry>, CziError> {
     require_data_size(&segment, DIRECTORY_FIXED_SIZE, "subblock directory")?;
-    let fixed = read_data(source, &segment, 0, DIRECTORY_FIXED_SIZE)?;
-    let count = le_i32(&fixed, 0);
+    if segment.used_size > options.max_index_bytes {
+        return Err(CziError::LimitExceeded {
+            kind: "summary directory bytes",
+            value: segment.used_size,
+            maximum: options.max_index_bytes,
+        });
+    }
+    let directory_data = read_data(source, &segment, 0, segment.used_size)?;
+    let count = le_i32(&directory_data, 0);
     if count < 0 {
         return Err(CziError::InvalidNumber {
             kind: "directory entry count",
@@ -902,14 +1046,15 @@ fn parse_directory(
             offset: segment.offset,
         });
     }
-    let payload_size =
-        segment
-            .used_size
-            .checked_sub(DIRECTORY_FIXED_SIZE)
-            .ok_or(CziError::InvalidSegment {
-                offset: segment.offset,
-                reason: String::from("used data is smaller than directory fixed data"),
-            })?;
+    let payload_size = u64::try_from(directory_data.len())
+        .map_err(|_| CziError::Overflow {
+            context: "directory payload length conversion",
+        })?
+        .checked_sub(DIRECTORY_FIXED_SIZE)
+        .ok_or(CziError::InvalidSegment {
+            offset: segment.offset,
+            reason: String::from("used data is smaller than directory fixed data"),
+        })?;
     let minimum_bytes = checked_mul(count, DV_FIXED_SIZE, "directory minimum entry bytes")?;
     if minimum_bytes > payload_size {
         return Err(CziError::InvalidNumber {
@@ -918,15 +1063,46 @@ fn parse_directory(
             offset: segment.offset,
         });
     }
-    let payload_offset = data_offset(&segment, DIRECTORY_FIXED_SIZE)?;
-    let mut entries =
-        Vec::with_capacity(usize::try_from(count).map_err(|_| CziError::Overflow {
+    let mut entries = Vec::new();
+    try_reserve_exact(
+        &mut entries,
+        usize::try_from(count).map_err(|_| CziError::Overflow {
             context: "directory allocation size",
-        })?);
-    let mut cursor = 0_u64;
-    for index in 0..count {
-        let entry_offset = checked_add(payload_offset, cursor, "directory entry offset")?;
-        let schema = read_array::<2>(source, entry_offset)?;
+        })?,
+        "directory entries",
+        count,
+    )?;
+    let mut cursor = usize::try_from(DIRECTORY_FIXED_SIZE).map_err(|_| CziError::Overflow {
+        context: "directory fixed size conversion",
+    })?;
+    let dv_fixed_size = usize::try_from(DV_FIXED_SIZE).map_err(|_| CziError::Overflow {
+        context: "DV fixed size conversion",
+    })?;
+    let mut total_dimensions = 0_u64;
+    for _ in 0..count {
+        let fixed_end = cursor
+            .checked_add(dv_fixed_size)
+            .ok_or(CziError::Overflow {
+                context: "directory fixed prefix end",
+            })?;
+        if fixed_end > directory_data.len() {
+            return Err(CziError::InvalidSegment {
+                offset: segment.offset,
+                reason: String::from("directory payload ended inside DV fixed prefix"),
+            });
+        }
+        let entry_offset = checked_add(
+            segment.offset,
+            checked_add(
+                SEGMENT_HEADER_SIZE,
+                u64::try_from(cursor).map_err(|_| CziError::Overflow {
+                    context: "directory cursor conversion",
+                })?,
+                "directory entry offset",
+            )?,
+            "directory entry offset",
+        )?;
+        let schema = [directory_data[cursor], directory_data[cursor + 1]];
         if &schema == b"DE" {
             return Err(CziError::UnsupportedSchema {
                 context: "subblock directory",
@@ -939,32 +1115,55 @@ fn parse_directory(
                 schema: display_schema(schema),
             });
         }
-        let fixed_entry = read_vec(source, entry_offset, DV_FIXED_SIZE)?;
-        let dimensions_count = le_i32(&fixed_entry, 28);
+        let dimensions_count = le_i32(&directory_data, cursor + 28);
         let dimensions_count = checked_count(
             dimensions_count,
             options.max_dimensions_per_entry,
             "dimension count",
             entry_offset,
         )?;
+        if dimensions_count == 0 {
+            return Err(CziError::InvalidNumber {
+                kind: "dimension count",
+                value: 0,
+                offset: entry_offset,
+            });
+        }
+        total_dimensions =
+            total_dimensions
+                .checked_add(dimensions_count)
+                .ok_or(CziError::Overflow {
+                    context: "aggregate dimension count",
+                })?;
+        if total_dimensions > options.max_total_dimensions {
+            return Err(CziError::LimitExceeded {
+                kind: "aggregate dimension count",
+                value: total_dimensions,
+                maximum: options.max_total_dimensions,
+            });
+        }
         let dimensions_bytes = checked_mul(
             dimensions_count,
             DIMENSION_ENTRY_SIZE,
             "directory dimension bytes",
         )?;
         let entry_size = checked_add(DV_FIXED_SIZE, dimensions_bytes, "directory entry size")?;
-        let end = checked_add(cursor, entry_size, "directory payload cursor")?;
-        if end > payload_size {
+        let end = cursor
+            .checked_add(usize::try_from(entry_size).map_err(|_| CziError::Overflow {
+                context: "directory entry size conversion",
+            })?)
+            .ok_or(CziError::Overflow {
+                context: "directory payload cursor",
+            })?;
+        if end > directory_data.len() {
             return Err(CziError::InvalidSegment {
                 offset: entry_offset,
                 reason: String::from("DV entry extends beyond directory used data"),
             });
         }
-        let entry_bytes = read_vec(source, entry_offset, entry_size)?;
-        let entry = parse_dv_entry(&entry_bytes, entry_offset, dimensions_count)?;
+        let entry = parse_dv_entry(&directory_data[cursor..end], entry_offset, dimensions_count)?;
         entries.push(entry);
         cursor = end;
-        let _ = index;
     }
     Ok(entries)
 }
@@ -976,12 +1175,15 @@ fn parse_dv_entry(
 ) -> Result<DirectoryEntry, CziError> {
     let mut schema_type = [0; 2];
     schema_type.copy_from_slice(&bytes[..2]);
-    let mut dimensions =
-        Vec::with_capacity(
-            usize::try_from(dimensions_count).map_err(|_| CziError::Overflow {
-                context: "dimension allocation size",
-            })?,
-        );
+    let mut dimensions = Vec::new();
+    try_reserve_exact(
+        &mut dimensions,
+        usize::try_from(dimensions_count).map_err(|_| CziError::Overflow {
+            context: "dimension allocation size",
+        })?,
+        "dimension entries",
+        dimensions_count,
+    )?;
     for index in 0..dimensions_count {
         let relative = checked_add(
             DV_FIXED_SIZE,
@@ -1029,8 +1231,18 @@ fn parse_dv_entry(
                 context: "stored dimension size conversion",
             })?
         };
+        let code = DimensionCode::from_raw(raw_code);
+        if dimensions
+            .iter()
+            .any(|dimension: &DimensionEntry| dimension.code == code)
+        {
+            return Err(CziError::DuplicateDimension {
+                code: code.as_string(),
+                offset,
+            });
+        }
         dimensions.push(DimensionEntry {
-            code: DimensionCode::from_raw(raw_code),
+            code,
             start: le_i32(dimension, 4),
             logical_size,
             start_coordinate: le_f32(dimension, 12),
@@ -1041,7 +1253,11 @@ fn parse_dv_entry(
     Ok(DirectoryEntry {
         schema_type,
         pixel_type: PixelType::from_raw(le_i32(bytes, 2)),
-        file_position: le_u64(bytes, 6),
+        file_position: nonnegative_i64(
+            le_i64(bytes, 6),
+            "subblock file position",
+            checked_add(offset, 6, "subblock file position offset")?,
+        )?,
         file_part: le_i32(bytes, 14),
         compression: CompressionMode::from_raw(le_i32(bytes, 18)),
         pyramid_type: PyramidType::from_raw(bytes[22]),
@@ -1051,19 +1267,33 @@ fn parse_dv_entry(
 
 fn parse_tile(
     source: &Arc<dyn RandomAccessSource>,
-    entry: DirectoryEntry,
-) -> Result<TileIndex, CziError> {
+    entry: &DirectoryEntry,
+    file_part: i32,
+    options: ParseOptions,
+) -> Result<TilePayload, CziError> {
+    ensure_file_part("tile", file_part, entry.file_part)?;
     let segment = parse_segment(source, entry.file_position)?;
     expect_kind(&segment, SegmentKind::Subblock, "ZISRAWSUBBLOCK")?;
     require_data_size(&segment, SUBBLOCK_FIXED_SIZE, "subblock")?;
     let fixed = read_data(source, &segment, 0, SUBBLOCK_FIXED_SIZE)?;
-    let metadata_size = u64::from(le_u32(&fixed, 0));
-    let attachment_size = u64::from(le_u32(&fixed, 4));
-    let data_size = le_u64(&fixed, 8);
+    let metadata_size = nonnegative_i32(
+        le_i32(&fixed, 0),
+        "subblock metadata size",
+        data_offset(&segment, 0)?,
+    )?;
+    let attachment_size = nonnegative_i32(
+        le_i32(&fixed, 4),
+        "subblock attachment size",
+        data_offset(&segment, 4)?,
+    )?;
+    let data_size = nonnegative_i64(
+        le_i64(&fixed, 8),
+        "subblock data size",
+        data_offset(&segment, 8)?,
+    )?;
     let inline_offset = data_offset(&segment, SUBBLOCK_FIXED_SIZE)?;
-    let inline_schema_bytes = read_data(source, &segment, SUBBLOCK_FIXED_SIZE, 2)?;
-    let mut inline_schema = [0; 2];
-    inline_schema.copy_from_slice(&inline_schema_bytes);
+    let inline_fixed = read_data(source, &segment, SUBBLOCK_FIXED_SIZE, DV_FIXED_SIZE)?;
+    let inline_schema = [inline_fixed[0], inline_fixed[1]];
     if &inline_schema == b"DE" {
         return Err(CziError::UnsupportedSchema {
             context: "subblock",
@@ -1076,24 +1306,29 @@ fn parse_tile(
             schema: display_schema(inline_schema),
         });
     }
-    let inline_fixed = read_data(source, &segment, SUBBLOCK_FIXED_SIZE, DV_FIXED_SIZE)?;
     let inline_count = le_i32(&inline_fixed, 28);
-    let entry_dimensions_count =
-        u64::try_from(entry.dimensions.len()).map_err(|_| CziError::Overflow {
-            context: "directory dimension count conversion",
-        })?;
     let inline_count = checked_count(
         inline_count,
-        entry_dimensions_count,
+        options.max_dimensions_per_entry,
         "inline dimension count",
         inline_offset,
     )?;
+    if inline_count == 0 {
+        return Err(CziError::InvalidNumber {
+            kind: "inline dimension count",
+            value: 0,
+            offset: inline_offset,
+        });
+    }
     let inline_size = checked_add(
         DV_FIXED_SIZE,
         checked_mul(inline_count, DIMENSION_ENTRY_SIZE, "inline dimension bytes")?,
         "inline DV entry size",
     )?;
-    let header_data_size = inline_size.max(SUBBLOCK_MIN_DATA_SIZE);
+    let inline_bytes = read_data(source, &segment, SUBBLOCK_FIXED_SIZE, inline_size)?;
+    let inline_entry = parse_dv_entry(&inline_bytes, inline_offset, inline_count)?;
+    reconcile_dv_entries(entry, &inline_entry, inline_offset)?;
+    let header_data_size = subblock_header_data_size(inline_size)?;
     require_data_size(&segment, header_data_size, "subblock")?;
     let payload_end = checked_add(
         checked_add(header_data_size, metadata_size, "tile metadata end")?,
@@ -1106,17 +1341,21 @@ fn parse_tile(
             reason: String::from("subblock payload exceeds used segment data"),
         });
     }
-    if inline_count != entry_dimensions_count {
-        return Err(CziError::InvalidSegment {
-            offset: entry.file_position,
-            reason: String::from("inline DV dimension count differs from directory entry"),
-        });
+    if matches!(entry.compression, CompressionMode::Uncompressed) {
+        if let Some(expected) = entry.stored_byte_size() {
+            if data_size != expected {
+                return Err(CziError::PayloadSizeMismatch {
+                    offset: entry.file_position,
+                    actual: data_size,
+                    expected,
+                });
+            }
+        }
     }
     let metadata_offset = data_offset(&segment, header_data_size)?;
     let data_offset = checked_add(metadata_offset, metadata_size, "tile data offset")?;
     let attachment_offset = checked_add(data_offset, data_size, "tile attachment offset")?;
-    Ok(TileIndex {
-        entry,
+    Ok(TilePayload {
         segment,
         metadata_offset,
         metadata_size,
@@ -1125,6 +1364,108 @@ fn parse_tile(
         attachment_offset,
         attachment_size,
     })
+}
+
+fn subblock_header_data_size(inline_dv_size: u64) -> Result<u64, CziError> {
+    checked_add(
+        SUBBLOCK_FIXED_SIZE,
+        inline_dv_size,
+        "subblock header extent",
+    )
+    .map(|size| size.max(SUBBLOCK_MIN_DATA_SIZE))
+}
+
+fn reconcile_dv_entries(
+    summary: &DirectoryEntry,
+    inline: &DirectoryEntry,
+    offset: u64,
+) -> Result<(), CziError> {
+    if summary.schema_type != inline.schema_type {
+        return Err(descriptor_mismatch("DV", "schema", offset));
+    }
+    if summary.pixel_type != inline.pixel_type {
+        return Err(descriptor_mismatch("DV", "pixel type", offset));
+    }
+    if summary.file_position != inline.file_position {
+        return Err(descriptor_mismatch("DV", "file position", offset));
+    }
+    if summary.file_part != inline.file_part {
+        return Err(descriptor_mismatch("DV", "file part", offset));
+    }
+    if summary.compression != inline.compression {
+        return Err(descriptor_mismatch("DV", "compression", offset));
+    }
+    if summary.pyramid_type != inline.pyramid_type {
+        return Err(descriptor_mismatch("DV", "pyramid type", offset));
+    }
+    if summary.dimensions.len() != inline.dimensions.len() {
+        return Err(descriptor_mismatch("DV", "dimension count", offset));
+    }
+    for (summary_dimension, inline_dimension) in summary.dimensions.iter().zip(&inline.dimensions) {
+        if summary_dimension.code != inline_dimension.code {
+            return Err(descriptor_mismatch("DV", "dimension code", offset));
+        }
+        if summary_dimension.start != inline_dimension.start {
+            return Err(descriptor_mismatch("DV", "dimension start", offset));
+        }
+        if summary_dimension.logical_size != inline_dimension.logical_size {
+            return Err(descriptor_mismatch("DV", "logical dimension size", offset));
+        }
+        if summary_dimension.start_coordinate.to_bits()
+            != inline_dimension.start_coordinate.to_bits()
+        {
+            return Err(descriptor_mismatch("DV", "dimension coordinate", offset));
+        }
+        if summary_dimension.stored_size_raw != inline_dimension.stored_size_raw {
+            return Err(descriptor_mismatch("DV", "stored dimension size", offset));
+        }
+    }
+    Ok(())
+}
+
+fn reconcile_attachment_entries(
+    summary: &AttachmentEntry,
+    inline: &AttachmentEntry,
+    offset: u64,
+) -> Result<(), CziError> {
+    if summary.schema_type != inline.schema_type {
+        return Err(descriptor_mismatch("A1", "schema", offset));
+    }
+    if summary.file_position != inline.file_position {
+        return Err(descriptor_mismatch("A1", "file position", offset));
+    }
+    if summary.file_part != inline.file_part {
+        return Err(descriptor_mismatch("A1", "file part", offset));
+    }
+    if summary.content_guid != inline.content_guid {
+        return Err(descriptor_mismatch("A1", "content GUID", offset));
+    }
+    if summary.content_file_type != inline.content_file_type {
+        return Err(descriptor_mismatch("A1", "content file type", offset));
+    }
+    if summary.name != inline.name {
+        return Err(descriptor_mismatch("A1", "name", offset));
+    }
+    Ok(())
+}
+
+fn descriptor_mismatch(context: &'static str, field: &'static str, offset: u64) -> CziError {
+    CziError::DescriptorMismatch {
+        context,
+        field,
+        offset,
+    }
+}
+
+fn ensure_file_part(context: &'static str, expected: i32, actual: i32) -> Result<(), CziError> {
+    if expected != actual {
+        return Err(CziError::CrossFilePartReference {
+            context,
+            expected,
+            actual,
+        });
+    }
+    Ok(())
 }
 
 fn parse_metadata(
@@ -1136,8 +1477,16 @@ fn parse_metadata(
     expect_kind(&segment, SegmentKind::Metadata, "ZISRAWMETADATA")?;
     require_data_size(&segment, METADATA_FIXED_SIZE, "metadata")?;
     let fixed = read_data(source, &segment, 0, 8)?;
-    let xml_size = u64::from(le_u32(&fixed, 0));
-    let attachment_size = u64::from(le_u32(&fixed, 4));
+    let xml_size = nonnegative_i32(
+        le_i32(&fixed, 0),
+        "metadata XML size",
+        data_offset(&segment, 0)?,
+    )?;
+    let attachment_size = nonnegative_i32(
+        le_i32(&fixed, 4),
+        "metadata attachment size",
+        data_offset(&segment, 4)?,
+    )?;
     if xml_size > maximum {
         return Err(CziError::MetadataTooLarge {
             size: xml_size,
@@ -1171,9 +1520,11 @@ fn parse_metadata(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_attachment_directory(
     source: &Arc<dyn RandomAccessSource>,
     offset: u64,
+    file_part: i32,
     options: ParseOptions,
 ) -> Result<Vec<AttachmentIndex>, CziError> {
     let segment = parse_segment(source, offset)?;
@@ -1183,16 +1534,25 @@ fn parse_attachment_directory(
         ATTACHMENT_DIRECTORY_FIXED_SIZE,
         "attachment directory",
     )?;
-    let fixed = read_data(source, &segment, 0, 4)?;
-    let count = le_i32(&fixed, 0);
+    if segment.used_size > options.max_index_bytes {
+        return Err(CziError::LimitExceeded {
+            kind: "attachment directory bytes",
+            value: segment.used_size,
+            maximum: options.max_index_bytes,
+        });
+    }
+    let directory_data = read_data(source, &segment, 0, segment.used_size)?;
+    let count = le_i32(&directory_data, 0);
     let count = checked_count(
         count,
         options.max_directory_entries,
         "attachment entry count",
         offset,
     )?;
-    let payload_size = segment
-        .used_size
+    let payload_size = u64::try_from(directory_data.len())
+        .map_err(|_| CziError::Overflow {
+            context: "attachment directory length conversion",
+        })?
         .checked_sub(ATTACHMENT_DIRECTORY_FIXED_SIZE)
         .ok_or(CziError::InvalidSegment {
             offset,
@@ -1206,19 +1566,48 @@ fn parse_attachment_directory(
             offset,
         });
     }
-    let entries_offset = data_offset(&segment, ATTACHMENT_DIRECTORY_FIXED_SIZE)?;
-    let mut attachments =
-        Vec::with_capacity(usize::try_from(count).map_err(|_| CziError::Overflow {
+    let mut attachments = Vec::new();
+    try_reserve_exact(
+        &mut attachments,
+        usize::try_from(count).map_err(|_| CziError::Overflow {
             context: "attachment directory allocation size",
-        })?);
-    for index in 0..count {
+        })?,
+        "attachment entries",
+        count,
+    )?;
+    let mut cursor =
+        usize::try_from(ATTACHMENT_DIRECTORY_FIXED_SIZE).map_err(|_| CziError::Overflow {
+            context: "attachment directory fixed size conversion",
+        })?;
+    let attachment_entry_size =
+        usize::try_from(ATTACHMENT_ENTRY_SIZE).map_err(|_| CziError::Overflow {
+            context: "attachment entry size conversion",
+        })?;
+    for _ in 0..count {
+        let entry_end = cursor
+            .checked_add(attachment_entry_size)
+            .ok_or(CziError::Overflow {
+                context: "attachment directory entry end",
+            })?;
+        if entry_end > directory_data.len() {
+            return Err(CziError::InvalidSegment {
+                offset,
+                reason: String::from("attachment directory ended inside A1 entry"),
+            });
+        }
         let entry_offset = checked_add(
-            entries_offset,
-            checked_mul(index, ATTACHMENT_ENTRY_SIZE, "attachment entry offset")?,
+            segment.offset,
+            checked_add(
+                SEGMENT_HEADER_SIZE,
+                u64::try_from(cursor).map_err(|_| CziError::Overflow {
+                    context: "attachment cursor conversion",
+                })?,
+                "attachment entry offset",
+            )?,
             "attachment entry offset",
         )?;
-        let bytes = read_vec(source, entry_offset, ATTACHMENT_ENTRY_SIZE)?;
-        let entry = parse_attachment_entry(&bytes, entry_offset)?;
+        let entry = parse_attachment_entry(&directory_data[cursor..entry_end], entry_offset)?;
+        ensure_file_part("attachment", file_part, entry.file_part)?;
         let attachment_segment = parse_segment(source, entry.file_position)?;
         expect_kind(&attachment_segment, SegmentKind::Attachment, "ZISRAWATTACH")?;
         require_data_size(
@@ -1226,14 +1615,21 @@ fn parse_attachment_directory(
             ATTACHMENT_DIRECTORY_FIXED_SIZE,
             "attachment",
         )?;
-        let attachment_fixed = read_data(source, &attachment_segment, 0, 4)?;
-        let data_size = u64::from(le_u32(&attachment_fixed, 0));
-        let end = checked_add(
+        let attachment_fixed = read_data(source, &attachment_segment, 0, 256)?;
+        let data_size = nonnegative_i32(
+            le_i32(&attachment_fixed, 0),
+            "attachment data size",
+            data_offset(&attachment_segment, 0)?,
+        )?;
+        let inline_entry_offset = data_offset(&attachment_segment, 16)?;
+        let inline_entry = parse_attachment_entry(&attachment_fixed[16..144], inline_entry_offset)?;
+        reconcile_attachment_entries(&entry, &inline_entry, inline_entry_offset)?;
+        let data_end = checked_add(
             ATTACHMENT_DIRECTORY_FIXED_SIZE,
             data_size,
             "attachment data end",
         )?;
-        if end > attachment_segment.used_size {
+        if data_end > attachment_segment.used_size {
             return Err(CziError::InvalidSegment {
                 offset: entry.file_position,
                 reason: String::from("attachment data exceeds used segment data"),
@@ -1246,7 +1642,7 @@ fn parse_attachment_directory(
             data_offset,
             data_size,
         });
-        let _ = index;
+        cursor = entry_end;
     }
     Ok(attachments)
 }
@@ -1272,9 +1668,14 @@ fn parse_attachment_entry(bytes: &[u8], offset: u64) -> Result<AttachmentEntry, 
         context: "attachment name",
         offset: name_offset,
     })?;
+    let file_position = nonnegative_i64(
+        le_i64(bytes, 12),
+        "attachment file position",
+        checked_add(offset, 12, "attachment file position offset")?,
+    )?;
     Ok(AttachmentEntry {
         schema_type,
-        file_position: le_u64(bytes, 12),
+        file_position,
         file_part: le_i32(bytes, 20),
         content_guid,
         content_file_type,
@@ -1289,8 +1690,16 @@ fn parse_segment(
     let bytes = read_vec(source, offset, SEGMENT_HEADER_SIZE)?;
     let mut id = [0; 16];
     id.copy_from_slice(&bytes[..16]);
-    let allocated_size = le_u64(&bytes, 16);
-    let on_disk_used_size = le_u64(&bytes, 24);
+    let allocated_size = nonnegative_i64(
+        le_i64(&bytes, 16),
+        "segment allocated size",
+        checked_add(offset, 16, "segment allocated size offset")?,
+    )?;
+    let on_disk_used_size = nonnegative_i64(
+        le_i64(&bytes, 24),
+        "segment used size",
+        checked_add(offset, 24, "segment used size offset")?,
+    )?;
     if allocated_size == 0 {
         return Err(CziError::InvalidSegment {
             offset,
@@ -1393,20 +1802,18 @@ fn read_vec(
     source.read_vec_at(offset, size).map_err(CziError::from)
 }
 
-fn read_array<const N: usize>(
-    source: &Arc<dyn RandomAccessSource>,
-    offset: u64,
-) -> Result<[u8; N], CziError> {
-    let bytes = read_vec(
-        source,
-        offset,
-        u64::try_from(N).map_err(|_| CziError::Overflow {
-            context: "fixed array size conversion",
-        })?,
-    )?;
-    let mut output = [0; N];
-    output.copy_from_slice(&bytes);
-    Ok(output)
+fn try_reserve_exact<T>(
+    values: &mut Vec<T>,
+    additional: usize,
+    context: &'static str,
+    size: u64,
+) -> Result<(), CziError> {
+    let size = usize::try_from(size).map_err(|_| CziError::Overflow {
+        context: "allocation size conversion",
+    })?;
+    values
+        .try_reserve_exact(additional)
+        .map_err(|_| CziError::Allocation { context, size })
 }
 
 fn checked_count(
@@ -1445,6 +1852,32 @@ fn checked_mul(left: u64, right: u64, context: &'static str) -> Result<u64, CziE
         .ok_or(CziError::Overflow { context })
 }
 
+fn nonnegative_i32(value: i32, kind: &'static str, offset: u64) -> Result<u64, CziError> {
+    if value < 0 {
+        return Err(CziError::InvalidNumber {
+            kind,
+            value: i64::from(value),
+            offset,
+        });
+    }
+    u64::try_from(value).map_err(|_| CziError::Overflow {
+        context: "signed i32 conversion",
+    })
+}
+
+fn nonnegative_i64(value: i64, kind: &'static str, offset: u64) -> Result<u64, CziError> {
+    if value < 0 {
+        return Err(CziError::InvalidNumber {
+            kind,
+            value,
+            offset,
+        });
+    }
+    u64::try_from(value).map_err(|_| CziError::Overflow {
+        context: "signed i64 conversion",
+    })
+}
+
 fn fixed_string(bytes: &[u8]) -> Result<String, std::str::Utf8Error> {
     let end = bytes
         .iter()
@@ -1467,10 +1900,10 @@ fn le_i32(bytes: &[u8], offset: usize) -> i32 {
     i32::from_le_bytes(le_u32(bytes, offset).to_le_bytes())
 }
 
-fn le_u64(bytes: &[u8], offset: usize) -> u64 {
+fn le_i64(bytes: &[u8], offset: usize) -> i64 {
     let mut value = [0; 8];
     value.copy_from_slice(&bytes[offset..offset + 8]);
-    u64::from_le_bytes(value)
+    i64::from_le_bytes(value)
 }
 
 fn le_f32(bytes: &[u8], offset: usize) -> f32 {
@@ -1502,5 +1935,12 @@ mod tests {
         let source = MemorySource::new(Arc::<[u8]>::from([1, 2, 3]));
         let error = source.read_vec_at(2, 2).expect_err("read must fail");
         assert!(matches!(error, SourceError::OutOfBounds { .. }));
+    }
+
+    #[test]
+    fn subblock_header_extent_has_dimension_boundaries() {
+        assert_eq!(subblock_header_data_size(32 + 10 * 20).unwrap(), 256);
+        assert_eq!(subblock_header_data_size(32 + 11 * 20).unwrap(), 268);
+        assert_eq!(subblock_header_data_size(32 + 12 * 20).unwrap(), 288);
     }
 }

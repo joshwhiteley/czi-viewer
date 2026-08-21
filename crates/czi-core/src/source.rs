@@ -47,6 +47,12 @@ pub enum SourceError {
         /// Unrepresentable length.
         length: u64,
     },
+    /// The requested owned range could not be allocated.
+    #[error("cannot allocate {size} bytes for source read")]
+    Allocation {
+        /// Requested allocation size.
+        size: usize,
+    },
 }
 
 /// A source that supports bounded, thread-safe random reads.
@@ -83,7 +89,11 @@ pub trait RandomAccessSource: Send + Sync {
         }
         let size =
             usize::try_from(size).map_err(|_| SourceError::LengthConversion { length: size })?;
-        let mut bytes = vec![0; size];
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(size)
+            .map_err(|_| SourceError::Allocation { size })?;
+        bytes.resize(size, 0);
         self.read_at(offset, &mut bytes)?;
         Ok(bytes)
     }

@@ -6,7 +6,7 @@ mod source;
 pub use parser::{
     AttachmentEntry, AttachmentIndex, CompressionMode, CziDataset, CziError, DatasetIndex,
     DimensionCode, DimensionEntry, DirectoryEntry, FileHeader, MetadataIndex, ParseOptions,
-    PixelType, PyramidType, SegmentHeader, SegmentKind, TileIndex,
+    PixelType, PyramidType, SegmentHeader, SegmentKind, TileIndex, TilePayload,
 };
 pub use source::{LocalFileSource, MemorySource, RandomAccessSource, SourceError, SourceInfo};
 
