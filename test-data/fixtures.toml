@@ -1,0 +1,28 @@
+# Expected facts for local, non-redistributable development fixtures.
+# Paths are supplied through environment variables and the CZI files are never committed.
+
+[fixtures.hada_bridge]
+path_env = "CZI_HADA_FIXTURE"
+sha256 = "573ee0438726ceea416bace6daedb5c7ef20c4175c0547dec1eff4461c078193"
+file_size = 12731678336
+version_major = 1
+version_minor = 0
+subblocks = 2700
+scenes = 12
+channels = 3
+pixel_type = "Gray16"
+compression = "Uncompressed"
+
+[fixtures.plate_rep1]
+path_env = "CZI_PLATE_FIXTURE"
+sha256 = "be39c1d050eed543acb59d23d4d93ee9df888fd2623da1ae386b47dae6f91129"
+file_size = 32498112
+version_major = 1
+version_minor = 0
+subblocks = 3
+scenes = 1
+channels = 3
+size_x = 2304
+size_y = 2304
+pixel_type = "Gray16"
+compression = "Uncompressed"

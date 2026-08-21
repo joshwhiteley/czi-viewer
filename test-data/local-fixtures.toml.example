@@ -1,0 +1,5 @@
+# Copy this file to local-fixtures.toml and keep it out of Git.
+# Tests primarily use the corresponding environment variables.
+
+hada_bridge = "/path/to/large-mosaic.czi"
+plate_rep1 = "/path/to/small-three-channel.czi"

@@ -1,0 +1,28 @@
+# Redistributable fixtures downloaded on demand by scripts/fetch-test-data.sh.
+
+[fixtures.multidimensional]
+filename = "T=3_Z=5_CH=2.czi"
+url = "https://zenodo.org/api/records/7015307/files/T=3_Z=5_CH=2.czi/content"
+sha256 = "fa940d1a7816be6628f0b508c39258a69b83f29f98b950692f819fbe7cee5427"
+file_size = 5284096
+license = "CC-BY-4.0"
+credit = "Sebastian Rhode / Carl Zeiss Microscopy GmbH"
+coverage = ["T=3", "Z=5", "C=2"]
+
+[fixtures.jpeg_xr]
+filename = "Zeiss-5-JXR.czi"
+url = "https://openslide.cs.cmu.edu/download/openslide-testdata/Zeiss/Zeiss-5-JXR.czi"
+sha256 = "c202ddf7b0bd473cdbe29977aee07c10c207077779485c0b1f876e8c00da77f7"
+file_size = 68811968
+license = "CC0-1.0"
+credit = "Venklab, Pathology, UTHSCSA"
+coverage = ["JPEG-XR", "pyramid", "S=2"]
+
+[fixtures.zstd1_hilo]
+filename = "Zeiss-5-SlidePreview-Zstd1-HiLo.czi"
+url = "https://openslide.cs.cmu.edu/download/openslide-testdata/Zeiss/Zeiss-5-SlidePreview-Zstd1-HiLo.czi"
+sha256 = "fd5cea806a557954e2ff63c2eb0dd23c83fe05d4900aac9d81a4af2a412288b0"
+file_size = 1885344
+license = "CC0-1.0"
+credit = "Venklab, Pathology, UTHSCSA"
+coverage = ["Zstd1", "HiLo", "Bgr48"]
