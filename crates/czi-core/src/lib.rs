@@ -14,7 +14,10 @@ pub use query::{
     PhysicalSize, PlaneInfo, PlaneKey, PlaneSelector, PyramidScale, SceneId, SparseAxisChoices,
     SpatialRect, TileHit, TileId, TileQueryError, TileQueryIndex, ViewQuery, ViewQueryResult,
 };
-pub use source::{LocalFileSource, MemorySource, RandomAccessSource, SourceError, SourceInfo};
+pub use source::{
+    BlockCache, BlockCacheConfig, BlockCacheError, CacheStats, DEFAULT_BLOCK_SIZE,
+    DEFAULT_MAX_BYTES, LocalFileSource, MemorySource, RandomAccessSource, SourceError, SourceInfo,
+};
 
 /// The library version exposed in diagnostic reports.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

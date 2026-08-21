@@ -8,6 +8,13 @@ use std::time::UNIX_EPOCH;
 
 use thiserror::Error;
 
+mod block_cache;
+
+pub use block_cache::{
+    BlockCache, BlockCacheConfig, BlockCacheError, CacheStats, DEFAULT_BLOCK_SIZE,
+    DEFAULT_MAX_BYTES,
+};
+
 /// Stable information captured for a source at open time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SourceInfo {
