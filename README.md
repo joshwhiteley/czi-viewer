@@ -2,7 +2,7 @@
 
 A macOS-first, pure-Rust desktop viewer for local and remote ZEISS CZI microscopy images.
 
-The project is under active development. It currently indexes CZI files and displays one uncompressed Gray8 or Gray16 tile with sparse C/S/Z/T selection, metadata preview, display levels, pan, and zoom. Mosaic composition, compressed codecs, and SSH/SFTP access are the next milestones.
+The project is under active development. It currently displays local, tiled and pyramidal CZI mosaics with sparse C/S/Z/T selection, metadata preview, display levels, pan, and zoom. Uncompressed Gray8 and Gray16 pixels are supported. Compressed codecs and SSH/SFTP access are the next milestones.
 
 ## Principles
 
