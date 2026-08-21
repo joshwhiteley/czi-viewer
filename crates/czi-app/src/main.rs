@@ -1,3 +1,3 @@
-fn main() {
-    println!("czi-viewer {}", czi_core::VERSION);
+fn main() -> eframe::Result {
+    czi_viewer::run()
 }
