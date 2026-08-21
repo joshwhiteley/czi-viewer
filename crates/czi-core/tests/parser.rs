@@ -3,6 +3,10 @@ use czi_core::{
     MemorySource, ParseOptions, PixelType, PyramidType, RandomAccessSource, SourceError,
 };
 use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 const SEGMENT_HEADER_SIZE: usize = 32;
 const FILE_HEADER_DATA_SIZE: usize = 512;
@@ -390,6 +394,30 @@ fn index_local_fixtures_without_pixel_allocation() {
 }
 
 #[test]
+#[ignore = "requires the 2,700-tile HADA fixture and CZI_RUN_FIXTURES=1"]
+fn opening_hada_uses_bounded_source_reads() {
+    if std::env::var_os("CZI_RUN_FIXTURES").is_none() {
+        return;
+    }
+    let path = std::env::var_os("CZI_HADA_FIXTURE").map_or_else(
+        || PathBuf::from("/Users/josh/Downloads/czi-tests/tf_HADA_BOD_d1_bridge_060225-02.czi"),
+        PathBuf::from,
+    );
+    if !path.exists() {
+        eprintln!("skipping missing fixture {}", path.display());
+        return;
+    }
+    let reads = Arc::new(AtomicUsize::new(0));
+    let source = CountingSource {
+        inner: Arc::new(LocalFileSource::open(path).expect("fixture source")),
+        reads: Arc::clone(&reads),
+    };
+    let dataset = CziDataset::open(source).expect("fixture index");
+    assert_eq!(dataset.index().tile_count(), 2_700);
+    assert!(reads.load(Ordering::Relaxed) <= 16);
+}
+
+#[test]
 #[ignore = "requires downloaded public fixture cache and CZI_RUN_FIXTURES=1"]
 fn index_public_fixture_cache_without_pixel_allocation() {
     if std::env::var_os("CZI_RUN_FIXTURES").is_none() {
@@ -431,6 +459,23 @@ fn public_fixture_dir() -> Option<PathBuf> {
 
 fn open(bytes: Vec<u8>) -> CziDataset {
     CziDataset::open(MemorySource::new(bytes)).expect("synthetic CZI")
+}
+
+#[derive(Clone)]
+struct CountingSource {
+    inner: Arc<dyn RandomAccessSource>,
+    reads: Arc<AtomicUsize>,
+}
+
+impl RandomAccessSource for CountingSource {
+    fn info(&self) -> czi_core::SourceInfo {
+        self.inner.info()
+    }
+
+    fn read_at(&self, offset: u64, destination: &mut [u8]) -> Result<(), SourceError> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.read_at(offset, destination)
+    }
 }
 
 fn synthetic_file(with_attachments: bool) -> SyntheticFile {
