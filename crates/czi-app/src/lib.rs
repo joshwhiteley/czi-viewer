@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -138,7 +138,7 @@ struct DatasetWorker {
 impl DatasetWorker {
     fn spawn() -> Self {
         let (commands, command_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
-        let (event_tx, events) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let (event_tx, events) = mpsc::channel();
         let join = thread::Builder::new()
             .name(String::from("czi-dataset-worker"))
             .spawn(move || worker_loop(&command_rx, &event_tx))
@@ -173,7 +173,7 @@ impl Drop for DatasetWorker {
     }
 }
 
-fn worker_loop(commands: &Receiver<WorkerCommand>, events: &SyncSender<WorkerEvent>) {
+fn worker_loop(commands: &Receiver<WorkerCommand>, events: &Sender<WorkerEvent>) {
     let mut dataset = None;
     let mut active_source_generation = 0;
     while let Ok(command) = commands.recv() {
@@ -191,24 +191,24 @@ fn worker_loop(commands: &Receiver<WorkerCommand>, events: &SyncSender<WorkerEve
                     Ok(opened) => {
                         let info = DatasetInfo::from_dataset(path, &opened);
                         dataset = Some(opened);
-                        if !publish_event(
-                            events,
-                            WorkerEvent::Opened {
+                        if events
+                            .send(WorkerEvent::Opened {
                                 info,
                                 source_generation,
-                            },
-                        ) {
+                            })
+                            .is_err()
+                        {
                             break;
                         }
                     }
                     Err(error) => {
-                        if !publish_event(
-                            events,
-                            WorkerEvent::OpenFailed {
+                        if events
+                            .send(WorkerEvent::OpenFailed {
                                 message: error.to_string(),
                                 source_generation,
-                            },
-                        ) {
+                            })
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -234,19 +234,12 @@ fn worker_loop(commands: &Receiver<WorkerCommand>, events: &SyncSender<WorkerEve
                         plane_generation,
                     }
                 };
-                if !publish_event(events, event) {
+                if events.send(event).is_err() {
                     break;
                 }
             }
             WorkerCommand::Shutdown => break,
         }
-    }
-}
-
-fn publish_event(events: &SyncSender<WorkerEvent>, event: WorkerEvent) -> bool {
-    match events.try_send(event) {
-        Ok(()) | Err(TrySendError::Full(_)) => true,
-        Err(TrySendError::Disconnected(_)) => false,
     }
 }
 
@@ -962,6 +955,40 @@ mod tests {
         let mut worker = DatasetWorker::spawn();
         worker.shutdown();
         assert!(worker.join.is_none());
+    }
+
+    #[test]
+    fn worker_preserves_events_from_a_bounded_command_burst() {
+        let mut worker = DatasetWorker::spawn();
+        let count = u64::try_from(CHANNEL_CAPACITY + 1).expect("channel capacity fits u64");
+        for source_generation in 1..=count {
+            worker
+                .commands
+                .send(WorkerCommand::Open {
+                    path: PathBuf::from(format!(
+                        "/dev/null/czi-viewer-missing-{source_generation}.czi"
+                    )),
+                    source_generation,
+                })
+                .expect("bounded command burst");
+        }
+
+        let mut observed = Vec::new();
+        for _ in 0..count {
+            match worker
+                .events
+                .recv_timeout(Duration::from_secs(1))
+                .expect("worker event")
+            {
+                WorkerEvent::OpenFailed {
+                    source_generation, ..
+                } => observed.push(source_generation),
+                _ => panic!("missing-path open should fail"),
+            }
+        }
+        observed.sort_unstable();
+        assert_eq!(observed, (1..=count).collect::<Vec<_>>());
+        worker.shutdown();
     }
 
     #[test]
