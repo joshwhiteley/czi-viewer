@@ -218,7 +218,12 @@ fn index_public_fixture_cache_without_pixel_allocation() {
     if std::env::var_os("CZI_RUN_FIXTURES").is_none() {
         return;
     }
-    let cache = PathBuf::from("/Users/josh/czi-viewer-rs/test-data/cache");
+    let Some(cache) = public_fixture_dir() else {
+        eprintln!(
+            "skipping public fixtures: set CZI_PUBLIC_FIXTURE_DIR or provide the repository-relative test-data/cache"
+        );
+        return;
+    };
     for name in [
         "T=3_Z=5_CH=2.czi",
         "Zeiss-5-JXR.czi",
@@ -233,6 +238,18 @@ fn index_public_fixture_cache_without_pixel_allocation() {
             .expect("public fixture index");
         assert!(!dataset.index().tiles.is_empty());
     }
+}
+
+fn public_fixture_dir() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("CZI_PUBLIC_FIXTURE_DIR") {
+        let path = PathBuf::from(path);
+        return path.is_dir().then_some(path);
+    }
+    let repository_cache = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-data/cache");
+    repository_cache
+        .canonicalize()
+        .ok()
+        .filter(|path| path.is_dir())
 }
 
 fn open(bytes: Vec<u8>) -> CziDataset {
