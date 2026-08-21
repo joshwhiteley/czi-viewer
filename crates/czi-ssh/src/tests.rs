@@ -212,6 +212,9 @@ fn validates_profiles_and_locations() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn command_builders_keep_paths_out_of_argv_and_preserve_host_checks() {
+    #[cfg(unix)]
+    let base = std::path::Path::new("/tmp").join(format!("czi-ssh-test-{}", std::process::id()));
+    #[cfg(not(unix))]
     let base = std::env::temp_dir().join(format!("czi-ssh-test-{}", std::process::id()));
     std::fs::create_dir_all(&base).unwrap();
     let private = base.join("socket's directory");

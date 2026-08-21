@@ -11,9 +11,9 @@ use crate::{OpenSshConfigError, SftpError, SshProfile};
 pub const OPENSSH_PATH: &str = "/usr/bin/ssh";
 
 /// macOS has a 104-byte `sockaddr_un::sun_path`. OpenSSH creates its listener at a temporary
-/// `<ControlPath>.XXXXXXXXXXX` name before renaming it, so keep the configured name at 90 bytes.
-/// This leaves room for the 12-byte suffix, a NUL terminator, and one spare byte.
-pub(crate) const SOCKET_PATH_LIMIT: usize = 90;
+/// name by appending a suffix observed to be 17 bytes. Keep the configured name at 80 bytes,
+/// leaving room for that suffix, a NUL terminator, and additional implementation variance.
+pub(crate) const SOCKET_PATH_LIMIT: usize = 80;
 
 #[cfg(unix)]
 const PRIVATE_CONTROL_BASE: &str = "/tmp";
@@ -31,7 +31,7 @@ impl ControlPath {
     ///
     /// A deliberately short base avoids macOS `sun_path` limits and ignores `TMPDIR`. The private
     /// child directory permissions are set to `0700` on Unix platforms. The returned socket has
-    /// a conservative 90-byte maximum that reserves space for OpenSSH's temporary socket suffix.
+    /// a conservative 80-byte maximum that reserves space for OpenSSH's temporary socket suffix.
     ///
     /// # Errors
     ///
