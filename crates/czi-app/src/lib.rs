@@ -812,6 +812,17 @@ impl TextureCache {
     }
 }
 
+fn take_worker_event_batch(events: &Receiver<WorkerEvent>) -> Vec<WorkerEvent> {
+    let mut batch = Vec::with_capacity(CHANNEL_CAPACITY);
+    for _ in 0..CHANNEL_CAPACITY {
+        match events.try_recv() {
+            Ok(event) => batch.push(event),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        }
+    }
+    batch
+}
+
 struct PendingTile {
     tile_id: TileId,
     plane: PlaneKey,
@@ -967,32 +978,54 @@ impl ViewerApp {
     }
 
     fn handle_worker_events(&mut self) {
-        loop {
-            match self.worker.events.try_recv() {
-                Ok(WorkerEvent::Opened {
-                    info,
-                    source_generation,
-                }) if self.generations.accepts_source(source_generation) => {
-                    self.selection = info.default_selection();
-                    self.levels = Levels::default_for(info.pixel_type);
-                    self.status = Status::normal(format!(
-                        "Indexed {} tile(s); choose a plane or view the mosaic.",
-                        info.tile_count
-                    ));
-                    self.dataset = Some(info);
-                    self.cache.clear();
-                    self.pending_tiles.clear();
-                    self.visible_tile_ids.clear();
-                    self.fit_pending = true;
-                    self.invalidate_view();
+        for event in take_worker_event_batch(&self.worker.events) {
+            self.handle_worker_event(event);
+        }
+    }
+
+    fn handle_worker_event(&mut self, event: WorkerEvent) {
+        match event {
+            WorkerEvent::Opened {
+                info,
+                source_generation,
+            } if self.generations.accepts_source(source_generation) => {
+                self.selection = info.default_selection();
+                self.levels = Levels::default_for(info.pixel_type);
+                self.status = Status::normal(format!(
+                    "Indexed {} tile(s); choose a plane or view the mosaic.",
+                    info.tile_count
+                ));
+                self.dataset = Some(info);
+                self.cache.clear();
+                self.pending_tiles.clear();
+                self.visible_tile_ids.clear();
+                self.fit_pending = true;
+                self.invalidate_view();
+            }
+            WorkerEvent::OpenFailed {
+                message,
+                source_generation,
+            } if self.generations.accepts_source(source_generation) => {
+                self.status = Status::error(message);
+            }
+            WorkerEvent::TileLoaded {
+                tile_id,
+                plane,
+                logical_rect,
+                scale,
+                paint_order,
+                tile,
+                source_generation,
+                view_generation,
+            } if self
+                .generations
+                .accepts_view(source_generation, view_generation)
+                && plane == self.selection.key() =>
+            {
+                if !self.visible_tile_ids.contains(&tile_id) {
+                    self.visible_tile_ids.push(tile_id);
                 }
-                Ok(WorkerEvent::OpenFailed {
-                    message,
-                    source_generation,
-                }) if self.generations.accepts_source(source_generation) => {
-                    self.status = Status::error(message);
-                }
-                Ok(WorkerEvent::TileLoaded {
+                self.pending_tiles.push(PendingTile {
                     tile_id,
                     plane,
                     logical_rect,
@@ -1001,63 +1034,48 @@ impl ViewerApp {
                     tile,
                     source_generation,
                     view_generation,
-                }) if self
-                    .generations
-                    .accepts_view(source_generation, view_generation)
-                    && plane == self.selection.key() =>
-                {
-                    if !self.visible_tile_ids.contains(&tile_id) {
-                        self.visible_tile_ids.push(tile_id);
-                    }
-                    self.pending_tiles.push(PendingTile {
-                        tile_id,
-                        plane,
-                        logical_rect,
-                        scale,
-                        paint_order,
-                        tile,
-                        source_generation,
-                        view_generation,
-                    });
-                }
-                Ok(WorkerEvent::ViewFinished {
-                    plane,
-                    scale,
-                    visible_tile_ids,
-                    source_generation,
-                    view_generation,
-                }) if self
-                    .generations
-                    .accepts_view(source_generation, view_generation)
-                    && plane == self.selection.key() =>
-                {
-                    self.selected_scale = Some(scale);
-                    self.visible_tile_ids = visible_tile_ids;
-                    self.cache
-                        .finish_view(source_generation, plane, &self.visible_tile_ids);
-                    let (visible, resident, bytes) =
-                        self.cache.current_counts(source_generation, plane);
-                    self.status = Status::normal(format!(
-                        "Scale {}× · {} visible · {} resident · {} cache",
-                        format_scale(scale),
-                        visible,
-                        resident,
-                        format_bytes(bytes)
-                    ));
-                }
-                Ok(WorkerEvent::ViewFailed {
-                    message,
-                    source_generation,
-                    view_generation,
-                }) if self
-                    .generations
-                    .accepts_view(source_generation, view_generation) =>
-                {
-                    self.status = Status::error(message);
-                }
-                Ok(_) => {}
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                });
             }
+            WorkerEvent::ViewFinished {
+                plane,
+                scale,
+                visible_tile_ids,
+                source_generation,
+                view_generation,
+            } if self
+                .generations
+                .accepts_view(source_generation, view_generation)
+                && plane == self.selection.key() =>
+            {
+                self.selected_scale = Some(scale);
+                self.visible_tile_ids = visible_tile_ids;
+                self.cache
+                    .finish_view(source_generation, plane, &self.visible_tile_ids);
+                let (visible, resident, bytes) =
+                    self.cache.current_counts(source_generation, plane);
+                self.status = Status::normal(format!(
+                    "Scale {}× · {} visible · {} resident · {} cache",
+                    format_scale(scale),
+                    visible,
+                    resident,
+                    format_bytes(bytes)
+                ));
+            }
+            WorkerEvent::ViewFailed {
+                message,
+                source_generation,
+                view_generation,
+            } if self
+                .generations
+                .accepts_view(source_generation, view_generation) =>
+            {
+                self.status = Status::error(message);
+            }
+            WorkerEvent::Opened { .. }
+            | WorkerEvent::OpenFailed { .. }
+            | WorkerEvent::TileLoaded { .. }
+            | WorkerEvent::ViewFinished { .. }
+            | WorkerEvent::ViewFailed { .. } => {}
         }
     }
 
@@ -1541,6 +1559,27 @@ mod tests {
         observed.sort_unstable();
         assert_eq!(observed, (1..=count).collect::<Vec<_>>());
         worker.shutdown();
+    }
+
+    #[test]
+    fn worker_event_batch_is_bounded_per_ui_update() {
+        let (sender, events) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        for source_generation in 0..CHANNEL_CAPACITY {
+            sender
+                .send(WorkerEvent::OpenFailed {
+                    message: source_generation.to_string(),
+                    source_generation: u64::try_from(source_generation).expect("generation"),
+                })
+                .expect("event channel capacity");
+        }
+        assert_eq!(take_worker_event_batch(&events).len(), CHANNEL_CAPACITY);
+        sender
+            .send(WorkerEvent::OpenFailed {
+                message: String::from("next"),
+                source_generation: 0,
+            })
+            .expect("event channel capacity");
+        assert_eq!(take_worker_event_batch(&events).len(), 1);
     }
 
     #[test]

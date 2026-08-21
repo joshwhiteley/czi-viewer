@@ -40,9 +40,11 @@ fn hada_query_index_is_sparse_and_payload_lazy() {
         return;
     }
     let path = hada_path();
-    if !path.is_file() {
-        return;
-    }
+    assert!(
+        path.is_file(),
+        "CZI_RUN_FIXTURES is set but requested HADA fixture is missing: {}",
+        path.display()
+    );
     let reads = Arc::new(AtomicUsize::new(0));
     let source = CountingSource {
         inner: Arc::new(LocalFileSource::open(path).expect("fixture source")),
