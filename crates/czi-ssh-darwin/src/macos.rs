@@ -16,6 +16,7 @@ const TIOCSCTTY: libc::c_ulong = 0x2000_7461;
 const MIN_CHILD_FD: RawFd = 3;
 const SSH_ASKPASS: &str = "SSH_ASKPASS";
 const SSH_ASKPASS_REQUIRE: &str = "SSH_ASKPASS_REQUIRE";
+const CHILD_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 unsafe extern "C" {
     fn ptsname_r(
@@ -208,21 +209,28 @@ impl Child {
         self.wait_once()
     }
 
-    /// Block until the child is reaped.
+    /// Wait briefly for the child to be reaped.
     ///
     /// The returned status is the Darwin wait status suitable for
     /// `std::os::unix::process::ExitStatusExt::from_raw`.
     ///
     /// # Errors
     ///
-    /// Returns an error when waiting for the child fails.
+    /// Returns an error when waiting fails or exceeds the bounded reap timeout.
     pub fn wait(&mut self) -> io::Result<Option<i32>> {
+        let deadline = std::time::Instant::now() + CHILD_REAP_TIMEOUT;
         loop {
             if let Some(status) = self.wait_once()? {
                 return Ok(Some(status));
             }
             if self.is_leader_reaped()? {
                 return Ok(None);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out reaping embedded child",
+                ));
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -257,6 +265,9 @@ impl Child {
             .map_err(|_| io::Error::other("embedded child lifecycle lock poisoned"))?;
         if lifecycle.leader_reaped {
             return Ok(None);
+        }
+        if lifecycle.process_group_terminated {
+            return try_reap_terminated_child(self.state.pid, &mut lifecycle);
         }
 
         if !leader_is_waitable(self.state.pid)? {
@@ -296,7 +307,9 @@ impl Child {
 
 impl Drop for Child {
     fn drop(&mut self) {
-        let _ = self.terminate_and_wait();
+        if self.terminate_and_wait().is_err() {
+            reap_child_in_background(Arc::clone(&self.state));
+        }
     }
 }
 
@@ -335,17 +348,90 @@ fn terminate_process_group_locked(
     }
     // SAFETY: a live or waitable leader keeps its private session/process-group ID from being
     // recycled. A negative PID targets the whole private group, including SSH helpers.
-    let result = unsafe { libc::kill(-pid, libc::SIGKILL) };
-    let error = io::Error::last_os_error();
-    if result == 0
-        || error.raw_os_error() == Some(libc::ESRCH)
+    let group_result = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    let group_error = io::Error::last_os_error();
+    if group_result == -1
+        && group_error.raw_os_error() != Some(libc::ESRCH)
         // Darwin returns EPERM for a zombie session leader whose group has no live members.
-        || (leader_waitable && error.raw_os_error() == Some(libc::EPERM))
+        && !(leader_waitable && group_error.raw_os_error() == Some(libc::EPERM))
     {
-        lifecycle.process_group_terminated = true;
-        return Ok(());
+        return Err(group_error);
+    }
+    // SAFETY: pid is the unreaped leader returned by posix_spawn. This direct signal is a
+    // fallback for Darwin session/process-group edge cases; it cannot target a recycled PID.
+    let leader_result = unsafe { libc::kill(pid, libc::SIGKILL) };
+    let leader_error = io::Error::last_os_error();
+    if leader_result == -1
+        && leader_error.raw_os_error() != Some(libc::ESRCH)
+        && !(leader_waitable && leader_error.raw_os_error() == Some(libc::EPERM))
+    {
+        return Err(leader_error);
+    }
+    lifecycle.process_group_terminated = true;
+    Ok(())
+}
+
+fn try_reap_terminated_child(
+    pid: libc::pid_t,
+    lifecycle: &mut ProcessLifecycle,
+) -> io::Result<Option<i32>> {
+    let mut status = 0;
+    // SAFETY: status is writable and pid is the still-unreaped posix_spawn child.
+    let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    if result == pid {
+        lifecycle.leader_reaped = true;
+        return Ok(Some(status));
+    }
+    if result == 0 {
+        return Ok(None);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ECHILD) {
+        lifecycle.leader_reaped = true;
+        return Ok(None);
     }
     Err(error)
+}
+
+fn reap_child_in_background(state: Arc<ProcessState>) {
+    let _ = std::thread::Builder::new()
+        .name(String::from("czi-ssh-child-reaper"))
+        .spawn(move || {
+            let needs_reap = {
+                let Ok(mut lifecycle) = state.lifecycle.lock() else {
+                    return;
+                };
+                if !lifecycle.leader_reaped && !lifecycle.process_group_terminated {
+                    let _ = terminate_process_group_locked(state.pid, &mut lifecycle, false);
+                }
+                !lifecycle.leader_reaped
+            };
+            if !needs_reap {
+                return;
+            }
+            // SAFETY: the leader remains unreaped, so its PID cannot be recycled. Retry the
+            // direct signal before the background wait in case an earlier group signal raced an
+            // exiting Darwin session leader.
+            let _ = unsafe { libc::kill(state.pid, libc::SIGKILL) };
+            let mut status = 0;
+            loop {
+                // SAFETY: the background reaper owns the last Child lifecycle path for this PID.
+                let result = unsafe { libc::waitpid(state.pid, &mut status, 0) };
+                if result == state.pid
+                    || (result == -1
+                        && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+                {
+                    if let Ok(mut lifecycle) = state.lifecycle.lock() {
+                        lifecycle.leader_reaped = true;
+                    }
+                    return;
+                }
+                if result == -1 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return;
+            }
+        });
 }
 
 fn leader_is_waitable(pid: libc::pid_t) -> io::Result<bool> {

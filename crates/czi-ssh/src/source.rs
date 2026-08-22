@@ -112,8 +112,9 @@ impl SftpSource {
 
     /// Close the remote SFTP file handle before dropping this source.
     ///
-    /// This is the graceful close path. Drop tries to close without waiting for a concurrent
-    /// browser/read operation; the final shared-session owner then reaps the OpenSSH child.
+    /// This is the graceful close path. Drop queues a CLOSE without waiting for a concurrent
+    /// browser/read operation; the shared session drains it before/after its next operation or at
+    /// final shutdown.
     ///
     /// # Errors
     ///
@@ -154,9 +155,7 @@ impl Drop for SftpSource {
         let Some(handle) = self.handle.take() else {
             return;
         };
-        let _ = self
-            .session
-            .try_with_session(|session| session.close(&handle));
+        self.session.defer_close(handle);
     }
 }
 

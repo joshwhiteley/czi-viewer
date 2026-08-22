@@ -6,7 +6,7 @@
 
 mod bridge;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -130,14 +130,16 @@ struct EmbeddedCancellationSlot {
 
 struct EmbeddedCancellationState {
     current: Option<(u64, EmbeddedSshCancellation)>,
-    cancelled_generations: HashSet<u64>,
+    cancelled_through: Option<u64>,
 }
 
 impl EmbeddedCancellationSlot {
     fn replace(&self, generation: u64, cancellation: &EmbeddedSshCancellation) {
         let cancel = if let Ok(mut state) = self.inner.lock() {
             state.current = Some((generation, cancellation.clone()));
-            state.cancelled_generations.contains(&generation)
+            state
+                .cancelled_through
+                .is_some_and(|cancelled_through| generation <= cancelled_through)
         } else {
             false
         };
@@ -155,7 +157,6 @@ impl EmbeddedCancellationSlot {
             {
                 state.current = None;
             }
-            state.cancelled_generations.remove(&generation);
         }
     }
 
@@ -164,7 +165,13 @@ impl EmbeddedCancellationSlot {
             .inner
             .lock()
             .map(|mut state| {
-                state.cancelled_generations.insert(generation);
+                state.cancelled_through = Some(
+                    state
+                        .cancelled_through
+                        .map_or(generation, |cancelled_through| {
+                            cancelled_through.max(generation)
+                        }),
+                );
                 state
                     .current
                     .as_ref()
@@ -195,7 +202,7 @@ impl Default for EmbeddedCancellationSlot {
         Self {
             inner: Arc::new(Mutex::new(EmbeddedCancellationState {
                 current: None,
-                cancelled_generations: HashSet::new(),
+                cancelled_through: None,
             })),
         }
     }
@@ -589,10 +596,21 @@ struct WorkerDataset {
     query: TileQueryIndex,
 }
 
+struct ViewInterruption {
+    command: WorkerCommand,
+    resume: Option<ViewRequest>,
+}
+
 struct WorkerBrowseSession {
     profile: String,
     config: OpenSshConfig,
+    connection_generation: u64,
     session: SharedSftpSession,
+}
+
+struct ConnectedSftpSession {
+    session: SftpSession,
+    embedded_cancellation: Option<EmbeddedSshCancellation>,
 }
 
 struct EmbeddedConnectionContext<'a> {
@@ -671,6 +689,7 @@ impl Drop for DatasetWorker {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn worker_loop(
     commands: &Receiver<WorkerCommand>,
     events: &SyncSender<WorkerEvent>,
@@ -680,9 +699,9 @@ fn worker_loop(
     let mut dataset = None;
     let mut browse_session = None;
     let mut active_source_generation = 0;
-    let mut pending_command = None;
+    let mut pending_commands = VecDeque::new();
     loop {
-        let command = match pending_command.take() {
+        let command = match pending_commands.pop_front() {
             Some(command) => command,
             None => match commands.recv() {
                 Ok(command) => command,
@@ -762,7 +781,14 @@ fn worker_loop(
                         break;
                     }
                 } else if let Some(opened) = dataset.as_ref() {
-                    pending_command = process_view(commands, events, opened, &request);
+                    if let Some(ViewInterruption { command, resume }) =
+                        process_view(commands, events, opened, &request)
+                    {
+                        if let Some(resume) = resume {
+                            pending_commands.push_front(WorkerCommand::View(resume));
+                        }
+                        pending_commands.push_front(command);
+                    }
                 } else if events
                     .send(WorkerEvent::ViewFailed {
                         message: String::from("no dataset is open"),
@@ -863,18 +889,27 @@ fn browse_remote_paths(
             Some((SftpLocation::new(path).map_err(validation_failure)?, prefix))
         }
     };
-    let matches_existing = browse_session
-        .as_ref()
-        .is_some_and(|existing| existing.profile == profile.as_str() && existing.config == *config);
+    let matches_existing = browse_session.as_ref().is_some_and(|existing| {
+        existing.profile == profile.as_str()
+            && existing.config == *config
+            && existing.connection_generation == connection.generation
+    });
     if !matches_existing {
+        if let Some(existing) = browse_session.as_ref() {
+            let _ = existing
+                .session
+                .cancel_embedded_connection(existing.connection_generation);
+        }
         *browse_session = None;
-        let session = SharedSftpSession::new(
+        let session = shared_session(
             connect_embedded(&profile, config, connection)
                 .map_err(|error| remote_failure(profile.as_str(), config, error))?,
+            connection.generation,
         );
         *browse_session = Some(WorkerBrowseSession {
             profile: profile.as_str().to_owned(),
             config: config.clone(),
+            connection_generation: connection.generation,
             session,
         });
     }
@@ -950,7 +985,9 @@ fn open_dataset(
                 .remote_parts()
                 .map_err(|error| remote.open_failure(error))?;
             let source = if browse_session.as_ref().is_some_and(|existing| {
-                existing.profile == profile.as_str() && existing.config == *config
+                existing.profile == profile.as_str()
+                    && existing.config == *config
+                    && existing.connection_generation == connection.generation
             }) {
                 SftpSource::open_with_shared_session(
                     browse_session
@@ -961,14 +998,21 @@ fn open_dataset(
                     &location,
                 )
             } else {
+                if let Some(existing) = browse_session.as_ref() {
+                    let _ = existing
+                        .session
+                        .cancel_embedded_connection(existing.connection_generation);
+                }
                 *browse_session = None;
-                let session = SharedSftpSession::new(
+                let session = shared_session(
                     connect_embedded(&profile, config, connection)
                         .map_err(|error| remote.open_failure(error))?,
+                    connection.generation,
                 );
                 *browse_session = Some(WorkerBrowseSession {
                     profile: profile.as_str().to_owned(),
                     config: config.clone(),
+                    connection_generation: connection.generation,
                     session: session.clone(),
                 });
                 SftpSource::open_with_shared_session(session, &location)
@@ -986,13 +1030,17 @@ fn connect_embedded(
     profile: &SshProfile,
     config: &OpenSshConfig,
     connection: &EmbeddedConnectionContext<'_>,
-) -> Result<SftpSession, czi_ssh::SftpError> {
+) -> Result<ConnectedSftpSession, czi_ssh::SftpError> {
     if matches!(connection.mode, RemoteConnectionMode::TerminalBridge) {
         return SftpSession::connect_preferred_with_cancellation(
             profile,
             config,
             connection.bridge_cancellation,
-        );
+        )
+        .map(|session| ConnectedSftpSession {
+            session,
+            embedded_cancellation: None,
+        });
     }
     let (pending, console) = match SftpSession::start_embedded(profile, config) {
         Ok(connection) => connection,
@@ -1013,7 +1061,7 @@ fn connect_embedded(
         .send(WorkerEvent::AuthenticationStarted {
             profile: profile.as_str().to_owned(),
             console,
-            cancellation,
+            cancellation: cancellation.clone(),
             connection_generation: connection.generation,
         })
         .is_err()
@@ -1043,7 +1091,10 @@ fn connect_embedded(
                     ),
                 });
             }
-            Ok(session)
+            Ok(ConnectedSftpSession {
+                session,
+                embedded_cancellation: Some(cancellation),
+            })
         }
         Err(error) => {
             connection.cancellation.clear(connection.generation);
@@ -1056,6 +1107,15 @@ fn connect_embedded(
     }
 }
 
+fn shared_session(connected: ConnectedSftpSession, generation: u64) -> SharedSftpSession {
+    match connected.embedded_cancellation {
+        Some(cancellation) => {
+            SharedSftpSession::new_embedded(connected.session, generation, cancellation)
+        }
+        None => SharedSftpSession::new(connected.session),
+    }
+}
+
 fn finish_open(
     source_label: String,
     opened: CziDataset,
@@ -1065,20 +1125,32 @@ fn finish_open(
     Ok((opened, query, info))
 }
 
-fn take_newer_command(commands: &Receiver<WorkerCommand>) -> Option<WorkerCommand> {
+fn take_newer_command(
+    commands: &Receiver<WorkerCommand>,
+    current_view: &ViewRequest,
+) -> Option<ViewInterruption> {
     let mut latest_view = None;
     loop {
         match commands.try_recv() {
-            Ok(WorkerCommand::View(request)) => latest_view = Some(WorkerCommand::View(request)),
-            Ok(
-                command @ (WorkerCommand::Open { .. }
-                | WorkerCommand::Browse { .. }
-                | WorkerCommand::ClearBrowse
-                | WorkerCommand::Shutdown),
-            ) => {
-                return Some(command);
+            Ok(WorkerCommand::View(request)) => latest_view = Some(request),
+            Ok(command @ (WorkerCommand::Browse { .. } | WorkerCommand::ClearBrowse)) => {
+                return Some(ViewInterruption {
+                    command,
+                    resume: Some(latest_view.unwrap_or_else(|| current_view.clone())),
+                });
             }
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => return latest_view,
+            Ok(command @ (WorkerCommand::Open { .. } | WorkerCommand::Shutdown)) => {
+                return Some(ViewInterruption {
+                    command,
+                    resume: None,
+                });
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
+                return latest_view.map(|request| ViewInterruption {
+                    command: WorkerCommand::View(request),
+                    resume: None,
+                });
+            }
         }
     }
 }
@@ -1088,8 +1160,8 @@ fn process_view(
     events: &SyncSender<WorkerEvent>,
     opened: &WorkerDataset,
     request: &ViewRequest,
-) -> Option<WorkerCommand> {
-    if let Some(newer) = take_newer_command(commands) {
+) -> Option<ViewInterruption> {
+    if let Some(newer) = take_newer_command(commands, request) {
         return Some(newer);
     }
     let query = match ViewQuery::new(request.plane, request.viewport, request.target_downsample)
@@ -1139,7 +1211,7 @@ fn process_view(
         if events.send(event).is_err() {
             return None;
         }
-        if let Some(newer) = take_newer_command(commands) {
+        if let Some(newer) = take_newer_command(commands, request) {
             return Some(newer);
         }
     }
@@ -1652,7 +1724,7 @@ impl ViewerApp {
     }
 
     fn open_local_path(&mut self) {
-        self.cancel_authentication_if_connecting();
+        self.cancel_active_remote_connection();
         let path = PathBuf::from(self.path_input.trim());
         if self.path_input.trim().is_empty() {
             self.status = Status::error("Enter a local .czi path first.");
@@ -1693,7 +1765,7 @@ impl ViewerApp {
         self.remote_browse_pending = false;
         self.terminal_bootstrap_command = None;
         if profile_changed {
-            self.cancel_authentication_if_connecting();
+            self.cancel_active_remote_connection();
             self.embedded_authentication = None;
             self.generations.begin_connection();
             self.use_terminal_fallback = false;
@@ -1818,39 +1890,34 @@ impl ViewerApp {
                     && authentication.status != AuthenticationStatus::Failed
             });
         if !reuse {
-            self.cancel_authentication_if_connecting();
+            self.cancel_active_remote_connection();
             self.embedded_authentication = None;
             self.generations.begin_connection();
         }
         self.generations.connection
     }
 
-    fn cancel_authentication_if_connecting(&mut self) {
-        let connecting = self
-            .embedded_authentication
-            .as_ref()
-            .is_none_or(|authentication| authentication.status == AuthenticationStatus::Connecting);
-        if connecting {
-            self.worker
-                .embedded_cancellation
-                .cancel(self.generations.connection);
-            if let Some(authentication) = &self.embedded_authentication {
-                let _ = authentication.cancellation.cancel();
-            }
+    fn cancel_active_remote_connection(&mut self) {
+        self.worker
+            .embedded_cancellation
+            .cancel(self.generations.connection);
+        if let Some(authentication) = &self.embedded_authentication
+            && authentication.generation == self.generations.connection
+        {
+            let _ = authentication.cancellation.cancel();
         }
     }
 
     fn cancel_embedded_authentication(&mut self) {
-        self.cancel_authentication_if_connecting();
+        self.cancel_active_remote_connection();
         self.generations.begin_connection();
         self.embedded_authentication = None;
         self.status = Status::normal("SSH authentication cancelled.");
     }
 
     fn reconnect_remote(&mut self) {
-        self.cancel_authentication_if_connecting();
+        self.cancel_active_remote_connection();
         self.embedded_authentication = None;
-        self.generations.begin_connection();
         self.open_remote_path();
     }
 
@@ -2359,7 +2426,7 @@ impl ViewerApp {
 
 impl Drop for ViewerApp {
     fn drop(&mut self) {
-        self.cancel_authentication_if_connecting();
+        self.cancel_active_remote_connection();
         self.worker.shutdown();
         if let Some(control_path) = self
             .ssh_config
@@ -2818,6 +2885,58 @@ mod tests {
         let second = generations.begin_connection();
         assert!(!generations.accepts_connection(first));
         assert!(generations.accepts_connection(second));
+    }
+
+    #[test]
+    fn canceled_connection_generation_stays_sticky_for_late_worker_commands() {
+        let slot = EmbeddedCancellationSlot::default();
+        slot.cancel(4);
+        slot.clear(4);
+        let state = slot.inner.lock().expect("cancellation state");
+        assert_eq!(state.cancelled_through, Some(4));
+        assert!(
+            state
+                .cancelled_through
+                .is_some_and(|cancelled_through| 4 <= cancelled_through)
+        );
+        assert!(
+            state
+                .cancelled_through
+                .is_none_or(|cancelled_through| 5 > cancelled_through)
+        );
+    }
+
+    fn test_view_request(view_generation: u64) -> ViewRequest {
+        ViewRequest {
+            source_generation: 1,
+            view_generation,
+            plane: PlaneSelector::default(),
+            viewport: SpatialRect::new(0, 0, 1, 1).expect("unit viewport"),
+            target_downsample: 1.0,
+            resident_tile_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn browse_interleaved_with_views_requeues_the_latest_view() {
+        let (sender, receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let current = test_view_request(1);
+        sender
+            .send(WorkerCommand::View(test_view_request(2)))
+            .expect("queue newer view");
+        sender
+            .send(WorkerCommand::ClearBrowse)
+            .expect("queue browse clear");
+
+        let ViewInterruption { command, resume } =
+            take_newer_command(&receiver, &current).expect("interrupted view");
+        assert!(matches!(command, WorkerCommand::ClearBrowse));
+        assert_eq!(
+            resume
+                .expect("newest view must be requeued")
+                .view_generation,
+            2
+        );
     }
 
     #[test]

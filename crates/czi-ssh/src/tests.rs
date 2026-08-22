@@ -921,6 +921,98 @@ fn dropping_source_clone_keeps_shared_browser_session_alive() {
 }
 
 #[test]
+fn contended_source_drop_defers_close_until_the_session_unlocks() {
+    let requested = location("/input/image.czi");
+    let (browse_started_tx, browse_started_rx) = mpsc::channel();
+    let (release_browse_tx, release_browse_rx) = mpsc::channel();
+    let (session, worker) = fake_session(move |fake| {
+        fake.expect_init();
+        fake.send_version(false);
+        let realpath = fake.read_request();
+        send_name(
+            fake,
+            request_id(&realpath),
+            &[(
+                "/canonical/image.czi",
+                "image.czi",
+                0_u32.to_be_bytes().to_vec(),
+            )],
+        );
+        let open = fake.read_request();
+        fake.send_handle(request_id(&open), b"file");
+        let fstat = fake.read_request();
+        fake.send(
+            SSH_FXP_ATTRS,
+            &attrs_response(request_id(&fstat), &attrs(8, 77)),
+        );
+        let browse = fake.read_request();
+        assert_eq!(browse.packet_type, SSH_FXP_REALPATH);
+        browse_started_tx.send(()).expect("report blocked browser");
+        release_browse_rx.recv().expect("release blocked browser");
+        send_name(
+            fake,
+            request_id(&browse),
+            &[("/home/test", "/home/test", 0_u32.to_be_bytes().to_vec())],
+        );
+        let close = fake.read_request();
+        assert_eq!(close.packet_type, SSH_FXP_CLOSE);
+        fake.send_status(request_id(&close), SSH_FX_OK);
+        let mut eof = [0_u8; 1];
+        assert_eq!(fake.stream.read(&mut eof).unwrap(), 0);
+    });
+    let shared = SharedSftpSession::new(session);
+    let source = SftpSource::open_with_shared_session(shared.clone(), &requested).unwrap();
+    let browser_session = shared.clone();
+    let browser = thread::spawn(move || {
+        browser_session
+            .with_session(|session| session.realpath(&location(".")))
+            .expect("complete browser operation")
+    });
+    browse_started_rx
+        .recv()
+        .expect("browser holds session lock");
+    drop(source);
+    release_browse_tx.send(()).expect("release browser");
+    assert_eq!(browser.join().expect("join browser").as_str(), "/home/test");
+    drop(shared);
+    worker.join().unwrap();
+}
+
+#[test]
+fn final_shared_owner_drains_a_deferred_source_close() {
+    let requested = location("/input/image.czi");
+    let (session, worker) = fake_session(|fake| {
+        fake.expect_init();
+        fake.send_version(false);
+        let realpath = fake.read_request();
+        send_name(
+            fake,
+            request_id(&realpath),
+            &[(
+                "/canonical/image.czi",
+                "image.czi",
+                0_u32.to_be_bytes().to_vec(),
+            )],
+        );
+        let open = fake.read_request();
+        fake.send_handle(request_id(&open), b"file");
+        let fstat = fake.read_request();
+        fake.send(
+            SSH_FXP_ATTRS,
+            &attrs_response(request_id(&fstat), &attrs(8, 77)),
+        );
+        let close = fake.read_request();
+        assert_eq!(close.packet_type, SSH_FXP_CLOSE);
+        fake.send_status(request_id(&close), SSH_FX_OK);
+    });
+    let shared = SharedSftpSession::new(session);
+    let source = SftpSource::open_with_shared_session(shared.clone(), &requested).unwrap();
+    drop(source);
+    drop(shared);
+    worker.join().unwrap();
+}
+
+#[test]
 fn source_uses_u64_read_offsets_above_four_gibibytes() {
     let requested = location("/input/large.czi");
     let canonical = "/canonical/large.czi";

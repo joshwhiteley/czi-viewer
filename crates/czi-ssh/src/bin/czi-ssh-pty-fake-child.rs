@@ -34,6 +34,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     czi_ssh_darwin::claim_controlling_terminal()?;
     if profile == "block@example.test" {
         block_on_terminal_input()
+    } else if profile == "block-after-version@example.test" {
+        speak_sftp_version_then_block()
     } else {
         authenticate_and_speak_sftp()
     }
@@ -149,6 +151,26 @@ fn block_on_terminal_input() -> Result<(), Box<dyn std::error::Error>> {
     tty.flush()?;
     let mut byte = [0];
     tty.read_exact(&mut byte)?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn speak_sftp_version_then_block() -> Result<(), Box<dyn std::error::Error>> {
+    let mut stdin = std::io::stdin().lock();
+    let mut init = [0; SFTP_INIT.len()];
+    stdin.read_exact(&mut init)?;
+    if init != SFTP_INIT {
+        return Err("fd 0 was not an isolated binary SFTP pipe".into());
+    }
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(&5_u32.to_be_bytes())?;
+    stdout.write_all(&[2])?;
+    stdout.write_all(&3_u32.to_be_bytes())?;
+    stdout.flush()?;
+    let mut tty = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
+    tty.write_all(b"SFTP VERSION accepted; blocking authenticated transport.\n")?;
+    tty.flush()?;
+    std::thread::sleep(std::time::Duration::from_secs(30));
     Ok(())
 }
 

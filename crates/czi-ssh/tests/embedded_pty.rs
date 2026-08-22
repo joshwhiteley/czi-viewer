@@ -4,7 +4,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use czi_ssh::{OpenSshConfig, SftpError, SftpSession, SshConsole, SshProfile};
+use czi_ssh::{
+    OpenSshConfig, SftpError, SftpLocation, SftpSession, SharedSftpSession, SshConsole, SshProfile,
+};
 
 const PASSWORD: &[u8] = b"opaque-password-for-pty-test\n";
 
@@ -86,4 +88,56 @@ fn pty_cancellation_reaps_a_child_blocked_on_terminal_input() {
         .expect("blocked SFTP initialization must return after cancellation");
     assert!(matches!(result, Err(SftpError::ChildExited { .. })));
     worker.join().expect("join cancellation worker");
+}
+
+#[test]
+fn authenticated_cancellation_allows_a_fresh_second_sftp_initialization() {
+    let (pending, mut console) = SftpSession::start_embedded_with_executor(
+        &profile("block-after-version@example.test"),
+        &OpenSshConfig::new(),
+        &fake_executor(),
+    )
+    .expect("start authenticated blocking fake PTY executor");
+    let cancellation = pending.cancellation();
+    let session = pending
+        .initialize()
+        .expect("strict SFTP VERSION from blocking child");
+    wait_for_console(&mut console, "SFTP VERSION accepted");
+    let shared = SharedSftpSession::new_embedded(session, 7, cancellation);
+    assert!(!shared.cancel_embedded_connection(8));
+
+    let blocked_session = shared.clone();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let blocked = thread::spawn(move || {
+        finished_tx
+            .send(blocked_session.with_session(|session| {
+                session.realpath(&SftpLocation::new(".").expect("fixed test location"))
+            }))
+            .expect("report blocked authenticated operation");
+    });
+    thread::sleep(Duration::from_millis(50));
+    assert!(shared.cancel_embedded_connection(7));
+    let result = finished_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("authenticated SFTP operation must unblock after cancellation");
+    assert!(matches!(result, Err(SftpError::ChildExited { .. })));
+    blocked
+        .join()
+        .expect("join authenticated cancellation worker");
+    drop(shared);
+
+    let (pending, _console) = SftpSession::start_embedded_with_executor(
+        &profile("block-after-version@example.test"),
+        &OpenSshConfig::new(),
+        &fake_executor(),
+    )
+    .expect("start fresh fake PTY executor");
+    let cancellation = pending.cancellation();
+    let session = pending
+        .initialize()
+        .expect("fresh second SFTP initialization");
+    cancellation
+        .cancel()
+        .expect("cancel fresh second SFTP child before dropping it");
+    drop(session);
 }
