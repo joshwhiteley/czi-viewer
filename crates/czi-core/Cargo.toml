@@ -9,4 +9,5 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+quick-xml = { version = "0.37", default-features = false }
 thiserror = "2"

@@ -904,6 +904,7 @@ mod tests {
             },
             tiles,
             metadata: None,
+            metadata_diagnostics: Vec::new(),
             attachments: Vec::new(),
         }
     }

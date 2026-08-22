@@ -216,14 +216,23 @@ fn rejects_de_schema_explicitly() {
 }
 
 #[test]
-fn rejects_metadata_over_limit() {
+fn metadata_over_limit_is_non_fatal_and_diagnostic() {
     let file = synthetic_file(false);
-    let error = CziDataset::open_with_options(
+    let dataset = CziDataset::open_with_options(
         MemorySource::new(file.bytes),
         ParseOptions::default().with_max_metadata_bytes(2),
     )
-    .expect_err("metadata limit");
-    assert!(matches!(error, CziError::MetadataTooLarge { .. }));
+    .expect("metadata limit must not prevent image opening");
+    assert!(dataset.index().metadata.is_none());
+    assert!(dataset.index().metadata_diagnostics[0].contains("metadata XML"));
+
+    let mut file = synthetic_file(false);
+    let metadata_position = SEGMENT_HEADER_SIZE + 60;
+    file.bytes[metadata_position..metadata_position + 8].copy_from_slice(&(-1_i64).to_le_bytes());
+    let dataset = CziDataset::open(MemorySource::new(file.bytes))
+        .expect("negative metadata pointer must not prevent image opening");
+    assert!(dataset.index().metadata.is_none());
+    assert!(dataset.index().metadata_diagnostics[0].contains("metadata position"));
 
     let file = synthetic_file(false);
     let error = CziDataset::open_with_options(
@@ -373,14 +382,10 @@ fn reconciles_inline_a1_and_rejects_signed_metadata_and_attachment_sizes() {
         .expect("offset")
         + SEGMENT_HEADER_SIZE;
     metadata.bytes[metadata_size..metadata_size + 4].copy_from_slice(&(-1_i32).to_le_bytes());
-    let error = CziDataset::open(MemorySource::new(metadata.bytes)).expect_err("negative metadata");
-    assert!(matches!(
-        error,
-        CziError::InvalidNumber {
-            kind: "metadata XML size",
-            ..
-        }
-    ));
+    let dataset = CziDataset::open(MemorySource::new(metadata.bytes))
+        .expect("bad metadata must not prevent image opening");
+    assert!(dataset.index().metadata.is_none());
+    assert!(dataset.index().metadata_diagnostics[0].contains("metadata XML size"));
 
     let mut attachment = synthetic_file(true);
     let attachment_offset = attachment.attachment_offset.expect("attachment");

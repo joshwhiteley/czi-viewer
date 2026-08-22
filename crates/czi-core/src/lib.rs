@@ -1,9 +1,15 @@
 //! Pure-Rust building blocks for reading and examining CZI image documents.
 
+mod metadata;
 mod parser;
 mod query;
 mod source;
 
+pub use metadata::{
+    ChannelMetadata, MetadataAttribute, MetadataDiagnostic, MetadataDocument, MetadataNode,
+    MetadataParseLimits, MetadataParseOptions, MetadataSummary, PhysicalPixelSize,
+    summarize_metadata,
+};
 pub use parser::{
     AttachmentEntry, AttachmentIndex, CompressionMode, CziDataset, CziError, DatasetIndex,
     DecodedPixels, DecodedTile, DimensionCode, DimensionEntry, DirectoryEntry, FileHeader,

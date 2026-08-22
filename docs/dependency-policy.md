@@ -20,6 +20,8 @@ Other permissive licenses require explicit review. GPL, LGPL, AGPL, SSPL, and pr
 
 The eframe `default_fonts` feature embeds font assets under OFL-1.1 and Ubuntu-font-1.0. These two font licenses are allowed only for those bundled assets.
 
+The metadata parser uses `quick-xml` with default features disabled. It is pure Rust and MIT licensed. PNG snapshot export uses `png` with default features disabled. It is pure Rust and dual MIT/Apache-2.0 licensed.
+
 ## Review requirements
 
 Before adding a dependency:

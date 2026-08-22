@@ -815,6 +815,8 @@ pub struct DatasetIndex {
     pub tiles: Vec<TileIndex>,
     /// Global metadata, if the header points to one.
     pub metadata: Option<MetadataIndex>,
+    /// Non-fatal global metadata read, size, or encoding diagnostics.
+    pub metadata_diagnostics: Vec<String>,
     /// Attachment directory entries.
     pub attachments: Vec<AttachmentIndex>,
 }
@@ -1065,7 +1067,7 @@ fn parse_index(
     options: ParseOptions,
 ) -> Result<DatasetIndex, CziError> {
     let source_info = source.info();
-    let file_header = parse_file_header(source)?;
+    let (file_header, header_metadata_diagnostic) = parse_file_header(source)?;
     if file_header.update_pending {
         return Err(CziError::UpdatePending {
             offset: file_header.segment.offset,
@@ -1093,15 +1095,21 @@ fn parse_index(
         })?,
     )?;
     tiles.extend(entries.into_iter().map(|entry| TileIndex { entry }));
-    let metadata = if file_header.metadata_position == 0 {
-        None
+    let (metadata, mut metadata_diagnostics) = if file_header.metadata_position == 0 {
+        (None, Vec::new())
     } else {
-        Some(parse_metadata(
+        match parse_metadata(
             source,
             file_header.metadata_position,
             options.max_metadata_bytes,
-        )?)
+        ) {
+            Ok(metadata) => (Some(metadata), Vec::new()),
+            Err(error) => (None, vec![format!("Global metadata was skipped: {error}")]),
+        }
     };
+    if let Some(diagnostic) = header_metadata_diagnostic {
+        metadata_diagnostics.push(diagnostic);
+    }
     let attachments = if file_header.attachment_directory_position == 0 {
         Vec::new()
     } else {
@@ -1117,11 +1125,14 @@ fn parse_index(
         file_header,
         tiles,
         metadata,
+        metadata_diagnostics,
         attachments,
     })
 }
 
-fn parse_file_header(source: &Arc<dyn RandomAccessSource>) -> Result<FileHeader, CziError> {
+fn parse_file_header(
+    source: &Arc<dyn RandomAccessSource>,
+) -> Result<(FileHeader, Option<String>), CziError> {
     let segment = parse_segment(source, 0)?;
     expect_kind(&segment, SegmentKind::File, "ZISRAWFILE")?;
     require_data_size(&segment, FILE_HEADER_DATA_SIZE, "file header")?;
@@ -1131,21 +1142,38 @@ fn parse_file_header(source: &Arc<dyn RandomAccessSource>) -> Result<FileHeader,
     let mut file_guid = [0; 16];
     file_guid.copy_from_slice(&data[32..48]);
     let directory_position = nonnegative_i64(le_i64(&data, 52), "directory position", 52)?;
-    let metadata_position = nonnegative_i64(le_i64(&data, 60), "metadata position", 60)?;
+    let raw_metadata_position = le_i64(&data, 60);
+    let (metadata_position, metadata_diagnostic) = if raw_metadata_position < 0 {
+        (
+            0,
+            Some(String::from(
+                "Global metadata was skipped: metadata position at offset 60 is negative.",
+            )),
+        )
+    } else {
+        (
+            u64::try_from(raw_metadata_position)
+                .expect("nonnegative metadata position converts to u64"),
+            None,
+        )
+    };
     let attachment_directory_position =
         nonnegative_i64(le_i64(&data, 72), "attachment directory position", 72)?;
-    Ok(FileHeader {
-        segment,
-        major_version: le_u32(&data, 0),
-        minor_version: le_u32(&data, 4),
-        primary_file_guid,
-        file_guid,
-        file_part: le_i32(&data, 48),
-        directory_position,
-        metadata_position,
-        update_pending: le_i32(&data, 68) != 0,
-        attachment_directory_position,
-    })
+    Ok((
+        FileHeader {
+            segment,
+            major_version: le_u32(&data, 0),
+            minor_version: le_u32(&data, 4),
+            primary_file_guid,
+            file_guid,
+            file_part: le_i32(&data, 48),
+            directory_position,
+            metadata_position,
+            update_pending: le_i32(&data, 68) != 0,
+            attachment_directory_position,
+        },
+        metadata_diagnostic,
+    ))
 }
 
 #[allow(clippy::too_many_lines)]
