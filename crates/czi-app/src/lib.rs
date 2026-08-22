@@ -261,6 +261,8 @@ struct RemotePathSuggestion {
     name: String,
     path: String,
     kind: RemotePathKind,
+    size: Option<u64>,
+    modified: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -322,12 +324,33 @@ fn remote_path_suggestions(
                 name: name.to_owned(),
                 path: join_remote_path(directory, name),
                 kind,
+                size: entry.attributes.size,
+                modified: entry
+                    .attributes
+                    .access_modify_time
+                    .map(|(_, modified)| modified),
             })
         })
         .collect::<Vec<_>>();
-    suggestions.sort_by(|left, right| left.name.cmp(&right.name));
+    suggestions.sort_by(|left, right| {
+        remote_path_kind_order(&left.kind)
+            .cmp(&remote_path_kind_order(&right.kind))
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
+            .then_with(|| left.name.cmp(&right.name))
+    });
     suggestions.truncate(MAX_REMOTE_SUGGESTIONS);
     suggestions
+}
+
+fn remote_path_kind_order(kind: &RemotePathKind) -> u8 {
+    match kind {
+        RemotePathKind::Directory => 0,
+        RemotePathKind::CziFile => 1,
+    }
 }
 
 fn remote_path_kind(name: &str, permissions: Option<u32>) -> Option<RemotePathKind> {
@@ -362,6 +385,56 @@ fn directory_path(path: &str) -> String {
     } else {
         format!("{}/", path.trim_end_matches('/'))
     }
+}
+
+fn remote_parent_path(path: &str) -> String {
+    let path = path.trim_end_matches('/');
+    if path.is_empty() || path == "/" {
+        return String::from("/");
+    }
+    path.rsplit_once('/').map_or_else(
+        || String::from("/"),
+        |(parent, _)| {
+            if parent.is_empty() {
+                String::from("/")
+            } else {
+                parent.to_owned()
+            }
+        },
+    )
+}
+
+fn filter_remote_suggestions(
+    suggestions: &[RemotePathSuggestion],
+    filter: &str,
+) -> Vec<RemotePathSuggestion> {
+    let filter = filter.trim().to_ascii_lowercase();
+    suggestions
+        .iter()
+        .filter(|suggestion| suggestion.name.to_ascii_lowercase().contains(&filter))
+        .cloned()
+        .collect()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RemoteSelectionAction {
+    BrowseDirectory(String),
+    OpenCzi(String),
+}
+
+fn remote_selection_action(
+    suggestion: &RemotePathSuggestion,
+    double_clicked: bool,
+) -> Option<RemoteSelectionAction> {
+    if !double_clicked {
+        return None;
+    }
+    Some(match suggestion.kind {
+        RemotePathKind::Directory => {
+            RemoteSelectionAction::BrowseDirectory(directory_path(&suggestion.path))
+        }
+        RemotePathKind::CziFile => RemoteSelectionAction::OpenCzi(suggestion.path.clone()),
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -492,6 +565,16 @@ impl Generations {
     }
 }
 
+fn accepts_open_result(
+    generations: &Generations,
+    source_generation: u64,
+    connection_generation: u64,
+    remote: bool,
+) -> bool {
+    generations.accepts_source(source_generation)
+        && (!remote || generations.accepts_connection(connection_generation))
+}
+
 #[derive(Clone, Debug)]
 struct ViewRequest {
     source_generation: u64,
@@ -519,11 +602,12 @@ enum WorkerCommand {
         connection_mode: RemoteConnectionMode,
     },
     ClearBrowse,
+    ClearDataset,
     View(ViewRequest),
     Shutdown,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum RemoteConnectionMode {
     Embedded,
     TerminalBridge,
@@ -534,12 +618,14 @@ enum WorkerEvent {
         info: DatasetInfo,
         source_generation: u64,
         connection_generation: u64,
+        remote: bool,
     },
     OpenFailed {
         message: String,
         terminal_bootstrap_command: Option<String>,
         source_generation: u64,
         connection_generation: u64,
+        remote: bool,
     },
     AuthenticationStarted {
         profile: String,
@@ -596,6 +682,12 @@ struct WorkerDataset {
     query: TileQueryIndex,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DatasetOrigin {
+    Local,
+    Remote,
+}
+
 struct ViewInterruption {
     command: WorkerCommand,
     resume: Option<ViewRequest>,
@@ -605,12 +697,60 @@ struct WorkerBrowseSession {
     profile: String,
     config: OpenSshConfig,
     connection_generation: u64,
+    connection_mode: RemoteConnectionMode,
     session: SharedSftpSession,
+}
+
+#[derive(Clone, Copy)]
+struct RemoteSessionKey<'a> {
+    profile: &'a str,
+    config: &'a OpenSshConfig,
+    generation: u64,
+    mode: RemoteConnectionMode,
+}
+
+fn matches_worker_remote_session(
+    existing: RemoteSessionKey<'_>,
+    requested: RemoteSessionKey<'_>,
+) -> bool {
+    existing.profile == requested.profile
+        && existing.config == requested.config
+        && existing.generation == requested.generation
+        && existing.mode == requested.mode
 }
 
 struct ConnectedSftpSession {
     session: SftpSession,
     embedded_cancellation: Option<EmbeddedSshCancellation>,
+}
+
+#[derive(Clone, Default)]
+struct BridgeCancellationSlot {
+    inner: Arc<Mutex<BridgeCancellation>>,
+}
+
+impl BridgeCancellationSlot {
+    fn current(&self) -> BridgeCancellation {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn cancel_active(&self) {
+        self.current().cancel();
+    }
+
+    fn cancel_and_replace(&self) {
+        let cancellation = {
+            let mut current = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *current)
+        };
+        cancellation.cancel();
+    }
 }
 
 struct EmbeddedConnectionContext<'a> {
@@ -624,7 +764,7 @@ struct EmbeddedConnectionContext<'a> {
 struct DatasetWorker {
     commands: SyncSender<WorkerCommand>,
     events: Receiver<WorkerEvent>,
-    bridge_cancellation: BridgeCancellation,
+    bridge_cancellation: BridgeCancellationSlot,
     embedded_cancellation: EmbeddedCancellationSlot,
     join: Option<JoinHandle<()>>,
 }
@@ -633,7 +773,7 @@ impl DatasetWorker {
     fn spawn() -> Self {
         let (commands, command_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let (event_tx, events) = mpsc::sync_channel(CHANNEL_CAPACITY);
-        let bridge_cancellation = BridgeCancellation::default();
+        let bridge_cancellation = BridgeCancellationSlot::default();
         let worker_cancellation = bridge_cancellation.clone();
         let embedded_cancellation = EmbeddedCancellationSlot::default();
         let worker_embedded_cancellation = embedded_cancellation.clone();
@@ -667,7 +807,7 @@ impl DatasetWorker {
         if self.join.is_none() {
             return;
         }
-        self.bridge_cancellation.cancel();
+        self.bridge_cancellation.cancel_active();
         self.embedded_cancellation.cancel_active();
         let mut sent = self.commands.try_send(WorkerCommand::Shutdown).is_ok();
         while self.events.try_recv().is_ok() {}
@@ -693,7 +833,7 @@ impl Drop for DatasetWorker {
 fn worker_loop(
     commands: &Receiver<WorkerCommand>,
     events: &SyncSender<WorkerEvent>,
-    bridge_cancellation: &BridgeCancellation,
+    bridge_cancellation: &BridgeCancellationSlot,
     embedded_cancellation: &EmbeddedCancellationSlot,
 ) {
     let mut dataset = None;
@@ -716,8 +856,10 @@ fn worker_loop(
                 connection_mode,
             } => {
                 active_source_generation = source_generation;
+                let remote = matches!(&locator, DatasetLocator::Remote { .. });
+                let bridge_cancellation = bridge_cancellation.current();
                 let connection = EmbeddedConnectionContext {
-                    bridge_cancellation,
+                    bridge_cancellation: &bridge_cancellation,
                     cancellation: embedded_cancellation,
                     events,
                     generation: connection_generation,
@@ -728,6 +870,7 @@ fn worker_loop(
                     open_dataset(locator, &mut browse_session, &connection),
                     source_generation,
                     connection_generation,
+                    remote,
                 );
                 if !sent {
                     break;
@@ -743,8 +886,9 @@ fn worker_loop(
                 connection_generation,
                 connection_mode,
             } => {
+                let bridge_cancellation = bridge_cancellation.current();
                 let connection = EmbeddedConnectionContext {
-                    bridge_cancellation,
+                    bridge_cancellation: &bridge_cancellation,
                     cancellation: embedded_cancellation,
                     events,
                     generation: connection_generation,
@@ -768,6 +912,10 @@ fn worker_loop(
                 }
             }
             WorkerCommand::ClearBrowse => browse_session = None,
+            WorkerCommand::ClearDataset => {
+                dataset = None;
+                active_source_generation = 0;
+            }
             WorkerCommand::View(request) => {
                 if request.source_generation != active_source_generation {
                     if events
@@ -810,6 +958,7 @@ fn send_open_result(
     result: Result<(CziDataset, TileQueryIndex, DatasetInfo), OpenFailure>,
     source_generation: u64,
     connection_generation: u64,
+    remote: bool,
 ) -> (Option<WorkerDataset>, bool) {
     match result {
         Ok((dataset, query, info)) => {
@@ -818,6 +967,7 @@ fn send_open_result(
                     info,
                     source_generation,
                     connection_generation,
+                    remote,
                 })
                 .is_ok();
             (sent.then_some(WorkerDataset { dataset, query }), sent)
@@ -833,6 +983,7 @@ fn send_open_result(
                     terminal_bootstrap_command,
                     source_generation,
                     connection_generation,
+                    remote,
                 })
                 .is_ok(),
         ),
@@ -890,9 +1041,20 @@ fn browse_remote_paths(
         }
     };
     let matches_existing = browse_session.as_ref().is_some_and(|existing| {
-        existing.profile == profile.as_str()
-            && existing.config == *config
-            && existing.connection_generation == connection.generation
+        matches_worker_remote_session(
+            RemoteSessionKey {
+                profile: &existing.profile,
+                config: &existing.config,
+                generation: existing.connection_generation,
+                mode: existing.connection_mode,
+            },
+            RemoteSessionKey {
+                profile: profile.as_str(),
+                config,
+                generation: connection.generation,
+                mode: connection.mode,
+            },
+        )
     });
     if !matches_existing {
         if let Some(existing) = browse_session.as_ref() {
@@ -910,6 +1072,7 @@ fn browse_remote_paths(
             profile: profile.as_str().to_owned(),
             config: config.clone(),
             connection_generation: connection.generation,
+            connection_mode: connection.mode,
             session,
         });
     }
@@ -985,9 +1148,20 @@ fn open_dataset(
                 .remote_parts()
                 .map_err(|error| remote.open_failure(error))?;
             let source = if browse_session.as_ref().is_some_and(|existing| {
-                existing.profile == profile.as_str()
-                    && existing.config == *config
-                    && existing.connection_generation == connection.generation
+                matches_worker_remote_session(
+                    RemoteSessionKey {
+                        profile: &existing.profile,
+                        config: &existing.config,
+                        generation: existing.connection_generation,
+                        mode: existing.connection_mode,
+                    },
+                    RemoteSessionKey {
+                        profile: profile.as_str(),
+                        config,
+                        generation: connection.generation,
+                        mode: connection.mode,
+                    },
+                )
             }) {
                 SftpSource::open_with_shared_session(
                     browse_session
@@ -1013,6 +1187,7 @@ fn open_dataset(
                     profile: profile.as_str().to_owned(),
                     config: config.clone(),
                     connection_generation: connection.generation,
+                    connection_mode: connection.mode,
                     session: session.clone(),
                 });
                 SftpSource::open_with_shared_session(session, &location)
@@ -1139,7 +1314,11 @@ fn take_newer_command(
                     resume: Some(latest_view.unwrap_or_else(|| current_view.clone())),
                 });
             }
-            Ok(command @ (WorkerCommand::Open { .. } | WorkerCommand::Shutdown)) => {
+            Ok(
+                command @ (WorkerCommand::Open { .. }
+                | WorkerCommand::ClearDataset
+                | WorkerCommand::Shutdown),
+            ) => {
                 return Some(ViewInterruption {
                     command,
                     resume: None,
@@ -1638,12 +1817,44 @@ enum AuthenticationStatus {
     Failed,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RemoteBrowserVisibility {
+    Open,
+    Hidden,
+}
+
+impl RemoteBrowserVisibility {
+    fn is_open(self) -> bool {
+        self == Self::Open
+    }
+
+    fn toggle(&mut self) {
+        *self = match *self {
+            Self::Open => Self::Hidden,
+            Self::Hidden => Self::Open,
+        };
+    }
+}
+
 struct EmbeddedAuthentication {
     profile: String,
     console: SshConsole,
     cancellation: EmbeddedSshCancellation,
     generation: u64,
     status: AuthenticationStatus,
+}
+
+fn reuses_remote_connection(
+    profile: &str,
+    connection_generation: u64,
+    authentication: Option<(&str, AuthenticationStatus)>,
+    session: Option<(&str, u64)>,
+) -> bool {
+    authentication.is_some_and(|(authenticated_profile, status)| {
+        authenticated_profile == profile && status != AuthenticationStatus::Failed
+    }) || session.is_some_and(|(session_profile, session_generation)| {
+        session_profile == profile && session_generation == connection_generation
+    })
 }
 
 /// The local and SSH CZI mosaic viewer.
@@ -1653,11 +1864,19 @@ pub struct ViewerApp {
     path_input: String,
     ssh_profile_input: String,
     remote_path_input: String,
+    remote_browser_path_input: String,
     ssh_config: Option<OpenSshConfig>,
     remote_browse_directory: Option<String>,
     remote_suggestions: Vec<RemotePathSuggestion>,
     remote_browse_pending: bool,
+    remote_filename_filter: String,
+    remote_selected_path: Option<String>,
+    remote_browser_visibility: RemoteBrowserVisibility,
+    remote_session: Option<(String, u64)>,
+    authentication_console_open_request: Option<bool>,
     dataset: Option<DatasetInfo>,
+    dataset_origin: Option<DatasetOrigin>,
+    opening_origin: Option<DatasetOrigin>,
     selection: PlaneSelection,
     generations: Generations,
     status: Status,
@@ -1688,11 +1907,19 @@ impl ViewerApp {
                 .map_or_else(String::new, |path| path.display().to_string()),
             ssh_profile_input: String::new(),
             remote_path_input: String::new(),
+            remote_browser_path_input: String::new(),
             ssh_config: None,
             remote_browse_directory: None,
             remote_suggestions: Vec::new(),
             remote_browse_pending: false,
+            remote_filename_filter: String::new(),
+            remote_selected_path: None,
+            remote_browser_visibility: RemoteBrowserVisibility::Open,
+            remote_session: None,
+            authentication_console_open_request: None,
             dataset: None,
+            dataset_origin: None,
+            opening_origin: None,
             selection: PlaneSelection::default(),
             generations: Generations::default(),
             status: Status::normal("Choose Local or SSH, then open a .czi file."),
@@ -1724,12 +1951,12 @@ impl ViewerApp {
     }
 
     fn open_local_path(&mut self) {
-        self.cancel_active_remote_connection();
         let path = PathBuf::from(self.path_input.trim());
         if self.path_input.trim().is_empty() {
             self.status = Status::error("Enter a local .czi path first.");
             return;
         }
+        self.disconnect_remote_for_local_source();
         self.open_locator(DatasetLocator::Local(path));
     }
 
@@ -1760,17 +1987,66 @@ impl ViewerApp {
 
     fn invalidate_remote_browse(&mut self, profile_changed: bool) {
         self.generations.begin_browse();
-        self.remote_browse_directory = None;
-        self.remote_suggestions.clear();
         self.remote_browse_pending = false;
         self.terminal_bootstrap_command = None;
         if profile_changed {
+            self.close_remote_dataset();
             self.cancel_active_remote_connection();
             self.embedded_authentication = None;
+            self.remote_session = None;
             self.generations.begin_connection();
             self.use_terminal_fallback = false;
+            self.remote_browse_directory = None;
+            self.remote_suggestions.clear();
+            self.remote_browser_path_input.clear();
+            self.remote_path_input.clear();
+            self.remote_selected_path = None;
             let _ = self.worker.send(WorkerCommand::ClearBrowse);
         }
+    }
+
+    fn close_remote_dataset(&mut self) {
+        let pending_remote_open = self
+            .pending_open
+            .as_ref()
+            .is_some_and(|(locator, _)| matches!(locator, DatasetLocator::Remote { .. }));
+        if self.dataset_origin != Some(DatasetOrigin::Remote)
+            && self.opening_origin != Some(DatasetOrigin::Remote)
+            && !pending_remote_open
+        {
+            return;
+        }
+        self.generations.begin_source();
+        self.dataset = None;
+        self.dataset_origin = None;
+        self.opening_origin = None;
+        self.pending_open = None;
+        self.cache.clear();
+        self.pending_tiles.clear();
+        self.visible_tile_ids.clear();
+        self.selected_scale = None;
+        self.last_request = None;
+        self.fit_pending = false;
+        if let Err(error) = self.worker.send(WorkerCommand::ClearDataset) {
+            self.status = Status::error(error);
+        }
+    }
+
+    fn disconnect_remote_for_local_source(&mut self) {
+        self.close_remote_dataset();
+        self.cancel_active_remote_connection();
+        self.generations.begin_browse();
+        self.generations.begin_connection();
+        self.embedded_authentication = None;
+        self.remote_session = None;
+        self.remote_browse_pending = false;
+        self.remote_browse_directory = None;
+        self.remote_suggestions.clear();
+        self.remote_browser_path_input.clear();
+        self.remote_selected_path = None;
+        self.terminal_bootstrap_command = None;
+        self.use_terminal_fallback = false;
+        let _ = self.worker.send(WorkerCommand::ClearBrowse);
     }
 
     fn browse_remote_path(&mut self, home: bool) {
@@ -1782,8 +2058,6 @@ impl ViewerApp {
             }
         };
         let browse_generation = self.generations.begin_browse();
-        self.remote_browse_directory = None;
-        self.remote_suggestions.clear();
         self.remote_browse_pending = true;
         self.terminal_bootstrap_command = None;
         self.status = Status::normal(if home {
@@ -1795,7 +2069,11 @@ impl ViewerApp {
         let connection_mode = self.remote_connection_mode();
         if let Err(error) = self.worker.send(WorkerCommand::Browse {
             profile: self.ssh_profile_input.trim().to_owned(),
-            path: self.remote_path_input.trim().to_owned(),
+            path: if home {
+                String::new()
+            } else {
+                directory_path(self.remote_browser_path_input.trim())
+            },
             home,
             config,
             browse_generation,
@@ -1807,23 +2085,57 @@ impl ViewerApp {
         }
     }
 
-    fn select_remote_suggestion(&mut self, suggestion: RemotePathSuggestion) {
-        match suggestion.kind {
-            RemotePathKind::Directory => {
-                self.remote_path_input = directory_path(&suggestion.path);
+    fn run_remote_selection_action(&mut self, action: RemoteSelectionAction) {
+        match action {
+            RemoteSelectionAction::BrowseDirectory(path) => {
+                self.remote_browser_path_input = path;
+                self.remote_selected_path = None;
                 self.browse_remote_path(false);
             }
-            RemotePathKind::CziFile => {
-                self.remote_path_input = suggestion.path;
-                self.generations.begin_browse();
-                self.remote_browse_directory = None;
-                self.remote_suggestions.clear();
-                self.remote_browse_pending = false;
+            RemoteSelectionAction::OpenCzi(path) => {
+                self.remote_path_input = path;
+                self.open_remote_path();
             }
         }
     }
 
+    fn browse_remote_parent(&mut self) {
+        let directory = self
+            .remote_browse_directory
+            .as_deref()
+            .map_or_else(|| String::from("/"), remote_parent_path);
+        self.remote_browser_path_input = directory_path(&directory);
+        self.remote_selected_path = None;
+        self.browse_remote_path(false);
+    }
+
+    fn refresh_remote_browser(&mut self) {
+        if let Some(directory) = &self.remote_browse_directory {
+            self.remote_browser_path_input = directory_path(directory);
+            self.browse_remote_path(false);
+        } else {
+            self.browse_remote_path(true);
+        }
+    }
+
+    fn open_selected_remote_czi(&mut self) {
+        let Some(path) = self.remote_selected_path.as_deref() else {
+            return;
+        };
+        let Some(suggestion) = self.remote_suggestions.iter().find(|suggestion| {
+            suggestion.path == path && suggestion.kind == RemotePathKind::CziFile
+        }) else {
+            return;
+        };
+        self.run_remote_selection_action(RemoteSelectionAction::OpenCzi(suggestion.path.clone()));
+    }
+
     fn open_locator(&mut self, locator: DatasetLocator) {
+        let origin = if matches!(&locator, DatasetLocator::Remote { .. }) {
+            DatasetOrigin::Remote
+        } else {
+            DatasetOrigin::Local
+        };
         let connection_generation = match &locator {
             DatasetLocator::Remote { .. } => self.prepare_remote_connection(),
             DatasetLocator::Local(_) => self.generations.connection,
@@ -1835,6 +2147,8 @@ impl ViewerApp {
         let source_label = locator.display_label();
         let source_generation = self.generations.begin_source();
         self.dataset = None;
+        self.dataset_origin = None;
+        self.opening_origin = Some(origin);
         self.cache.clear();
         self.pending_tiles.clear();
         self.visible_tile_ids.clear();
@@ -1851,6 +2165,7 @@ impl ViewerApp {
             connection_mode,
         }) {
             self.pending_open = Some(pending);
+            self.opening_origin = None;
             self.status = Status::error(error);
         } else {
             self.pending_open = None;
@@ -1861,6 +2176,11 @@ impl ViewerApp {
         let Some((locator, source_generation)) = self.pending_open.take() else {
             return;
         };
+        let origin = if matches!(&locator, DatasetLocator::Remote { .. }) {
+            DatasetOrigin::Remote
+        } else {
+            DatasetOrigin::Local
+        };
         let connection_generation = match &locator {
             DatasetLocator::Remote { .. } => self.prepare_remote_connection(),
             DatasetLocator::Local(_) => self.generations.connection,
@@ -1869,6 +2189,7 @@ impl ViewerApp {
             DatasetLocator::Remote { .. } => self.remote_connection_mode(),
             DatasetLocator::Local(_) => RemoteConnectionMode::Embedded,
         };
+        self.opening_origin = Some(origin);
         if let Err(error) = self.worker.send(WorkerCommand::Open {
             locator: locator.clone(),
             source_generation,
@@ -1876,28 +2197,40 @@ impl ViewerApp {
             connection_mode,
         }) {
             self.pending_open = Some((locator, source_generation));
+            self.opening_origin = None;
             self.status = Status::error(error);
         }
     }
 
     fn prepare_remote_connection(&mut self) -> u64 {
         let profile = self.ssh_profile_input.trim();
-        let reuse = self
+        let authentication = self
             .embedded_authentication
             .as_ref()
-            .is_some_and(|authentication| {
-                authentication.profile == profile
-                    && authentication.status != AuthenticationStatus::Failed
+            .map(|authentication| (authentication.profile.as_str(), authentication.status));
+        let session = self
+            .remote_session
+            .as_ref()
+            .map(|(session_profile, session_generation)| {
+                (session_profile.as_str(), *session_generation)
             });
+        let reuse = reuses_remote_connection(
+            profile,
+            self.generations.connection,
+            authentication,
+            session,
+        );
         if !reuse {
             self.cancel_active_remote_connection();
             self.embedded_authentication = None;
+            self.remote_session = None;
             self.generations.begin_connection();
         }
         self.generations.connection
     }
 
     fn cancel_active_remote_connection(&mut self) {
+        self.worker.bridge_cancellation.cancel_and_replace();
         self.worker
             .embedded_cancellation
             .cancel(self.generations.connection);
@@ -1910,15 +2243,35 @@ impl ViewerApp {
 
     fn cancel_embedded_authentication(&mut self) {
         self.cancel_active_remote_connection();
+        self.generations.begin_browse();
         self.generations.begin_connection();
         self.embedded_authentication = None;
+        self.remote_session = None;
+        self.remote_browse_pending = false;
         self.status = Status::normal("SSH authentication cancelled.");
     }
 
     fn reconnect_remote(&mut self) {
+        self.close_remote_dataset();
         self.cancel_active_remote_connection();
         self.embedded_authentication = None;
-        self.open_remote_path();
+        self.remote_session = None;
+        self.refresh_remote_browser();
+    }
+
+    fn enable_terminal_fallback(&mut self) {
+        self.close_remote_dataset();
+        self.cancel_active_remote_connection();
+        self.generations.begin_browse();
+        self.generations.begin_connection();
+        self.embedded_authentication = None;
+        self.remote_session = None;
+        self.remote_browse_pending = false;
+        self.use_terminal_fallback = true;
+        let _ = self.worker.send(WorkerCommand::ClearBrowse);
+        self.status = Status::normal(
+            "Terminal fallback enabled. Run the command, then select Home, Refresh, or Go.",
+        );
     }
 
     fn remote_connection_mode(&self) -> RemoteConnectionMode {
@@ -1998,6 +2351,8 @@ impl ViewerApp {
                     generation: connection_generation,
                     status: AuthenticationStatus::Connecting,
                 });
+                self.remote_browser_visibility = RemoteBrowserVisibility::Open;
+                self.authentication_console_open_request = Some(true);
                 self.status = Status::normal("SSH authentication is waiting for terminal input.");
             }
             WorkerEvent::AuthenticationSucceeded {
@@ -2007,6 +2362,9 @@ impl ViewerApp {
                     && authentication.generation == connection_generation
                 {
                     authentication.status = AuthenticationStatus::Authenticated;
+                    self.remote_session =
+                        Some((authentication.profile.clone(), connection_generation));
+                    self.authentication_console_open_request = Some(false);
                     self.status =
                         Status::normal("SSH authentication succeeded; opening SFTP session.");
                 }
@@ -2020,23 +2378,40 @@ impl ViewerApp {
                 {
                     authentication.status = AuthenticationStatus::Failed;
                 }
+                self.remote_session = None;
+                self.remote_browser_visibility = RemoteBrowserVisibility::Open;
+                self.authentication_console_open_request = Some(true);
                 self.status = Status::error(message);
             }
             WorkerEvent::Opened {
                 info,
                 source_generation,
                 connection_generation,
-            } if self.generations.accepts_connection(connection_generation) => {
-                self.handle_opened(info, source_generation);
+                remote,
+            } if accepts_open_result(
+                &self.generations,
+                source_generation,
+                connection_generation,
+                remote,
+            ) =>
+            {
+                self.handle_opened(info, source_generation, remote);
             }
             WorkerEvent::OpenFailed {
                 message,
                 terminal_bootstrap_command,
                 source_generation,
                 connection_generation,
-            } if self.generations.accepts_source(source_generation)
-                && self.generations.accepts_connection(connection_generation) =>
+                remote,
+            } if accepts_open_result(
+                &self.generations,
+                source_generation,
+                connection_generation,
+                remote,
+            ) =>
             {
+                self.opening_origin = None;
+                self.pending_open = None;
                 self.status = Status::error(message);
                 self.terminal_bootstrap_command = terminal_bootstrap_command;
             }
@@ -2132,7 +2507,7 @@ impl ViewerApp {
         }
     }
 
-    fn handle_opened(&mut self, info: DatasetInfo, source_generation: u64) {
+    fn handle_opened(&mut self, info: DatasetInfo, source_generation: u64, remote: bool) {
         if !self.generations.accepts_source(source_generation) {
             return;
         }
@@ -2144,6 +2519,13 @@ impl ViewerApp {
             info.tile_count
         ));
         self.dataset = Some(info);
+        self.opening_origin = None;
+        self.pending_open = None;
+        self.dataset_origin = Some(if remote {
+            DatasetOrigin::Remote
+        } else {
+            DatasetOrigin::Local
+        });
         self.cache.clear();
         self.pending_tiles.clear();
         self.visible_tile_ids.clear();
@@ -2155,22 +2537,22 @@ impl ViewerApp {
         &mut self,
         directory: String,
         suggestions: Vec<RemotePathSuggestion>,
-        home: bool,
+        _home: bool,
         browse_generation: u64,
     ) {
         if !self.generations.accepts_browse(browse_generation) {
             return;
         }
-        if home {
-            self.remote_path_input = directory_path(&directory);
-        }
-        self.status = Status::normal(format!(
-            "Listed {} remote path suggestion(s).",
-            suggestions.len()
-        ));
+        self.remote_browser_path_input = directory_path(&directory);
+        self.status = Status::normal(format!("Listed {} remote entries.", suggestions.len()));
         self.remote_browse_directory = Some(directory);
         self.remote_suggestions = suggestions;
+        self.remote_selected_path = None;
         self.remote_browse_pending = false;
+        self.remote_session = Some((
+            self.ssh_profile_input.trim().to_owned(),
+            self.generations.connection,
+        ));
         self.terminal_bootstrap_command = None;
     }
 
@@ -2184,6 +2566,7 @@ impl ViewerApp {
             return;
         }
         self.status = Status::error(message);
+        self.remote_session = None;
         self.terminal_bootstrap_command = terminal_bootstrap_command;
         self.remote_browse_pending = false;
     }
@@ -2237,34 +2620,28 @@ impl ViewerApp {
         }
     }
 
+    fn poll_embedded_authentication(&mut self, context: &egui::Context) {
+        let Some(authentication) = self.embedded_authentication.as_mut() else {
+            return;
+        };
+        if let Err(error) = authentication.console.drain_output() {
+            self.status = Status::error(sanitize_error(error));
+        }
+        if authentication.status == AuthenticationStatus::Connecting {
+            context.request_repaint_after(Duration::from_millis(16));
+        }
+    }
+
     fn show_embedded_authentication(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
         let Some(authentication) = self.embedded_authentication.as_mut() else {
             return;
         };
         let console_id = ui.make_persistent_id(("embedded-ssh-console", authentication.generation));
         let connecting = authentication.status == AuthenticationStatus::Connecting;
-        let mut console_error = None;
-        if let Err(error) = authentication.console.drain_output() {
-            console_error = Some(sanitize_error(error));
-        }
         let transcript = authentication.console.transcript().to_owned();
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.strong("SSH authentication console");
-            match authentication.status {
-                AuthenticationStatus::Connecting => {
-                    ui.spinner();
-                    ui.weak("Connecting — click the console to focus it.");
-                }
-                AuthenticationStatus::Authenticated => {
-                    ui.colored_label(egui::Color32::LIGHT_GREEN, "Authenticated");
-                    ui.weak("Input is disabled after SFTP VERSION.");
-                }
-                AuthenticationStatus::Failed => {
-                    ui.colored_label(egui::Color32::LIGHT_RED, "Authentication failed");
-                }
-            }
-        });
+        ui.weak(
+            "Typing goes directly to system ssh. Passwords and one-time codes are never saved.",
+        );
         let response = ui.add_sized(
             [ui.available_width(), 112.0],
             egui::Label::new(egui::RichText::new(transcript).monospace())
@@ -2296,15 +2673,265 @@ impl ViewerApp {
                     if let Some(input) = input
                         && let Err(error) = authentication.console.write_input(&input)
                     {
-                        console_error = Some(sanitize_error(error));
+                        self.status = Status::error(sanitize_error(error));
                         break;
                     }
                 }
             }
-            context.request_repaint_after(Duration::from_millis(16));
         }
-        if let Some(error) = console_error {
-            self.status = Status::error(error);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn show_remote_browser(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        ui.horizontal(|ui| {
+            ui.heading("Remote files");
+            if ui.button("Hide").clicked() {
+                self.remote_browser_visibility = RemoteBrowserVisibility::Hidden;
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Profile:");
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.ssh_profile_input)
+                    .hint_text("my-ssh-profile")
+                    .desired_width(190.0),
+            );
+            if response.changed() {
+                self.invalidate_remote_browse(true);
+            }
+        });
+
+        let authentication_status = self
+            .embedded_authentication
+            .as_ref()
+            .map(|authentication| authentication.status);
+        let connecting = authentication_status == Some(AuthenticationStatus::Connecting);
+        let profile_ready = !self.ssh_profile_input.trim().is_empty();
+        let browse_enabled = profile_ready && !connecting && !self.remote_browse_pending;
+        ui.horizontal(|ui| {
+            let connect = ui
+                .add_enabled(browse_enabled, egui::Button::new("Connect"))
+                .clicked();
+            if connect {
+                self.browse_remote_path(true);
+            }
+            if ui
+                .add_enabled(profile_ready, egui::Button::new("Reconnect"))
+                .clicked()
+            {
+                self.reconnect_remote();
+            }
+            match authentication_status {
+                Some(AuthenticationStatus::Connecting) => {
+                    ui.spinner();
+                    ui.weak("Connecting");
+                }
+                Some(AuthenticationStatus::Authenticated) => {
+                    ui.colored_label(egui::Color32::LIGHT_GREEN, "Connected");
+                }
+                Some(AuthenticationStatus::Failed) => {
+                    ui.colored_label(egui::Color32::LIGHT_RED, "Connection failed");
+                }
+                None if self.remote_session.is_some() => {
+                    ui.colored_label(egui::Color32::LIGHT_GREEN, "Connected");
+                }
+                None => {
+                    ui.weak("Not connected");
+                }
+            }
+        });
+        ui.weak("Connect once, then browse and open over the same read-only SFTP session.");
+
+        ui.separator();
+        ui.label("Current directory:");
+        let directory = self
+            .remote_browse_directory
+            .as_deref()
+            .unwrap_or("Not listed yet");
+        ui.add(egui::Label::new(egui::RichText::new(directory).monospace()).selectable(true));
+
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(browse_enabled, egui::Button::new("Home"))
+                .clicked()
+            {
+                self.remote_browser_path_input.clear();
+                self.remote_selected_path = None;
+                self.browse_remote_path(true);
+            }
+            if ui
+                .add_enabled(
+                    browse_enabled && self.remote_browse_directory.is_some(),
+                    egui::Button::new("Up"),
+                )
+                .clicked()
+            {
+                self.browse_remote_parent();
+            }
+            if ui
+                .add_enabled(browse_enabled, egui::Button::new("Refresh"))
+                .clicked()
+            {
+                self.refresh_remote_browser();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Path:");
+            let path_response = ui.add(
+                egui::TextEdit::singleline(&mut self.remote_browser_path_input)
+                    .hint_text("/absolute/directory/")
+                    .desired_width(f32::INFINITY),
+            );
+            let go = ui
+                .add_enabled(browse_enabled, egui::Button::new("Go"))
+                .clicked()
+                || (path_response.lost_focus()
+                    && browse_enabled
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+            if go {
+                self.remote_selected_path = None;
+                self.browse_remote_path(false);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Filter:");
+            let filter_response = ui.add(
+                egui::TextEdit::singleline(&mut self.remote_filename_filter)
+                    .hint_text("filename")
+                    .desired_width(f32::INFINITY),
+            );
+            if filter_response.changed() {
+                self.remote_selected_path = None;
+            }
+        });
+
+        if self.remote_browse_pending {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.weak("Listing directory…");
+            });
+        }
+
+        let visible =
+            filter_remote_suggestions(&self.remote_suggestions, &self.remote_filename_filter);
+        let mut selected_path = None;
+        let mut action = None;
+        ui.horizontal(|ui| {
+            ui.weak("Name");
+            ui.weak("Type · Size · Modified");
+        });
+        egui::ScrollArea::vertical()
+            .id_salt("remote-file-list")
+            .max_height(360.0)
+            .show(ui, |ui| {
+                for suggestion in &visible {
+                    ui.push_id(&suggestion.path, |ui| {
+                        ui.horizontal(|ui| {
+                            let selected = self.remote_selected_path.as_deref()
+                                == Some(suggestion.path.as_str());
+                            let label = match suggestion.kind {
+                                RemotePathKind::Directory => format!("📁 {}/", suggestion.name),
+                                RemotePathKind::CziFile => format!("▣ {}", suggestion.name),
+                            };
+                            let response = ui
+                                .selectable_label(selected, label)
+                                .on_hover_text(&suggestion.path);
+                            if response.clicked() {
+                                selected_path = Some(suggestion.path.clone());
+                            }
+                            if response.double_clicked() {
+                                action = remote_selection_action(suggestion, true);
+                            }
+                            ui.weak(match suggestion.kind {
+                                RemotePathKind::Directory => "Folder".to_owned(),
+                                RemotePathKind::CziFile => "CZI".to_owned(),
+                            });
+                            ui.weak(
+                                suggestion
+                                    .size
+                                    .map_or_else(|| String::from("—"), format_byte_count),
+                            );
+                            ui.weak(format_remote_modified_time(suggestion.modified));
+                        });
+                    });
+                }
+                if visible.is_empty() {
+                    ui.weak("No matching directories or .czi files.");
+                }
+            });
+        if let Some(selected_path) = selected_path {
+            self.remote_selected_path = Some(selected_path);
+        }
+        if let Some(action) = action {
+            self.run_remote_selection_action(action);
+        }
+        let selected_czi = self
+            .remote_selected_path
+            .as_deref()
+            .is_some_and(|selected_path| {
+                self.remote_suggestions.iter().any(|suggestion| {
+                    suggestion.path == selected_path && suggestion.kind == RemotePathKind::CziFile
+                })
+            });
+        if ui
+            .add_enabled(selected_czi, egui::Button::new("Open selected CZI"))
+            .clicked()
+        {
+            self.open_selected_remote_czi();
+        }
+
+        if self.embedded_authentication.is_some() {
+            ui.separator();
+            let console_id = ui.make_persistent_id("embedded-ssh-console-panel");
+            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                context, console_id, true,
+            );
+            if let Some(open) = self.authentication_console_open_request.take() {
+                state.set_open(open);
+            }
+            state
+                .show_header(ui, |ui| {
+                    ui.strong("SSH authentication console");
+                    match authentication_status {
+                        Some(AuthenticationStatus::Connecting) => {
+                            ui.spinner();
+                            ui.weak("Click the transcript before typing.");
+                        }
+                        Some(AuthenticationStatus::Authenticated) => {
+                            ui.colored_label(egui::Color32::LIGHT_GREEN, "Authenticated");
+                        }
+                        Some(AuthenticationStatus::Failed) => {
+                            ui.colored_label(egui::Color32::LIGHT_RED, "Authentication failed");
+                        }
+                        None => {}
+                    }
+                })
+                .body(|ui| self.show_embedded_authentication(ui, context));
+            if connecting && ui.button("Cancel authentication").clicked() {
+                self.cancel_embedded_authentication();
+            }
+        }
+
+        if let Some(command) = &self.terminal_bootstrap_command {
+            ui.separator();
+            if self.use_terminal_fallback {
+                ui.label("Terminal fallback command:");
+                ui.add(
+                    egui::Label::new(egui::RichText::new(command).monospace())
+                        .selectable(true)
+                        .wrap(),
+                );
+                if ui.button("Copy command").clicked() {
+                    context.copy_text(command.clone());
+                }
+                ui.weak("Run this only as a fallback and keep Terminal open while the remote file is in use.");
+            } else {
+                ui.weak("Embedded SSH failed.");
+                if ui.button("Use Terminal fallback").clicked() {
+                    self.enable_terminal_fallback();
+                }
+            }
         }
     }
 
@@ -2439,12 +3066,37 @@ impl Drop for ViewerApp {
 }
 
 fn format_bytes(bytes: usize) -> String {
+    format_byte_count(u64::try_from(bytes).unwrap_or(u64::MAX))
+}
+
+fn format_byte_count(bytes: u64) -> String {
     if bytes >= 1024 * 1024 {
         format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
     } else if bytes >= 1024 {
         format!("{:.1} KiB", bytes as f64 / 1024.0)
     } else {
         format!("{bytes} B")
+    }
+}
+
+fn format_remote_modified_time(modified: Option<u32>) -> String {
+    let Some(modified) = modified else {
+        return String::from("—");
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    let age = now.saturating_sub(u64::from(modified));
+    if age < 60 {
+        String::from("just now")
+    } else if age < 60 * 60 {
+        format!("{} min ago", age / 60)
+    } else if age < 24 * 60 * 60 {
+        format!("{} h ago", age / (60 * 60))
+    } else if age < 365 * 24 * 60 * 60 {
+        format!("{} d ago", age / (24 * 60 * 60))
+    } else {
+        format!("{} y ago", age / (365 * 24 * 60 * 60))
     }
 }
 
@@ -2509,14 +3161,26 @@ impl eframe::App for ViewerApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_dropped_files(context);
         self.handle_worker_events();
+        self.poll_embedded_authentication(context);
         self.retry_pending_open();
 
         egui::TopBottomPanel::top("open_bar").show(context, |ui| {
             ui.horizontal(|ui| {
                 let local_mode = ui.selectable_value(&mut self.open_mode, OpenMode::Local, "Local");
-                ui.selectable_value(&mut self.open_mode, OpenMode::Ssh, "SSH");
-                if local_mode.changed() && self.open_mode == OpenMode::Local {
-                    self.invalidate_remote_browse(true);
+                let ssh_mode = ui.selectable_value(&mut self.open_mode, OpenMode::Ssh, "SSH");
+                if local_mode.changed()
+                    && self.open_mode == OpenMode::Local
+                    && self
+                        .embedded_authentication
+                        .as_ref()
+                        .is_some_and(|authentication| {
+                            authentication.status == AuthenticationStatus::Connecting
+                        })
+                {
+                    self.cancel_embedded_authentication();
+                }
+                if ssh_mode.changed() && self.open_mode == OpenMode::Ssh {
+                    self.remote_browser_visibility = RemoteBrowserVisibility::Open;
                 }
             });
             match self.open_mode {
@@ -2538,114 +3202,20 @@ impl eframe::App for ViewerApp {
                 }
                 OpenMode::Ssh => {
                     ui.horizontal(|ui| {
-                        ui.label("Profile / host alias:");
-                        let profile_response = ui.add(
-                            egui::TextEdit::singleline(&mut self.ssh_profile_input)
-                                .hint_text("my-ssh-profile")
-                                .desired_width(220.0),
-                        );
-                        ui.label("Remote CZI path:");
-                        let response = ui.add(
-                            egui::TextEdit::singleline(&mut self.remote_path_input)
-                                .hint_text("/absolute/path/image.czi")
-                                .desired_width(360.0),
-                        );
-                        if profile_response.changed() {
-                            self.invalidate_remote_browse(true);
-                        } else if response.changed() {
-                            self.invalidate_remote_browse(false);
+                        ui.label("SSH remote source");
+                        let browser_label = if self.remote_browser_visibility.is_open() {
+                            "Hide remote browser"
+                        } else {
+                            "Show remote browser"
+                        };
+                        if ui.button(browser_label).clicked() {
+                            self.remote_browser_visibility.toggle();
                         }
-                        if ui.button("Home").clicked() {
-                            self.browse_remote_path(true);
-                        }
-                        if ui.button("Browse").clicked() {
-                            self.browse_remote_path(false);
-                        }
-                        let authentication_connecting = self
-                            .embedded_authentication
-                            .as_ref()
-                            .is_some_and(|authentication| {
-                                authentication.status == AuthenticationStatus::Connecting
-                            });
-                        let connect = ui
-                            .add_enabled(!authentication_connecting, egui::Button::new("Connect"))
-                            .clicked()
-                            || (response.lost_focus()
-                                && ui.input(|input| input.key_pressed(egui::Key::Enter)));
-                        if connect {
-                            self.open_remote_path();
-                        }
-                        if ui.button("Reconnect").clicked() {
-                            self.reconnect_remote();
+                        if let Some(path) = self.remote_selected_path.as_deref() {
+                            ui.weak(format!("Selected: {path}"));
                         }
                     });
-                    ui.weak(
-                        "Read-only SFTP range reads · 1 MiB blocks · 256 MiB source cache.",
-                    );
-                    self.show_embedded_authentication(ui, context);
-                    if self
-                        .embedded_authentication
-                        .as_ref()
-                        .is_some_and(|authentication| {
-                            authentication.status == AuthenticationStatus::Connecting
-                        })
-                        && ui.button("Cancel authentication").clicked()
-                    {
-                        self.cancel_embedded_authentication();
-                    }
-                    if self.remote_browse_pending {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.weak("Listing remote paths…");
-                        });
-                    }
-                    if let Some(directory) = &self.remote_browse_directory {
-                        ui.label(format!("Remote suggestions in {directory}"));
-                        let mut selected_suggestion = None;
-                        egui::ScrollArea::vertical()
-                            .max_height(180.0)
-                            .show(ui, |ui| {
-                                for suggestion in &self.remote_suggestions {
-                                    let label = match suggestion.kind {
-                                        RemotePathKind::Directory => {
-                                            format!("{}/", suggestion.name)
-                                        }
-                                        RemotePathKind::CziFile => suggestion.name.clone(),
-                                    };
-                                    if ui.button(label).clicked() {
-                                        selected_suggestion = Some(suggestion.clone());
-                                    }
-                                }
-                                if self.remote_suggestions.is_empty() {
-                                    ui.weak("No matching directories or .czi files.");
-                                }
-                            });
-                        if let Some(suggestion) = selected_suggestion {
-                            self.select_remote_suggestion(suggestion);
-                        }
-                    }
-                    if let Some(command) = &self.terminal_bootstrap_command {
-                        ui.separator();
-                        if self.use_terminal_fallback {
-                            ui.label("Terminal fallback command:");
-                            ui.add(
-                                egui::Label::new(egui::RichText::new(command).monospace())
-                                    .selectable(true)
-                                    .wrap(),
-                            );
-                            if ui.button("Copy command").clicked() {
-                                context.copy_text(command.clone());
-                            }
-                            ui.weak(
-                                "Run this only as a fallback. Keep Terminal open while the remote file is in use.",
-                            );
-                        } else {
-                            ui.weak("Embedded SSH failed.");
-                            if ui.button("Use Terminal fallback").clicked() {
-                                self.use_terminal_fallback = true;
-                            }
-                        }
-                    }
+                    ui.weak("Read-only SFTP range reads · 1 MiB blocks · 256 MiB source cache.");
                 }
             }
             let color = if self.status.is_error {
@@ -2655,6 +3225,14 @@ impl eframe::App for ViewerApp {
             };
             ui.colored_label(color, &self.status.message);
         });
+
+        if self.open_mode == OpenMode::Ssh && self.remote_browser_visibility.is_open() {
+            egui::SidePanel::right("remote_browser_panel")
+                .resizable(true)
+                .default_width(390.0)
+                .min_width(300.0)
+                .show(context, |ui| self.show_remote_browser(ui, context));
+        }
 
         egui::SidePanel::left("dataset_panel")
             .resizable(true)
@@ -2868,7 +3446,7 @@ mod tests {
     }
 
     #[test]
-    fn browse_generations_drop_stale_results() {
+    fn remote_browser_generations_drop_stale_results() {
         let mut generations = Generations::default();
         let first = generations.begin_browse();
         assert!(generations.accepts_browse(first));
@@ -2885,6 +3463,26 @@ mod tests {
         let second = generations.begin_connection();
         assert!(!generations.accepts_connection(first));
         assert!(generations.accepts_connection(second));
+    }
+
+    #[test]
+    fn local_open_results_ignore_ssh_generation_changes() {
+        let mut generations = Generations::default();
+        let source = generations.begin_source();
+        let remote_connection = generations.begin_connection();
+        let _new_connection = generations.begin_connection();
+        assert!(accepts_open_result(
+            &generations,
+            source,
+            remote_connection,
+            false,
+        ));
+        assert!(!accepts_open_result(
+            &generations,
+            source,
+            remote_connection,
+            true,
+        ));
     }
 
     #[test]
@@ -3000,6 +3598,112 @@ mod tests {
     }
 
     #[test]
+    fn remote_browser_parent_filter_and_selection_actions_are_pure() {
+        let directory = RemotePathSuggestion {
+            name: String::from("images"),
+            path: String::from("/data/images"),
+            kind: RemotePathKind::Directory,
+            size: None,
+            modified: Some(1),
+        };
+        let file = RemotePathSuggestion {
+            name: String::from("sample.czi"),
+            path: String::from("/data/sample.czi"),
+            kind: RemotePathKind::CziFile,
+            size: Some(1_572_864),
+            modified: Some(1),
+        };
+        assert_eq!(remote_parent_path("/"), "/");
+        assert_eq!(remote_parent_path("/data"), "/");
+        assert_eq!(remote_parent_path("/data/images"), "/data");
+        assert_eq!(
+            filter_remote_suggestions(&[directory.clone(), file.clone()], "SAMPLE"),
+            vec![file.clone()]
+        );
+        assert_eq!(remote_selection_action(&directory, false), None);
+        assert_eq!(
+            remote_selection_action(&directory, true),
+            Some(RemoteSelectionAction::BrowseDirectory(String::from(
+                "/data/images/"
+            )))
+        );
+        assert_eq!(
+            remote_selection_action(&file, true),
+            Some(RemoteSelectionAction::OpenCzi(String::from(
+                "/data/sample.czi"
+            )))
+        );
+        assert_eq!(format_byte_count(1_572_864), "1.5 MiB");
+    }
+
+    #[test]
+    fn authenticated_remote_browse_reuses_only_the_matching_session() {
+        assert!(reuses_remote_connection(
+            "lab-czi",
+            7,
+            Some(("lab-czi", AuthenticationStatus::Authenticated)),
+            None,
+        ));
+        assert!(reuses_remote_connection(
+            "lab-czi",
+            7,
+            None,
+            Some(("lab-czi", 7)),
+        ));
+        assert!(!reuses_remote_connection(
+            "lab-czi",
+            8,
+            None,
+            Some(("lab-czi", 7)),
+        ));
+        assert!(!reuses_remote_connection(
+            "lab-czi",
+            7,
+            Some(("other-host", AuthenticationStatus::Authenticated)),
+            Some(("other-host", 7)),
+        ));
+        assert!(!reuses_remote_connection(
+            "lab-czi",
+            7,
+            Some(("lab-czi", AuthenticationStatus::Failed)),
+            None,
+        ));
+    }
+
+    #[test]
+    fn worker_session_reuse_never_crosses_connection_modes() {
+        let config = OpenSshConfig::new();
+        assert!(matches_worker_remote_session(
+            RemoteSessionKey {
+                profile: "lab-czi",
+                config: &config,
+                generation: 7,
+                mode: RemoteConnectionMode::Embedded,
+            },
+            RemoteSessionKey {
+                profile: "lab-czi",
+                config: &config,
+                generation: 7,
+                mode: RemoteConnectionMode::Embedded,
+            },
+        ));
+        assert!(!matches_worker_remote_session(
+            RemoteSessionKey {
+                profile: "lab-czi",
+                config: &config,
+                generation: 7,
+                mode: RemoteConnectionMode::Embedded,
+            },
+            RemoteSessionKey {
+                profile: "lab-czi",
+                config: &config,
+                generation: 7,
+                mode: RemoteConnectionMode::TerminalBridge,
+            },
+        ));
+    }
+
+    #[test]
     fn remote_browser_filters_sorts_and_bounds_safe_suggestions() {
         fn entry(name: &str, permissions: Option<u32>) -> RemoteDirEntry {
             RemoteDirEntry {
@@ -3031,19 +3735,25 @@ mod tests {
             suggestions,
             vec![
                 RemotePathSuggestion {
-                    name: String::from("beta.CZI"),
-                    path: String::from("/data/beta.CZI"),
-                    kind: RemotePathKind::CziFile,
-                },
-                RemotePathSuggestion {
                     name: String::from("folder.czi"),
                     path: String::from("/data/folder.czi"),
                     kind: RemotePathKind::Directory,
+                    size: None,
+                    modified: None,
+                },
+                RemotePathSuggestion {
+                    name: String::from("beta.CZI"),
+                    path: String::from("/data/beta.CZI"),
+                    kind: RemotePathKind::CziFile,
+                    size: None,
+                    modified: None,
                 },
                 RemotePathSuggestion {
                     name: String::from("zeta.czi"),
                     path: String::from("/data/zeta.czi"),
                     kind: RemotePathKind::CziFile,
+                    size: None,
+                    modified: None,
                 },
             ]
         );
@@ -3200,6 +3910,7 @@ mod tests {
                     terminal_bootstrap_command: None,
                     source_generation: u64::try_from(source_generation).expect("generation"),
                     connection_generation: 0,
+                    remote: false,
                 })
                 .expect("event channel capacity");
         }
@@ -3210,6 +3921,7 @@ mod tests {
                 terminal_bootstrap_command: None,
                 source_generation: 0,
                 connection_generation: 0,
+                remote: false,
             })
             .expect("event channel capacity");
         assert_eq!(take_worker_event_batch(&events).len(), 1);
