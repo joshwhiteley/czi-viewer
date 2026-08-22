@@ -17,8 +17,16 @@ const MIN_CHILD_FD: RawFd = 3;
 const SSH_ASKPASS: &str = "SSH_ASKPASS";
 const SSH_ASKPASS_REQUIRE: &str = "SSH_ASKPASS_REQUIRE";
 
-/// A spawned child whose stdin and stdout are independent binary pipes and whose stderr and
-/// controlling terminal are a local PTY.
+unsafe extern "C" {
+    fn ptsname_r(
+        fd: libc::c_int,
+        buffer: *mut libc::c_char,
+        buffer_length: libc::size_t,
+    ) -> libc::c_int;
+}
+
+/// A spawned child whose stdin and stdout are independent binary stream endpoints and whose stderr
+/// and controlling terminal are a local PTY.
 pub struct SpawnedPty {
     /// Parent writer for child fd 0.
     pub stdin: File,
@@ -173,7 +181,12 @@ pub struct Cancellation {
 
 struct ProcessState {
     pid: libc::pid_t,
-    reaped: Mutex<bool>,
+    lifecycle: Mutex<ProcessLifecycle>,
+}
+
+struct ProcessLifecycle {
+    leader_reaped: bool,
+    process_group_terminated: bool,
 }
 
 impl Child {
@@ -208,7 +221,7 @@ impl Child {
             if let Some(status) = self.wait_once()? {
                 return Ok(Some(status));
             }
-            if self.is_reaped()? {
+            if self.is_leader_reaped()? {
                 return Ok(None);
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -221,39 +234,42 @@ impl Child {
     ///
     /// Returns an error when signalling or waiting for the child fails.
     pub fn terminate_and_wait(&mut self) -> io::Result<Option<i32>> {
-        let cancellation = Cancellation {
-            state: Arc::clone(&self.state),
-        };
-        cancellation.cancel()?;
+        if let Some(status) = self.wait_once()? {
+            return Ok(Some(status));
+        }
+        self.terminate_process_group()?;
         self.wait()
     }
 
-    fn is_reaped(&self) -> io::Result<bool> {
+    fn is_leader_reaped(&self) -> io::Result<bool> {
         self.state
-            .reaped
+            .lifecycle
             .lock()
-            .map(|reaped| *reaped)
+            .map(|lifecycle| lifecycle.leader_reaped)
             .map_err(|_| io::Error::other("embedded child lifecycle lock poisoned"))
     }
 
     fn wait_once(&mut self) -> io::Result<Option<i32>> {
-        let mut reaped = self
+        let mut lifecycle = self
             .state
-            .reaped
+            .lifecycle
             .lock()
             .map_err(|_| io::Error::other("embedded child lifecycle lock poisoned"))?;
-        if *reaped {
+        if lifecycle.leader_reaped {
             return Ok(None);
         }
+
+        if !leader_is_waitable(self.state.pid)? {
+            return Ok(None);
+        }
+        terminate_process_group_locked(self.state.pid, &mut lifecycle, true)?;
+
         let mut status = 0;
         loop {
-            // SAFETY: `status` is valid writable storage and `pid` is returned by posix_spawn.
-            let result = unsafe { libc::waitpid(self.state.pid, &mut status, libc::WNOHANG) };
-            if result == 0 {
-                return Ok(None);
-            }
+            // SAFETY: WNOWAIT confirmed this exact child is waitable and status is writable.
+            let result = unsafe { libc::waitpid(self.state.pid, &mut status, 0) };
             if result == self.state.pid {
-                *reaped = true;
+                lifecycle.leader_reaped = true;
                 return Ok(Some(status));
             }
             if result == -1 {
@@ -265,6 +281,16 @@ impl Child {
             }
             return Err(io::Error::other("waitpid returned an unexpected process"));
         }
+    }
+
+    fn terminate_process_group(&self) -> io::Result<()> {
+        let mut lifecycle = self
+            .state
+            .lifecycle
+            .lock()
+            .map_err(|_| io::Error::other("embedded child lifecycle lock poisoned"))?;
+        let leader_waitable = leader_is_waitable(self.state.pid)?;
+        terminate_process_group_locked(self.state.pid, &mut lifecycle, leader_waitable)
     }
 }
 
@@ -281,33 +307,83 @@ impl Cancellation {
     ///
     /// Returns an error when signalling the child process group fails.
     pub fn cancel(&self) -> io::Result<()> {
-        let reaped = self
+        let mut lifecycle = self
             .state
-            .reaped
+            .lifecycle
             .lock()
             .map_err(|_| io::Error::other("embedded child lifecycle lock poisoned"))?;
-        if *reaped {
+        if lifecycle.process_group_terminated {
             return Ok(());
         }
-        // SAFETY: posix_spawn created a private session and process group whose ID is its PID.
-        // Holding the lifecycle lock prevents a concurrent waitpid from reaping and recycling it.
-        let result = unsafe { libc::kill(-self.state.pid, libc::SIGKILL) };
-        if result == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(());
-        }
-        Err(error)
+        let leader_waitable = leader_is_waitable(self.state.pid)?;
+        terminate_process_group_locked(self.state.pid, &mut lifecycle, leader_waitable)
     }
+}
+
+fn terminate_process_group_locked(
+    pid: libc::pid_t,
+    lifecycle: &mut ProcessLifecycle,
+    leader_waitable: bool,
+) -> io::Result<()> {
+    if lifecycle.process_group_terminated {
+        return Ok(());
+    }
+    if lifecycle.leader_reaped {
+        return Err(io::Error::other(
+            "embedded child group was not terminated before its leader was reaped",
+        ));
+    }
+    // SAFETY: a live or waitable leader keeps its private session/process-group ID from being
+    // recycled. A negative PID targets the whole private group, including SSH helpers.
+    let result = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    let error = io::Error::last_os_error();
+    if result == 0
+        || error.raw_os_error() == Some(libc::ESRCH)
+        // Darwin returns EPERM for a zombie session leader whose group has no live members.
+        || (leader_waitable && error.raw_os_error() == Some(libc::EPERM))
+    {
+        lifecycle.process_group_terminated = true;
+        return Ok(());
+    }
+    Err(error)
+}
+
+fn leader_is_waitable(pid: libc::pid_t) -> io::Result<bool> {
+    // `WNOWAIT` keeps an exited leader waitable. That keeps its PID and process-group ID from
+    // being recycled until the group is signalled and waitpid below reaps it.
+    // SAFETY: a zeroed siginfo_t is valid writable storage for waitid.
+    let mut information = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+    // SAFETY: `information` is valid writable storage and `pid` belongs to this child.
+    let wait_result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            libc::id_t::try_from(pid)
+                .map_err(|_| io::Error::other("invalid embedded child process identifier"))?,
+            &mut information,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if wait_result == -1 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    if information.si_pid == 0 {
+        return Ok(false);
+    }
+    if information.si_pid != pid {
+        return Err(io::Error::other("waitid returned an unexpected process"));
+    }
+    Ok(true)
 }
 
 /// Spawn an absolute-path program with binary stdin/stdout pipes and a controlling PTY.
 ///
 /// `argv[0]` must equal `executable`. The child receives no `SSH_ASKPASS` or
 /// `SSH_ASKPASS_REQUIRE`, even when they are present in the parent or `extra_environment`.
-/// Child fd 0 is the read end of a pipe, fd 1 is the write end of a pipe, and fd 2 is the
+/// Child fd 0 and fd 1 are independent directional binary socket endpoints, and fd 2 is the
 /// echo-disabled PTY slave. Darwin applies file actions before `POSIX_SPAWN_SETSID`, so the short
 /// executor must call [`claim_controlling_terminal`] before it `execve`s the final child.
 ///
@@ -339,8 +415,8 @@ pub fn spawn(
         .collect::<io::Result<Vec<_>>>()?;
     let environment = child_environment(extra_environment)?;
 
-    let (stdin_read, stdin_write) = pipe()?;
-    let (stdout_read, stdout_write) = pipe()?;
+    let (stdin_read, stdin_write) = binary_socket_pair()?;
+    let (stdout_read, stdout_write) = binary_socket_pair()?;
     let (pty_master, _pty_slave, slave_name) = open_pty()?;
 
     let mut actions = FileActions::new()?;
@@ -381,7 +457,10 @@ pub fn spawn(
 
     let state = Arc::new(ProcessState {
         pid,
-        reaped: Mutex::new(false),
+        lifecycle: Mutex::new(ProcessLifecycle {
+            leader_reaped: false,
+            process_group_terminated: false,
+        }),
     });
     Ok(SpawnedPty {
         stdin: stdin_write,
@@ -394,77 +473,80 @@ pub fn spawn(
     })
 }
 
-fn pipe() -> io::Result<(File, File)> {
+fn binary_socket_pair() -> io::Result<(File, File)> {
     let mut descriptors = [-1; 2];
     // SAFETY: `descriptors` points to two writable file-descriptor slots.
-    if unsafe { libc::pipe(descriptors.as_mut_ptr()) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: pipe returned owned file descriptors on success.
-    let read = unsafe { File::from_raw_fd(descriptors[0]) };
-    // SAFETY: pipe returned owned file descriptors on success.
-    let write = unsafe { File::from_raw_fd(descriptors[1]) };
-    Ok((move_above_stdio(read)?, move_above_stdio(write)?))
-}
-
-fn open_pty() -> io::Result<(File, File, CString)> {
-    let mut master = -1;
-    let mut slave = -1;
-    let mut name = [0_i8; libc::PATH_MAX as usize];
-    // SAFETY: all pointers point to writable storage. Null termios/winsize request system defaults.
     if unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            name.as_mut_ptr(),
-            ptr::null_mut(),
-            ptr::null_mut(),
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM,
+            0,
+            descriptors.as_mut_ptr(),
         )
     } == -1
     {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: openpty returned owned file descriptors on success.
+    // SAFETY: socketpair returned owned file descriptors on success.
+    let first = unsafe { File::from_raw_fd(descriptors[0]) };
+    // SAFETY: socketpair returned owned file descriptors on success.
+    let second = unsafe { File::from_raw_fd(descriptors[1]) };
+    Ok((
+        duplicate_close_on_exec(first)?,
+        duplicate_close_on_exec(second)?,
+    ))
+}
+
+fn open_pty() -> io::Result<(File, File, CString)> {
+    // SAFETY: posix_openpt has no pointer arguments and returns an owned descriptor on success.
+    let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+    if master == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: posix_openpt returned an owned descriptor on success.
     let master = unsafe { File::from_raw_fd(master) };
-    // SAFETY: openpty returned owned file descriptors on success.
-    let slave = unsafe { File::from_raw_fd(slave) };
-    let master = move_above_stdio(master)?;
-    let slave = move_above_stdio(slave)?;
-    disable_echo(&slave)?;
-    // SAFETY: successful openpty writes a NUL-terminated PTY path to the supplied PATH_MAX buffer.
+    // SAFETY: master is a valid pseudo-terminal descriptor.
+    if unsafe { libc::grantpt(master.as_raw_fd()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: master is a valid unlocked pseudo-terminal descriptor.
+    if unsafe { libc::unlockpt(master.as_raw_fd()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut name = [0_i8; libc::PATH_MAX as usize];
+    // SAFETY: the buffer is writable PATH_MAX storage for the slave pathname.
+    if unsafe { ptsname_r(master.as_raw_fd(), name.as_mut_ptr(), name.len()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful ptsname_r writes a NUL-terminated PTY path to the supplied buffer.
     let name = unsafe { CStr::from_ptr(name.as_ptr()) };
+    // SAFETY: name is a NUL-terminated pathname and open returns an owned descriptor on success.
+    let slave = unsafe {
+        libc::open(
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if slave == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: open returned an owned descriptor on success.
+    let slave = unsafe { File::from_raw_fd(slave) };
+    disable_echo(&slave)?;
     let name = CString::new(name.to_bytes()).map_err(|_| invalid_input("PTY slave path"))?;
     Ok((master, slave, name))
 }
 
-fn move_above_stdio(file: File) -> io::Result<File> {
-    if file.as_raw_fd() >= MIN_CHILD_FD {
-        set_close_on_exec(&file)?;
-        return Ok(file);
-    }
-    // SAFETY: `file` owns a valid descriptor; F_DUPFD requests a distinct descriptor at least 3.
-    let duplicated = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, MIN_CHILD_FD) };
+fn duplicate_close_on_exec(file: File) -> io::Result<File> {
+    // SAFETY: `file` owns a valid descriptor; F_DUPFD_CLOEXEC atomically creates a distinct
+    // descriptor at least 3 with FD_CLOEXEC set.
+    let duplicated = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, MIN_CHILD_FD) };
     if duplicated == -1 {
         return Err(io::Error::last_os_error());
     }
     drop(file);
     // SAFETY: fcntl returned a newly owned descriptor.
-    let duplicated = unsafe { File::from_raw_fd(duplicated) };
-    set_close_on_exec(&duplicated)?;
-    Ok(duplicated)
-}
-
-fn set_close_on_exec(file: &File) -> io::Result<()> {
-    // SAFETY: `file` owns a valid descriptor.
-    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
-    if flags == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `file` owns a valid descriptor and flags came from F_GETFD.
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    Ok(unsafe { File::from_raw_fd(duplicated) })
 }
 
 fn disable_echo(slave: &File) -> io::Result<()> {
@@ -611,6 +693,8 @@ impl Drop for SpawnAttributes {
 mod tests {
     use super::*;
 
+    const DESCENDANT_MODE: &str = "CZI_SSH_DARWIN_TEST_DESCENDANT";
+
     #[test]
     fn spawn_removes_askpass_environment() {
         let executable = std::path::Path::new("/usr/bin/env");
@@ -635,5 +719,70 @@ mod tests {
         assert!(status.is_some());
         assert!(!output.contains("SSH_ASKPASS="));
         assert!(!output.contains("SSH_ASKPASS_REQUIRE="));
+    }
+
+    #[test]
+    #[allow(
+        clippy::zombie_processes,
+        reason = "the parent test must reap the session leader and kill this inherited descendant"
+    )]
+    fn descendant_child_entry() {
+        if std::env::var_os(DESCENDANT_MODE).is_none() {
+            return;
+        }
+        std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn descendant that inherits the private process group");
+    }
+
+    #[test]
+    fn reaping_a_leader_terminates_its_descendant_group() {
+        let executable = std::env::current_exe().expect("current czi-ssh-darwin test executable");
+        let argv = vec![
+            executable.clone().into_os_string(),
+            "--exact".into(),
+            "macos::tests::descendant_child_entry".into(),
+            "--nocapture".into(),
+        ];
+        let extra_environment = vec![(OsString::from(DESCENDANT_MODE), OsString::from("1"))];
+        let SpawnedPty {
+            stdin,
+            stdout,
+            pty_master,
+            mut child,
+            cancellation,
+        } = spawn(&executable, &argv, &extra_environment).expect("spawn descendant test child");
+        let process_group = child.id();
+        drop((stdin, stdout, pty_master));
+        assert!(child.wait().expect("reap leader").is_some());
+        cancellation
+            .cancel()
+            .expect("cancellation after leader reap is already group-safe");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !process_group_is_gone(process_group).expect("inspect descendant process group") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "descendant process group {process_group} survived leader reaping"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn process_group_is_gone(process_group: u32) -> io::Result<bool> {
+        let process_group = libc::pid_t::try_from(process_group)
+            .map_err(|_| io::Error::other("invalid test process group"))?;
+        // SAFETY: this test owns the private process group created by posix_spawn.
+        let result = unsafe { libc::kill(-process_group, 0) };
+        if result == 0 {
+            return Ok(false);
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(true)
+        } else {
+            Err(error)
+        }
     }
 }

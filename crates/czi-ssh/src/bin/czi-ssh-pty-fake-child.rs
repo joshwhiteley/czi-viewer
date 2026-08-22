@@ -2,6 +2,8 @@
 
 #[cfg(target_os = "macos")]
 use std::io::{Read, Write};
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::FileTypeExt;
 
 #[cfg(target_os = "macos")]
 const PASSWORD: &[u8] = b"opaque-password-for-pty-test\n";
@@ -28,12 +30,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|argument| argument.to_str())
         .ok_or("fake PTY executor requires a UTF-8 profile")?;
     verify_production_argv(&arguments[2..], profile)?;
+    verify_descriptor_layout()?;
     czi_ssh_darwin::claim_controlling_terminal()?;
     if profile == "block@example.test" {
         block_on_terminal_input()
     } else {
         authenticate_and_speak_sftp()
     }
+}
+
+#[cfg(target_os = "macos")]
+fn verify_descriptor_layout() -> Result<(), Box<dyn std::error::Error>> {
+    if !std::fs::metadata("/dev/fd/0")?.file_type().is_socket()
+        || !std::fs::metadata("/dev/fd/1")?.file_type().is_socket()
+        || !std::fs::metadata("/dev/fd/2")?.file_type().is_char_device()
+    {
+        return Err("embedded child fd 0/1/2 layout is not socket/socket/PTY".into());
+    }
+    let leaked = std::fs::read_dir("/dev/fd")?
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter_map(|name| name.parse::<i32>().ok())
+        .any(|descriptor| descriptor > 3);
+    if leaked {
+        return Err("embedded child inherited a descriptor above the read_dir handle".into());
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]

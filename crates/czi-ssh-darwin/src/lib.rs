@@ -1,7 +1,7 @@
 //! Minimal, Darwin-only PTY process support for the embedded OpenSSH console.
 //!
 //! This crate deliberately contains the workspace's only unsafe code for this feature. The
-//! [`libc`] calls are limited to opening/configuring a PTY, creating pipes, `posix_spawn` file
+//! [`libc`] calls are limited to opening/configuring a PTY, creating binary socket endpoints, `posix_spawn` file
 //! actions, process signalling, reaping, and the executor's `TIOCSCTTY`/`execve` transition. It
 //! uses `POSIX_SPAWN_SETSID` plus an `addopen` action for the slave PTY. Darwin processes file
 //! actions before that session transition, so the tiny executor calls `TIOCSCTTY` and then
