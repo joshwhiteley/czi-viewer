@@ -8,6 +8,7 @@ mod command;
 mod error;
 mod location;
 mod protocol;
+mod shared;
 mod source;
 
 pub use bridge::BridgeCancellation;
@@ -26,4 +27,5 @@ pub use protocol::{
     EMBEDDED_PTY_EXEC_MODE, EmbeddedSshCancellation, PendingEmbeddedSftpSession,
     SSH_CONSOLE_OUTPUT_LIMIT, SftpSession, SshConsole, run_embedded_pty_executor_if_requested,
 };
+pub use shared::SharedSftpSession;
 pub use source::SftpSource;

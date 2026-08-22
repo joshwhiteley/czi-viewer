@@ -14,7 +14,8 @@ use crate::{
 };
 use crate::{
     ControlPath, OPENSSH_PATH, OpenSshConfig, OpenSshConfigError, SftpError, SftpLocation,
-    SftpLocationError, SftpProtocolError, SftpSession, SftpSource, SshProfile, SshProfileError,
+    SftpLocationError, SftpProtocolError, SftpSession, SftpSource, SharedSftpSession, SshProfile,
+    SshProfileError,
 };
 
 use super::{
@@ -794,6 +795,132 @@ fn source_reads_short_data_and_closes_through_fake_ssh() {
 }
 
 #[test]
+fn shared_session_reuses_one_init_across_browse_open_and_browse() {
+    let requested = location("/input/image.czi");
+    let (session, worker) = fake_session(|fake| {
+        fake.expect_init();
+        fake.send_version(false);
+
+        let home = fake.read_request();
+        assert_eq!(home.packet_type, SSH_FXP_REALPATH);
+        assert_eq!(request_id(&home), 1);
+        send_name(
+            fake,
+            1,
+            &[("/home/test", "/home/test", 0_u32.to_be_bytes().to_vec())],
+        );
+
+        let realpath = fake.read_request();
+        assert_eq!(realpath.packet_type, SSH_FXP_REALPATH);
+        assert_eq!(request_id(&realpath), 2);
+        send_name(
+            fake,
+            2,
+            &[(
+                "/canonical/image.czi",
+                "image.czi",
+                0_u32.to_be_bytes().to_vec(),
+            )],
+        );
+        let open = fake.read_request();
+        assert_eq!(open.packet_type, SSH_FXP_OPEN);
+        assert_eq!(request_id(&open), 3);
+        fake.send_handle(3, b"file");
+        let fstat = fake.read_request();
+        assert_eq!(fstat.packet_type, SSH_FXP_FSTAT);
+        assert_eq!(request_id(&fstat), 4);
+        fake.send(SSH_FXP_ATTRS, &attrs_response(4, &attrs(8, 77)));
+
+        let opendir = fake.read_request();
+        assert_eq!(opendir.packet_type, SSH_FXP_OPENDIR);
+        assert_eq!(request_id(&opendir), 5);
+        fake.send_handle(5, b"directory");
+        let readdir = fake.read_request();
+        assert_eq!(readdir.packet_type, SSH_FXP_READDIR);
+        assert_eq!(request_id(&readdir), 6);
+        fake.send_status(6, SSH_FX_EOF);
+        let close_directory = fake.read_request();
+        assert_eq!(close_directory.packet_type, SSH_FXP_CLOSE);
+        assert_eq!(request_id(&close_directory), 7);
+        fake.send_status(7, SSH_FX_OK);
+
+        let close_file = fake.read_request();
+        assert_eq!(close_file.packet_type, SSH_FXP_CLOSE);
+        assert_eq!(request_id(&close_file), 8);
+        fake.send_status(8, SSH_FX_OK);
+    });
+    let shared = SharedSftpSession::new(session);
+    let home = location(".");
+    assert_eq!(
+        shared
+            .with_session(|session| session.realpath(&home))
+            .unwrap()
+            .as_str(),
+        "/home/test"
+    );
+    let source = SftpSource::open_with_shared_session(shared.clone(), &requested).unwrap();
+    assert!(
+        shared
+            .with_session(|session| session.read_dir(&location("/home/test")))
+            .unwrap()
+            .is_empty()
+    );
+    source.close().unwrap();
+    drop(shared);
+    worker.join().unwrap();
+}
+
+#[test]
+fn dropping_source_clone_keeps_shared_browser_session_alive() {
+    let requested = location("/input/image.czi");
+    let (session, worker) = fake_session(|fake| {
+        fake.expect_init();
+        fake.send_version(false);
+        let realpath = fake.read_request();
+        send_name(
+            fake,
+            request_id(&realpath),
+            &[(
+                "/canonical/image.czi",
+                "image.czi",
+                0_u32.to_be_bytes().to_vec(),
+            )],
+        );
+        let open = fake.read_request();
+        fake.send_handle(request_id(&open), b"file");
+        let fstat = fake.read_request();
+        fake.send(
+            SSH_FXP_ATTRS,
+            &attrs_response(request_id(&fstat), &attrs(8, 77)),
+        );
+        let close = fake.read_request();
+        assert_eq!(close.packet_type, SSH_FXP_CLOSE);
+        fake.send_status(request_id(&close), SSH_FX_OK);
+        let browse = fake.read_request();
+        assert_eq!(browse.packet_type, SSH_FXP_REALPATH);
+        send_name(
+            fake,
+            request_id(&browse),
+            &[("/home/test", "/home/test", 0_u32.to_be_bytes().to_vec())],
+        );
+        let mut eof = [0_u8; 1];
+        assert_eq!(fake.stream.read(&mut eof).unwrap(), 0);
+    });
+    let shared = SharedSftpSession::new(session);
+    let source = SftpSource::open_with_shared_session(shared.clone(), &requested).unwrap();
+    drop(source);
+    assert_eq!(
+        shared
+            .with_session(|session| session.realpath(&location(".")))
+            .unwrap()
+            .as_str(),
+        "/home/test"
+    );
+    drop(shared);
+    worker.join().unwrap();
+}
+
+#[test]
 fn source_uses_u64_read_offsets_above_four_gibibytes() {
     let requested = location("/input/large.czi");
     let canonical = "/canonical/large.czi";
@@ -1055,14 +1182,33 @@ fn source_requires_fstat_size_and_modification_time() {
             SSH_FXP_ATTRS,
             &attrs_response(request_id(&fstat), &attributes),
         );
+        let close = fake.read_request();
+        assert_eq!(close.packet_type, SSH_FXP_CLOSE);
+        fake.send_status(request_id(&close), SSH_FX_OK);
+        let browse = fake.read_request();
+        assert_eq!(browse.packet_type, SSH_FXP_REALPATH);
+        send_name(
+            fake,
+            request_id(&browse),
+            &[("/home/test", "/home/test", 0_u32.to_be_bytes().to_vec())],
+        );
     });
-    let Err(error) = open_source(session, &requested) else {
+    let shared = SharedSftpSession::new(session);
+    let Err(error) = SftpSource::open_with_shared_session(shared.clone(), &requested) else {
         panic!("FSTAT missing mtime must fail");
     };
     match error {
         SftpError::Protocol(SftpProtocolError::MissingRequiredAttribute { .. }) => {}
         other => panic!("unexpected error: {other:?}"),
     }
+    assert_eq!(
+        shared
+            .with_session(|session| session.realpath(&location(".")))
+            .unwrap()
+            .as_str(),
+        "/home/test"
+    );
+    drop(shared);
     worker.join().unwrap();
 }
 

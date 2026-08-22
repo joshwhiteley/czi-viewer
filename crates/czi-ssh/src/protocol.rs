@@ -643,15 +643,6 @@ impl SftpSession {
         expect_request_id(&mut cursor, request_id, "FSTAT")?;
         let attributes = parse_attributes(&mut cursor)?;
         cursor.finish("FSTAT ATTRS")?;
-        if attributes.size.is_none() {
-            return Err(SftpProtocolError::MissingRequiredAttribute { attribute: "size" }.into());
-        }
-        if attributes.access_modify_time.is_none() {
-            return Err(SftpProtocolError::MissingRequiredAttribute {
-                attribute: "modification time",
-            }
-            .into());
-        }
         Ok(attributes)
     }
 

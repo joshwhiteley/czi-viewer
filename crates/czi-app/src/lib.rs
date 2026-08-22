@@ -20,7 +20,7 @@ use czi_core::{
 };
 use czi_ssh::{
     BridgeCancellation, ControlPath, EmbeddedSshCancellation, OpenSshConfig, RemoteDirEntry,
-    SftpLocation, SftpSession, SftpSource, SshConsole, SshProfile,
+    SftpLocation, SftpSession, SftpSource, SharedSftpSession, SshConsole, SshProfile,
 };
 use eframe::egui;
 
@@ -125,34 +125,67 @@ struct OpenFailure {
 
 #[derive(Clone)]
 struct EmbeddedCancellationSlot {
-    inner: Arc<Mutex<Option<(u64, EmbeddedSshCancellation)>>>,
+    inner: Arc<Mutex<EmbeddedCancellationState>>,
+}
+
+struct EmbeddedCancellationState {
+    current: Option<(u64, EmbeddedSshCancellation)>,
+    cancelled_generations: HashSet<u64>,
 }
 
 impl EmbeddedCancellationSlot {
-    fn replace(&self, generation: u64, cancellation: EmbeddedSshCancellation) {
-        if let Ok(mut current) = self.inner.lock() {
-            *current = Some((generation, cancellation));
+    fn replace(&self, generation: u64, cancellation: &EmbeddedSshCancellation) {
+        let cancel = if let Ok(mut state) = self.inner.lock() {
+            state.current = Some((generation, cancellation.clone()));
+            state.cancelled_generations.contains(&generation)
+        } else {
+            false
+        };
+        if cancel {
+            let _ = cancellation.cancel();
         }
     }
 
     fn clear(&self, generation: u64) {
-        if let Ok(mut current) = self.inner.lock()
-            && current
+        if let Ok(mut state) = self.inner.lock() {
+            if state
+                .current
                 .as_ref()
                 .is_some_and(|(current_generation, _)| *current_generation == generation)
-        {
-            *current = None;
+            {
+                state.current = None;
+            }
+            state.cancelled_generations.remove(&generation);
         }
     }
 
-    fn cancel(&self) {
-        let cancellation = self.inner.lock().ok().and_then(|current| {
-            current
-                .as_ref()
-                .map(|(_, cancellation)| cancellation.clone())
-        });
+    fn cancel(&self, generation: u64) {
+        let cancellation = self
+            .inner
+            .lock()
+            .map(|mut state| {
+                state.cancelled_generations.insert(generation);
+                state
+                    .current
+                    .as_ref()
+                    .filter(|(current_generation, _)| *current_generation == generation)
+                    .map(|(_, cancellation)| cancellation.clone())
+            })
+            .ok()
+            .flatten();
         if let Some(cancellation) = cancellation {
             let _ = cancellation.cancel();
+        }
+    }
+
+    fn cancel_active(&self) {
+        let generation = self
+            .inner
+            .lock()
+            .ok()
+            .and_then(|state| state.current.as_ref().map(|(generation, _)| *generation));
+        if let Some(generation) = generation {
+            self.cancel(generation);
         }
     }
 }
@@ -160,7 +193,10 @@ impl EmbeddedCancellationSlot {
 impl Default for EmbeddedCancellationSlot {
     fn default() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(None)),
+            inner: Arc::new(Mutex::new(EmbeddedCancellationState {
+                current: None,
+                cancelled_generations: HashSet::new(),
+            })),
         }
     }
 }
@@ -490,11 +526,13 @@ enum WorkerEvent {
     Opened {
         info: DatasetInfo,
         source_generation: u64,
+        connection_generation: u64,
     },
     OpenFailed {
         message: String,
         terminal_bootstrap_command: Option<String>,
         source_generation: u64,
+        connection_generation: u64,
     },
     AuthenticationStarted {
         profile: String,
@@ -514,11 +552,13 @@ enum WorkerEvent {
         suggestions: Vec<RemotePathSuggestion>,
         home: bool,
         browse_generation: u64,
+        connection_generation: u64,
     },
     RemotePathsFailed {
         message: String,
         terminal_bootstrap_command: Option<String>,
         browse_generation: u64,
+        connection_generation: u64,
     },
     TileLoaded {
         tile_id: TileId,
@@ -552,7 +592,7 @@ struct WorkerDataset {
 struct WorkerBrowseSession {
     profile: String,
     config: OpenSshConfig,
-    session: SftpSession,
+    session: SharedSftpSession,
 }
 
 struct EmbeddedConnectionContext<'a> {
@@ -610,7 +650,7 @@ impl DatasetWorker {
             return;
         }
         self.bridge_cancellation.cancel();
-        self.embedded_cancellation.cancel();
+        self.embedded_cancellation.cancel_active();
         let mut sent = self.commands.try_send(WorkerCommand::Shutdown).is_ok();
         while self.events.try_recv().is_ok() {}
         if !sent {
@@ -668,6 +708,7 @@ fn worker_loop(
                     events,
                     open_dataset(locator, &mut browse_session, &connection),
                     source_generation,
+                    connection_generation,
                 );
                 if !sent {
                     break;
@@ -698,14 +739,16 @@ fn worker_loop(
                     &mut browse_session,
                     &connection,
                 );
-                if !send_remote_browse_result(events, result, browse_generation) {
+                if !send_remote_browse_result(
+                    events,
+                    result,
+                    browse_generation,
+                    connection_generation,
+                ) {
                     break;
                 }
             }
-            WorkerCommand::ClearBrowse => {
-                browse_session = None;
-                embedded_cancellation.cancel();
-            }
+            WorkerCommand::ClearBrowse => browse_session = None,
             WorkerCommand::View(request) => {
                 if request.source_generation != active_source_generation {
                     if events
@@ -740,6 +783,7 @@ fn send_open_result(
     events: &SyncSender<WorkerEvent>,
     result: Result<(CziDataset, TileQueryIndex, DatasetInfo), OpenFailure>,
     source_generation: u64,
+    connection_generation: u64,
 ) -> (Option<WorkerDataset>, bool) {
     match result {
         Ok((dataset, query, info)) => {
@@ -747,6 +791,7 @@ fn send_open_result(
                 .send(WorkerEvent::Opened {
                     info,
                     source_generation,
+                    connection_generation,
                 })
                 .is_ok();
             (sent.then_some(WorkerDataset { dataset, query }), sent)
@@ -761,6 +806,7 @@ fn send_open_result(
                     message,
                     terminal_bootstrap_command,
                     source_generation,
+                    connection_generation,
                 })
                 .is_ok(),
         ),
@@ -771,6 +817,7 @@ fn send_remote_browse_result(
     events: &SyncSender<WorkerEvent>,
     result: Result<RemoteBrowseResult, OpenFailure>,
     browse_generation: u64,
+    connection_generation: u64,
 ) -> bool {
     match result {
         Ok(RemoteBrowseResult {
@@ -783,6 +830,7 @@ fn send_remote_browse_result(
                 suggestions,
                 home,
                 browse_generation,
+                connection_generation,
             })
             .is_ok(),
         Err(OpenFailure {
@@ -793,6 +841,7 @@ fn send_remote_browse_result(
                 message,
                 terminal_bootstrap_command,
                 browse_generation,
+                connection_generation,
             })
             .is_ok(),
     }
@@ -819,8 +868,10 @@ fn browse_remote_paths(
         .is_some_and(|existing| existing.profile == profile.as_str() && existing.config == *config);
     if !matches_existing {
         *browse_session = None;
-        let session = connect_embedded(&profile, config, connection)
-            .map_err(|error| remote_failure(profile.as_str(), config, error))?;
+        let session = SharedSftpSession::new(
+            connect_embedded(&profile, config, connection)
+                .map_err(|error| remote_failure(profile.as_str(), config, error))?,
+        );
         *browse_session = Some(WorkerBrowseSession {
             profile: profile.as_str().to_owned(),
             config: config.clone(),
@@ -828,8 +879,8 @@ fn browse_remote_paths(
         });
     }
     let result = browse_with_session(
-        &mut browse_session
-            .as_mut()
+        &browse_session
+            .as_ref()
             .expect("browse session was created or matched")
             .session,
         target,
@@ -843,24 +894,25 @@ fn browse_remote_paths(
 }
 
 fn browse_with_session(
-    session: &mut SftpSession,
+    session: &SharedSftpSession,
     target: Option<(SftpLocation, String)>,
     profile: &SshProfile,
     config: &OpenSshConfig,
 ) -> Result<RemoteBrowseResult, OpenFailure> {
-    let (directory, prefix, home) = match target {
-        None => {
-            let current_directory =
-                SftpLocation::new(".").expect("the fixed SFTP current-directory location is valid");
-            let home = session
-                .realpath(&current_directory)
-                .map_err(|error| remote_failure(profile.as_str(), config, error))?;
-            (home, String::new(), true)
-        }
-        Some((directory, prefix)) => (directory, prefix, false),
-    };
-    let entries = session
-        .read_dir_limited(&directory, MAX_REMOTE_DIRECTORY_ENTRIES)
+    let (directory, prefix, home, entries) = session
+        .with_session(|session| {
+            let (directory, prefix, home) = match target {
+                None => {
+                    let current_directory = SftpLocation::new(".")
+                        .expect("the fixed SFTP current-directory location is valid");
+                    let home = session.realpath(&current_directory)?;
+                    (home, String::new(), true)
+                }
+                Some((directory, prefix)) => (directory, prefix, false),
+            };
+            let entries = session.read_dir_limited(&directory, MAX_REMOTE_DIRECTORY_ENTRIES)?;
+            Ok((directory, prefix, home, entries))
+        })
         .map_err(|error| remote_failure(profile.as_str(), config, error))?;
     let directory = directory.as_str().trim_end_matches('/');
     let directory = if directory.is_empty() { "/" } else { directory };
@@ -900,15 +952,26 @@ fn open_dataset(
             let source = if browse_session.as_ref().is_some_and(|existing| {
                 existing.profile == profile.as_str() && existing.config == *config
             }) {
-                let session = browse_session
-                    .take()
-                    .expect("matching browse session is present")
-                    .session;
-                SftpSource::open_with_session(session, &location)
+                SftpSource::open_with_shared_session(
+                    browse_session
+                        .as_ref()
+                        .expect("matching browse session is present")
+                        .session
+                        .clone(),
+                    &location,
+                )
             } else {
                 *browse_session = None;
-                connect_embedded(&profile, config, connection)
-                    .and_then(|session| SftpSource::open_with_session(session, &location))
+                let session = SharedSftpSession::new(
+                    connect_embedded(&profile, config, connection)
+                        .map_err(|error| remote.open_failure(error))?,
+                );
+                *browse_session = Some(WorkerBrowseSession {
+                    profile: profile.as_str().to_owned(),
+                    config: config.clone(),
+                    session: session.clone(),
+                });
+                SftpSource::open_with_shared_session(session, &location)
             }
             .map_err(|error| remote.open_failure(error))?;
             let cache =
@@ -944,7 +1007,7 @@ fn connect_embedded(
     let cancellation = pending.cancellation();
     connection
         .cancellation
-        .replace(connection.generation, cancellation.clone());
+        .replace(connection.generation, &cancellation);
     if connection
         .events
         .send(WorkerEvent::AuthenticationStarted {
@@ -955,7 +1018,7 @@ fn connect_embedded(
         })
         .is_err()
     {
-        connection.cancellation.cancel();
+        connection.cancellation.cancel(connection.generation);
         return Err(czi_ssh::SftpError::Spawn {
             source: std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -972,7 +1035,7 @@ fn connect_embedded(
                 })
                 .is_err()
             {
-                connection.cancellation.cancel();
+                connection.cancellation.cancel(connection.generation);
                 return Err(czi_ssh::SftpError::Spawn {
                     source: std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
@@ -1768,7 +1831,9 @@ impl ViewerApp {
             .as_ref()
             .is_none_or(|authentication| authentication.status == AuthenticationStatus::Connecting);
         if connecting {
-            self.worker.embedded_cancellation.cancel();
+            self.worker
+                .embedded_cancellation
+                .cancel(self.generations.connection);
             if let Some(authentication) = &self.embedded_authentication {
                 let _ = authentication.cancellation.cancel();
             }
@@ -1893,12 +1958,18 @@ impl ViewerApp {
             WorkerEvent::Opened {
                 info,
                 source_generation,
-            } => self.handle_opened(info, source_generation),
+                connection_generation,
+            } if self.generations.accepts_connection(connection_generation) => {
+                self.handle_opened(info, source_generation);
+            }
             WorkerEvent::OpenFailed {
                 message,
                 terminal_bootstrap_command,
                 source_generation,
-            } if self.generations.accepts_source(source_generation) => {
+                connection_generation,
+            } if self.generations.accepts_source(source_generation)
+                && self.generations.accepts_connection(connection_generation) =>
+            {
                 self.status = Status::error(message);
                 self.terminal_bootstrap_command = terminal_bootstrap_command;
             }
@@ -1907,16 +1978,17 @@ impl ViewerApp {
                 suggestions,
                 home,
                 browse_generation,
-            } => self.handle_remote_paths(directory, suggestions, home, browse_generation),
+                connection_generation,
+            } if self.generations.accepts_connection(connection_generation) => {
+                self.handle_remote_paths(directory, suggestions, home, browse_generation);
+            }
             WorkerEvent::RemotePathsFailed {
                 message,
                 terminal_bootstrap_command,
                 browse_generation,
-            } => self.handle_remote_paths_failed(
-                message,
-                terminal_bootstrap_command,
-                browse_generation,
-            ),
+                connection_generation,
+            } if self.generations.accepts_connection(connection_generation) => self
+                .handle_remote_paths_failed(message, terminal_bootstrap_command, browse_generation),
             WorkerEvent::TileLoaded {
                 tile_id,
                 plane,
@@ -1983,7 +2055,10 @@ impl ViewerApp {
             WorkerEvent::AuthenticationStarted { .. }
             | WorkerEvent::AuthenticationSucceeded { .. }
             | WorkerEvent::AuthenticationFailed { .. }
+            | WorkerEvent::Opened { .. }
             | WorkerEvent::OpenFailed { .. }
+            | WorkerEvent::RemotePaths { .. }
+            | WorkerEvent::RemotePathsFailed { .. }
             | WorkerEvent::TileLoaded { .. }
             | WorkerEvent::ViewFinished { .. }
             | WorkerEvent::ViewFailed { .. } => {}
@@ -3005,6 +3080,7 @@ mod tests {
                     message: source_generation.to_string(),
                     terminal_bootstrap_command: None,
                     source_generation: u64::try_from(source_generation).expect("generation"),
+                    connection_generation: 0,
                 })
                 .expect("event channel capacity");
         }
@@ -3014,6 +3090,7 @@ mod tests {
                 message: String::from("next"),
                 terminal_bootstrap_command: None,
                 source_generation: 0,
+                connection_generation: 0,
             })
             .expect("event channel capacity");
         assert_eq!(take_worker_event_batch(&events).len(), 1);

@@ -1,23 +1,22 @@
 use std::io;
-use std::sync::Mutex;
 
 use czi_core::{RandomAccessSource, SourceError, SourceInfo};
 
 use crate::{
     OpenSshConfig, SftpAttributes, SftpError, SftpLocation, SftpProtocolError, SftpSession,
-    SshProfile,
+    SharedSftpSession, SshProfile,
 };
 
-/// A read-only, mutex-serialized random-access source served by SFTP v3.
+/// A read-only random-access source served by a shared, serialized SFTP v3 session.
 ///
 /// The source captures its canonical path, length, and modification time at open. It never
 /// reconnects after a failed protocol operation.
 pub struct SftpSource {
     canonical_path: SftpLocation,
     attributes: SftpAttributes,
-    handle: Vec<u8>,
+    handle: Option<Vec<u8>>,
     info: SourceInfo,
-    session: Mutex<SftpSession>,
+    session: SharedSftpSession,
 }
 
 impl SftpSource {
@@ -34,13 +33,12 @@ impl SftpSource {
         location: &SftpLocation,
         config: &OpenSshConfig,
     ) -> Result<Self, SftpError> {
-        Self::open_session(SftpSession::connect_preferred(profile, config)?, location)
+        Self::open_with_session(SftpSession::connect_preferred(profile, config)?, location)
     }
 
     /// Open a read-only source from an already authenticated strict SFTP session.
     ///
-    /// This consumes the session so a worker can retain one interactive bridge session while
-    /// browsing, then transfer it to the selected CZI source without opening a second channel.
+    /// This wraps the session in a shared owner for source-only callers.
     ///
     /// # Errors
     ///
@@ -49,28 +47,44 @@ impl SftpSource {
         session: SftpSession,
         location: &SftpLocation,
     ) -> Result<Self, SftpError> {
-        Self::open_session(session, location)
+        Self::open_with_shared_session(SharedSftpSession::new(session), location)
     }
 
-    fn open_session(mut session: SftpSession, location: &SftpLocation) -> Result<Self, SftpError> {
-        let canonical_path = session.realpath(location)?;
-        let handle = session.open_read(&canonical_path)?;
-        let attributes = match session.fstat(&handle) {
-            Ok(attributes) => attributes,
-            Err(error) => {
-                let _ = session.close(&handle);
-                return Err(error);
-            }
-        };
-        let size = attributes
-            .size
-            .ok_or(SftpProtocolError::MissingRequiredAttribute { attribute: "size" })?;
-        let mtime = attributes
-            .access_modify_time
-            .ok_or(SftpProtocolError::MissingRequiredAttribute {
-                attribute: "modification time",
-            })?
-            .1;
+    /// Open a read-only source using an existing shared authenticated SFTP session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if path resolution, read-only open, or FSTAT fails.
+    pub fn open_with_shared_session(
+        session: SharedSftpSession,
+        location: &SftpLocation,
+    ) -> Result<Self, SftpError> {
+        let (canonical_path, handle, attributes, size, mtime) =
+            session.with_session(|session| {
+                let canonical_path = session.realpath(location)?;
+                let handle = session.open_read(&canonical_path)?;
+                let attributes = match session.fstat(&handle) {
+                    Ok(attributes) => attributes,
+                    Err(error) => {
+                        let _ = session.close(&handle);
+                        return Err(error);
+                    }
+                };
+                let Some(size) = attributes.size else {
+                    let _ = session.close(&handle);
+                    return Err(
+                        SftpProtocolError::MissingRequiredAttribute { attribute: "size" }.into(),
+                    );
+                };
+                let Some((_, mtime)) = attributes.access_modify_time else {
+                    let _ = session.close(&handle);
+                    return Err(SftpProtocolError::MissingRequiredAttribute {
+                        attribute: "modification time",
+                    }
+                    .into());
+                };
+                Ok((canonical_path, handle, attributes, size, mtime))
+            })?;
         let info = SourceInfo {
             length: size,
             version: source_version(&canonical_path, size, mtime),
@@ -78,35 +92,40 @@ impl SftpSource {
         Ok(Self {
             canonical_path,
             attributes,
-            handle,
+            handle: Some(handle),
             info,
-            session: Mutex::new(session),
+            session,
         })
     }
 
     /// Return the canonical path received from REALPATH.
+    #[must_use]
     pub fn canonical_path(&self) -> &SftpLocation {
         &self.canonical_path
     }
 
     /// Return the v3 FSTAT attributes captured when the source was opened.
+    #[must_use]
     pub fn attributes(&self) -> &SftpAttributes {
         &self.attributes
     }
 
     /// Close the remote SFTP file handle before dropping this source.
     ///
-    /// This is the graceful close path. Dropping a source instead terminates and reaps the
-    /// OpenSSH child without blocking on remote protocol I/O.
+    /// This is the graceful close path. Drop tries to close without waiting for a concurrent
+    /// browser/read operation; the final shared-session owner then reaps the OpenSSH child.
     ///
     /// # Errors
     ///
     /// Returns an error if the SFTP server does not acknowledge `CLOSE`.
     pub fn close(mut self) -> Result<(), SftpError> {
-        self.session
-            .get_mut()
-            .map_err(|_| SftpError::SessionPoisoned)?
-            .close(&self.handle)
+        let handle = self.handle.take().ok_or_else(|| {
+            SftpError::io(
+                "close SFTP source",
+                io::Error::other("SFTP source file handle is already closed"),
+            )
+        })?;
+        self.session.with_session(|session| session.close(&handle))
     }
 }
 
@@ -120,12 +139,24 @@ impl RandomAccessSource for SftpSource {
         if dst.is_empty() {
             return Ok(());
         }
-        let mut session = self.session.lock().map_err(|_| {
-            SourceError::Io(io::Error::other("SFTP source session lock was poisoned"))
-        })?;
-        session
-            .read_exact_at(&self.handle, offset, dst)
+        let handle = self
+            .handle
+            .as_deref()
+            .ok_or_else(|| SourceError::Io(io::Error::other("SFTP source is closed")))?;
+        self.session
+            .with_session(|session| session.read_exact_at(handle, offset, dst))
             .map_err(|error| SourceError::Io(error.into_source_io()))
+    }
+}
+
+impl Drop for SftpSource {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let _ = self
+            .session
+            .try_with_session(|session| session.close(&handle));
     }
 }
 
@@ -178,7 +209,7 @@ impl SftpSource {
         session: SftpSession,
         location: &SftpLocation,
     ) -> Result<Self, SftpError> {
-        Self::open_session(session, location)
+        Self::open_with_shared_session(SharedSftpSession::new(session), location)
     }
 
     pub(crate) fn test_source_version(path: &SftpLocation, size: u64, mtime: u32) -> u64 {
