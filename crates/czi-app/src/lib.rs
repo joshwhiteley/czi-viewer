@@ -579,6 +579,14 @@ struct ViewRequest {
     resident_tile_ids: Vec<TileId>,
 }
 
+type ViewRequestKey = (PlaneKey, SpatialRect, u64);
+
+enum ViewSubmission {
+    Sent,
+    Pending(ViewRequest),
+    Unavailable(String),
+}
+
 enum WorkerCommand {
     Open {
         locator: DatasetLocator,
@@ -847,6 +855,13 @@ impl DatasetWorker {
             .map_err(|error| format!("dataset worker command queue is unavailable: {error}"))
     }
 
+    fn try_send_view(&self, request: ViewRequest) -> ViewSubmission {
+        let Some(commands) = self.commands.as_ref() else {
+            return ViewSubmission::Unavailable(String::from("dataset worker is shut down"));
+        };
+        enqueue_view(commands, request)
+    }
+
     fn shutdown(&mut self) {
         if self.join.is_none() {
             return;
@@ -860,6 +875,50 @@ impl DatasetWorker {
         drop(commands);
         if let Some(join) = self.join.take() {
             let _ = join.join();
+        }
+    }
+}
+
+fn enqueue_view(commands: &SyncSender<WorkerCommand>, request: ViewRequest) -> ViewSubmission {
+    match commands.try_send(WorkerCommand::View(request)) {
+        Ok(()) => ViewSubmission::Sent,
+        Err(mpsc::TrySendError::Full(WorkerCommand::View(request))) => {
+            ViewSubmission::Pending(request)
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => {
+            ViewSubmission::Unavailable(String::from("dataset worker is shut down"))
+        }
+        Err(mpsc::TrySendError::Full(_)) => {
+            ViewSubmission::Unavailable(String::from("dataset worker command queue is unavailable"))
+        }
+    }
+}
+
+fn replace_pending_view(
+    pending_view: &mut Option<(ViewRequest, ViewRequestKey)>,
+    request: ViewRequest,
+    key: ViewRequestKey,
+) {
+    *pending_view = Some((request, key));
+}
+
+fn record_view_submission(
+    pending_view: &mut Option<(ViewRequest, ViewRequestKey)>,
+    submission: ViewSubmission,
+    key: ViewRequestKey,
+) -> Result<(), String> {
+    match submission {
+        ViewSubmission::Sent => {
+            *pending_view = None;
+            Ok(())
+        }
+        ViewSubmission::Pending(request) => {
+            replace_pending_view(pending_view, request, key);
+            Ok(())
+        }
+        ViewSubmission::Unavailable(error) => {
+            *pending_view = None;
+            Err(error)
         }
     }
 }
@@ -1925,7 +1984,8 @@ pub struct ViewerApp {
     levels: Levels,
     camera: Camera,
     fit_pending: bool,
-    last_request: Option<(PlaneKey, SpatialRect, u64)>,
+    last_request: Option<ViewRequestKey>,
+    pending_view: Option<(ViewRequest, ViewRequestKey)>,
     pending_open: Option<(DatasetLocator, u64)>,
     embedded_authentication: Option<EmbeddedAuthentication>,
     retired_consoles: Vec<ConsolePump>,
@@ -1968,6 +2028,7 @@ impl ViewerApp {
             camera: Camera::default(),
             fit_pending: false,
             last_request: None,
+            pending_view: None,
             pending_open: None,
             embedded_authentication: None,
             retired_consoles: Vec::new(),
@@ -1980,10 +2041,15 @@ impl ViewerApp {
 
     fn invalidate_view(&mut self) {
         self.generations.begin_view();
-        self.last_request = None;
+        self.clear_pending_view();
         self.visible_tile_ids.clear();
         self.selected_scale = None;
         self.cache.clear_visibility();
+    }
+
+    fn clear_pending_view(&mut self) {
+        self.last_request = None;
+        self.pending_view = None;
     }
 
     fn open_local_path(&mut self) {
@@ -2024,7 +2090,7 @@ impl ViewerApp {
         self.pending_tiles.clear();
         self.visible_tile_ids.clear();
         self.selected_scale = None;
-        self.last_request = None;
+        self.clear_pending_view();
         self.fit_pending = false;
         if let Err(error) = self.worker.send(WorkerCommand::ClearDataset) {
             self.status = Status::error(error);
@@ -2136,7 +2202,7 @@ impl ViewerApp {
         self.pending_tiles.clear();
         self.visible_tile_ids.clear();
         self.selected_scale = None;
-        self.last_request = None;
+        self.clear_pending_view();
         self.fit_pending = false;
         self.status = Status::normal(format!("Opening {source_label}…"));
         let pending = (locator.clone(), source_generation);
@@ -2274,15 +2340,28 @@ impl ViewerApp {
             target_downsample,
             resident_tile_ids,
         };
-        if let Err(error) = self.worker.send(WorkerCommand::View(request)) {
+        self.last_request = Some(request_key);
+        if let Err(error) = record_view_submission(
+            &mut self.pending_view,
+            self.worker.try_send_view(request),
+            request_key,
+        ) {
+            self.last_request = None;
             self.status = Status::error(error);
-        } else {
-            self.last_request = Some(request_key);
-            if let Some(info) = self.dataset.as_ref()
-                && info.plane(plane).is_none()
-            {
-                self.status = Status::error("The selected sparse plane has no indexed geometry.");
-            }
+        }
+    }
+
+    fn flush_pending_view(&mut self) {
+        let Some((request, key)) = self.pending_view.take() else {
+            return;
+        };
+        if let Err(error) = record_view_submission(
+            &mut self.pending_view,
+            self.worker.try_send_view(request),
+            key,
+        ) {
+            self.last_request = None;
+            self.status = Status::error(error);
         }
     }
 
@@ -3265,6 +3344,7 @@ impl eframe::App for ViewerApp {
         self.handle_worker_events();
         self.poll_embedded_authentication(context);
         self.retry_pending_open();
+        self.flush_pending_view();
 
         egui::TopBottomPanel::top("top_toolbar_v2")
             .exact_height(40.0)
@@ -3709,6 +3789,58 @@ mod tests {
                 .view_generation,
             2
         );
+    }
+
+    #[test]
+    fn saturated_view_queue_keeps_only_the_latest_pending_view_without_an_error() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender
+            .send(WorkerCommand::View(test_view_request(1)))
+            .expect("saturate command queue");
+        let mut second = test_view_request(2);
+        second.viewport = SpatialRect::new(2, 0, 3, 1).expect("second viewport");
+        let mut third = test_view_request(3);
+        third.viewport = SpatialRect::new(3, 0, 4, 1).expect("third viewport");
+        let key = |request: &ViewRequest| {
+            (
+                request.plane.key(),
+                request.viewport,
+                request.target_downsample.to_bits(),
+            )
+        };
+        let mut pending = None;
+        let second_key = key(&second);
+        assert!(
+            record_view_submission(&mut pending, enqueue_view(&sender, second), second_key,)
+                .is_ok()
+        );
+        assert_eq!(
+            pending.as_ref().map(|(request, _)| request.view_generation),
+            Some(2)
+        );
+        let third_key = key(&third);
+
+        assert!(matches!(
+            receiver.recv().expect("queued first view"),
+            WorkerCommand::View(ViewRequest {
+                view_generation: 1,
+                ..
+            })
+        ));
+        assert!(
+            record_view_submission(&mut pending, enqueue_view(&sender, third), third_key,).is_ok()
+        );
+        assert!(
+            pending.is_none(),
+            "a submitted newest view clears stale pending work"
+        );
+        assert!(matches!(
+            receiver.recv().expect("latest view eventually submits"),
+            WorkerCommand::View(ViewRequest {
+                view_generation: 3,
+                ..
+            })
+        ));
     }
 
     #[test]
