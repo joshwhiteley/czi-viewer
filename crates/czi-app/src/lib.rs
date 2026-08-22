@@ -9,6 +9,7 @@ mod bridge;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -18,8 +19,8 @@ use czi_core::{
     SpatialRect, TileHit, TileId, TileIndex, TileQueryIndex, ViewQuery,
 };
 use czi_ssh::{
-    BridgeCancellation, ControlPath, OpenSshConfig, RemoteDirEntry, SftpLocation, SftpSession,
-    SftpSource, SshProfile,
+    BridgeCancellation, ControlPath, EmbeddedSshCancellation, OpenSshConfig, RemoteDirEntry,
+    SftpLocation, SftpSession, SftpSource, SshConsole, SshProfile,
 };
 use eframe::egui;
 
@@ -120,6 +121,48 @@ impl DatasetLocator {
 struct OpenFailure {
     message: String,
     terminal_bootstrap_command: Option<String>,
+}
+
+#[derive(Clone)]
+struct EmbeddedCancellationSlot {
+    inner: Arc<Mutex<Option<(u64, EmbeddedSshCancellation)>>>,
+}
+
+impl EmbeddedCancellationSlot {
+    fn replace(&self, generation: u64, cancellation: EmbeddedSshCancellation) {
+        if let Ok(mut current) = self.inner.lock() {
+            *current = Some((generation, cancellation));
+        }
+    }
+
+    fn clear(&self, generation: u64) {
+        if let Ok(mut current) = self.inner.lock()
+            && current
+                .as_ref()
+                .is_some_and(|(current_generation, _)| *current_generation == generation)
+        {
+            *current = None;
+        }
+    }
+
+    fn cancel(&self) {
+        let cancellation = self.inner.lock().ok().and_then(|current| {
+            current
+                .as_ref()
+                .map(|(_, cancellation)| cancellation.clone())
+        });
+        if let Some(cancellation) = cancellation {
+            let _ = cancellation.cancel();
+        }
+    }
+}
+
+impl Default for EmbeddedCancellationSlot {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
 fn validation_failure(error: impl std::fmt::Display) -> OpenFailure {
@@ -364,6 +407,7 @@ struct Generations {
     source: u64,
     view: u64,
     browse: u64,
+    connection: u64,
 }
 
 impl Generations {
@@ -394,6 +438,15 @@ impl Generations {
     fn accepts_browse(&self, browse: u64) -> bool {
         browse == self.browse
     }
+
+    fn begin_connection(&mut self) -> u64 {
+        self.connection = self.connection.wrapping_add(1);
+        self.connection
+    }
+
+    fn accepts_connection(&self, connection: u64) -> bool {
+        connection == self.connection
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -410,6 +463,8 @@ enum WorkerCommand {
     Open {
         locator: DatasetLocator,
         source_generation: u64,
+        connection_generation: u64,
+        connection_mode: RemoteConnectionMode,
     },
     Browse {
         profile: String,
@@ -417,10 +472,18 @@ enum WorkerCommand {
         home: bool,
         config: OpenSshConfig,
         browse_generation: u64,
+        connection_generation: u64,
+        connection_mode: RemoteConnectionMode,
     },
     ClearBrowse,
     View(ViewRequest),
     Shutdown,
+}
+
+#[derive(Clone, Copy)]
+enum RemoteConnectionMode {
+    Embedded,
+    TerminalBridge,
 }
 
 enum WorkerEvent {
@@ -432,6 +495,19 @@ enum WorkerEvent {
         message: String,
         terminal_bootstrap_command: Option<String>,
         source_generation: u64,
+    },
+    AuthenticationStarted {
+        profile: String,
+        console: SshConsole,
+        cancellation: EmbeddedSshCancellation,
+        connection_generation: u64,
+    },
+    AuthenticationSucceeded {
+        connection_generation: u64,
+    },
+    AuthenticationFailed {
+        message: String,
+        connection_generation: u64,
     },
     RemotePaths {
         directory: String,
@@ -479,10 +555,19 @@ struct WorkerBrowseSession {
     session: SftpSession,
 }
 
+struct EmbeddedConnectionContext<'a> {
+    bridge_cancellation: &'a BridgeCancellation,
+    cancellation: &'a EmbeddedCancellationSlot,
+    events: &'a SyncSender<WorkerEvent>,
+    generation: u64,
+    mode: RemoteConnectionMode,
+}
+
 struct DatasetWorker {
     commands: SyncSender<WorkerCommand>,
     events: Receiver<WorkerEvent>,
     bridge_cancellation: BridgeCancellation,
+    embedded_cancellation: EmbeddedCancellationSlot,
     join: Option<JoinHandle<()>>,
 }
 
@@ -492,14 +577,24 @@ impl DatasetWorker {
         let (event_tx, events) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let bridge_cancellation = BridgeCancellation::default();
         let worker_cancellation = bridge_cancellation.clone();
+        let embedded_cancellation = EmbeddedCancellationSlot::default();
+        let worker_embedded_cancellation = embedded_cancellation.clone();
         let join = thread::Builder::new()
             .name(String::from("czi-dataset-worker"))
-            .spawn(move || worker_loop(&command_rx, &event_tx, &worker_cancellation))
+            .spawn(move || {
+                worker_loop(
+                    &command_rx,
+                    &event_tx,
+                    &worker_cancellation,
+                    &worker_embedded_cancellation,
+                );
+            })
             .expect("start CZI dataset worker");
         Self {
             commands,
             events,
             bridge_cancellation,
+            embedded_cancellation,
             join: Some(join),
         }
     }
@@ -515,6 +610,7 @@ impl DatasetWorker {
             return;
         }
         self.bridge_cancellation.cancel();
+        self.embedded_cancellation.cancel();
         let mut sent = self.commands.try_send(WorkerCommand::Shutdown).is_ok();
         while self.events.try_recv().is_ok() {}
         if !sent {
@@ -539,6 +635,7 @@ fn worker_loop(
     commands: &Receiver<WorkerCommand>,
     events: &SyncSender<WorkerEvent>,
     bridge_cancellation: &BridgeCancellation,
+    embedded_cancellation: &EmbeddedCancellationSlot,
 ) {
     let mut dataset = None;
     let mut browse_session = None;
@@ -556,11 +653,20 @@ fn worker_loop(
             WorkerCommand::Open {
                 locator,
                 source_generation,
+                connection_generation,
+                connection_mode,
             } => {
                 active_source_generation = source_generation;
+                let connection = EmbeddedConnectionContext {
+                    bridge_cancellation,
+                    cancellation: embedded_cancellation,
+                    events,
+                    generation: connection_generation,
+                    mode: connection_mode,
+                };
                 let (next_dataset, sent) = send_open_result(
                     events,
-                    open_dataset(locator, &mut browse_session, bridge_cancellation),
+                    open_dataset(locator, &mut browse_session, &connection),
                     source_generation,
                 );
                 if !sent {
@@ -574,20 +680,32 @@ fn worker_loop(
                 home,
                 config,
                 browse_generation,
+                connection_generation,
+                connection_mode,
             } => {
+                let connection = EmbeddedConnectionContext {
+                    bridge_cancellation,
+                    cancellation: embedded_cancellation,
+                    events,
+                    generation: connection_generation,
+                    mode: connection_mode,
+                };
                 let result = browse_remote_paths(
                     &profile,
                     &path,
                     home,
                     &config,
                     &mut browse_session,
-                    bridge_cancellation,
+                    &connection,
                 );
                 if !send_remote_browse_result(events, result, browse_generation) {
                     break;
                 }
             }
-            WorkerCommand::ClearBrowse => browse_session = None,
+            WorkerCommand::ClearBrowse => {
+                browse_session = None;
+                embedded_cancellation.cancel();
+            }
             WorkerCommand::View(request) => {
                 if request.source_generation != active_source_generation {
                     if events
@@ -686,7 +804,7 @@ fn browse_remote_paths(
     home: bool,
     config: &OpenSshConfig,
     browse_session: &mut Option<WorkerBrowseSession>,
-    bridge_cancellation: &BridgeCancellation,
+    connection: &EmbeddedConnectionContext<'_>,
 ) -> Result<RemoteBrowseResult, OpenFailure> {
     let profile = SshProfile::new(profile.to_owned()).map_err(validation_failure)?;
     let target = remote_browse_target(path, home).map_err(validation_failure)?;
@@ -701,9 +819,8 @@ fn browse_remote_paths(
         .is_some_and(|existing| existing.profile == profile.as_str() && existing.config == *config);
     if !matches_existing {
         *browse_session = None;
-        let session =
-            SftpSession::connect_preferred_with_cancellation(&profile, config, bridge_cancellation)
-                .map_err(|error| remote_failure(profile.as_str(), config, error))?;
+        let session = connect_embedded(&profile, config, connection)
+            .map_err(|error| remote_failure(profile.as_str(), config, error))?;
         *browse_session = Some(WorkerBrowseSession {
             profile: profile.as_str().to_owned(),
             config: config.clone(),
@@ -757,7 +874,7 @@ fn browse_with_session(
 fn open_dataset(
     locator: DatasetLocator,
     browse_session: &mut Option<WorkerBrowseSession>,
-    bridge_cancellation: &BridgeCancellation,
+    connection: &EmbeddedConnectionContext<'_>,
 ) -> Result<(CziDataset, TileQueryIndex, DatasetInfo), OpenFailure> {
     match locator {
         DatasetLocator::Local(path) => {
@@ -790,18 +907,88 @@ fn open_dataset(
                 SftpSource::open_with_session(session, &location)
             } else {
                 *browse_session = None;
-                SftpSession::connect_preferred_with_cancellation(
-                    &profile,
-                    config,
-                    bridge_cancellation,
-                )
-                .and_then(|session| SftpSource::open_with_session(session, &location))
+                connect_embedded(&profile, config, connection)
+                    .and_then(|session| SftpSource::open_with_session(session, &location))
             }
             .map_err(|error| remote.open_failure(error))?;
             let cache =
                 BlockCache::with_defaults(source).map_err(|error| remote.open_failure(error))?;
             let opened = CziDataset::open(cache).map_err(|error| remote.open_failure(error))?;
             finish_open(source_label, opened).map_err(|error| remote.open_failure(error))
+        }
+    }
+}
+
+fn connect_embedded(
+    profile: &SshProfile,
+    config: &OpenSshConfig,
+    connection: &EmbeddedConnectionContext<'_>,
+) -> Result<SftpSession, czi_ssh::SftpError> {
+    if matches!(connection.mode, RemoteConnectionMode::TerminalBridge) {
+        return SftpSession::connect_preferred_with_cancellation(
+            profile,
+            config,
+            connection.bridge_cancellation,
+        );
+    }
+    let (pending, console) = match SftpSession::start_embedded(profile, config) {
+        Ok(connection) => connection,
+        Err(error) => {
+            let _ = connection.events.send(WorkerEvent::AuthenticationFailed {
+                message: sanitize_error(&error),
+                connection_generation: connection.generation,
+            });
+            return Err(error);
+        }
+    };
+    let cancellation = pending.cancellation();
+    connection
+        .cancellation
+        .replace(connection.generation, cancellation.clone());
+    if connection
+        .events
+        .send(WorkerEvent::AuthenticationStarted {
+            profile: profile.as_str().to_owned(),
+            console,
+            cancellation,
+            connection_generation: connection.generation,
+        })
+        .is_err()
+    {
+        connection.cancellation.cancel();
+        return Err(czi_ssh::SftpError::Spawn {
+            source: std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "viewer event receiver closed",
+            ),
+        });
+    }
+    match pending.initialize() {
+        Ok(session) => {
+            if connection
+                .events
+                .send(WorkerEvent::AuthenticationSucceeded {
+                    connection_generation: connection.generation,
+                })
+                .is_err()
+            {
+                connection.cancellation.cancel();
+                return Err(czi_ssh::SftpError::Spawn {
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "viewer event receiver closed",
+                    ),
+                });
+            }
+            Ok(session)
+        }
+        Err(error) => {
+            connection.cancellation.clear(connection.generation);
+            let _ = connection.events.send(WorkerEvent::AuthenticationFailed {
+                message: sanitize_error(&error),
+                connection_generation: connection.generation,
+            });
+            Err(error)
         }
     }
 }
@@ -1309,6 +1496,21 @@ struct PendingTile {
     view_generation: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthenticationStatus {
+    Connecting,
+    Authenticated,
+    Failed,
+}
+
+struct EmbeddedAuthentication {
+    profile: String,
+    console: SshConsole,
+    cancellation: EmbeddedSshCancellation,
+    generation: u64,
+    status: AuthenticationStatus,
+}
+
 /// The local and SSH CZI mosaic viewer.
 pub struct ViewerApp {
     worker: DatasetWorker,
@@ -1334,6 +1536,8 @@ pub struct ViewerApp {
     last_request: Option<(PlaneKey, SpatialRect, u64)>,
     pending_open: Option<(DatasetLocator, u64)>,
     terminal_bootstrap_command: Option<String>,
+    embedded_authentication: Option<EmbeddedAuthentication>,
+    use_terminal_fallback: bool,
 }
 
 impl ViewerApp {
@@ -1367,6 +1571,8 @@ impl ViewerApp {
             last_request: None,
             pending_open: None,
             terminal_bootstrap_command: None,
+            embedded_authentication: None,
+            use_terminal_fallback: false,
         };
         if initial_path.is_some() {
             app.open_local_path();
@@ -1383,6 +1589,7 @@ impl ViewerApp {
     }
 
     fn open_local_path(&mut self) {
+        self.cancel_authentication_if_connecting();
         let path = PathBuf::from(self.path_input.trim());
         if self.path_input.trim().is_empty() {
             self.status = Status::error("Enter a local .czi path first.");
@@ -1416,13 +1623,19 @@ impl ViewerApp {
         Ok(config)
     }
 
-    fn invalidate_remote_browse(&mut self) {
+    fn invalidate_remote_browse(&mut self, profile_changed: bool) {
         self.generations.begin_browse();
         self.remote_browse_directory = None;
         self.remote_suggestions.clear();
         self.remote_browse_pending = false;
         self.terminal_bootstrap_command = None;
-        let _ = self.worker.send(WorkerCommand::ClearBrowse);
+        if profile_changed {
+            self.cancel_authentication_if_connecting();
+            self.embedded_authentication = None;
+            self.generations.begin_connection();
+            self.use_terminal_fallback = false;
+            let _ = self.worker.send(WorkerCommand::ClearBrowse);
+        }
     }
 
     fn browse_remote_path(&mut self, home: bool) {
@@ -1443,12 +1656,16 @@ impl ViewerApp {
         } else {
             String::from("Listing remote paths…")
         });
+        let connection_generation = self.prepare_remote_connection();
+        let connection_mode = self.remote_connection_mode();
         if let Err(error) = self.worker.send(WorkerCommand::Browse {
             profile: self.ssh_profile_input.trim().to_owned(),
             path: self.remote_path_input.trim().to_owned(),
             home,
             config,
             browse_generation,
+            connection_generation,
+            connection_mode,
         }) {
             self.remote_browse_pending = false;
             self.status = Status::error(error);
@@ -1472,6 +1689,14 @@ impl ViewerApp {
     }
 
     fn open_locator(&mut self, locator: DatasetLocator) {
+        let connection_generation = match &locator {
+            DatasetLocator::Remote { .. } => self.prepare_remote_connection(),
+            DatasetLocator::Local(_) => self.generations.connection,
+        };
+        let connection_mode = match &locator {
+            DatasetLocator::Remote { .. } => self.remote_connection_mode(),
+            DatasetLocator::Local(_) => RemoteConnectionMode::Embedded,
+        };
         let source_label = locator.display_label();
         let source_generation = self.generations.begin_source();
         self.dataset = None;
@@ -1487,6 +1712,8 @@ impl ViewerApp {
         if let Err(error) = self.worker.send(WorkerCommand::Open {
             locator,
             source_generation,
+            connection_generation,
+            connection_mode,
         }) {
             self.pending_open = Some(pending);
             self.status = Status::error(error);
@@ -1499,12 +1726,74 @@ impl ViewerApp {
         let Some((locator, source_generation)) = self.pending_open.take() else {
             return;
         };
+        let connection_generation = match &locator {
+            DatasetLocator::Remote { .. } => self.prepare_remote_connection(),
+            DatasetLocator::Local(_) => self.generations.connection,
+        };
+        let connection_mode = match &locator {
+            DatasetLocator::Remote { .. } => self.remote_connection_mode(),
+            DatasetLocator::Local(_) => RemoteConnectionMode::Embedded,
+        };
         if let Err(error) = self.worker.send(WorkerCommand::Open {
             locator: locator.clone(),
             source_generation,
+            connection_generation,
+            connection_mode,
         }) {
             self.pending_open = Some((locator, source_generation));
             self.status = Status::error(error);
+        }
+    }
+
+    fn prepare_remote_connection(&mut self) -> u64 {
+        let profile = self.ssh_profile_input.trim();
+        let reuse = self
+            .embedded_authentication
+            .as_ref()
+            .is_some_and(|authentication| {
+                authentication.profile == profile
+                    && authentication.status != AuthenticationStatus::Failed
+            });
+        if !reuse {
+            self.cancel_authentication_if_connecting();
+            self.embedded_authentication = None;
+            self.generations.begin_connection();
+        }
+        self.generations.connection
+    }
+
+    fn cancel_authentication_if_connecting(&mut self) {
+        let connecting = self
+            .embedded_authentication
+            .as_ref()
+            .is_none_or(|authentication| authentication.status == AuthenticationStatus::Connecting);
+        if connecting {
+            self.worker.embedded_cancellation.cancel();
+            if let Some(authentication) = &self.embedded_authentication {
+                let _ = authentication.cancellation.cancel();
+            }
+        }
+    }
+
+    fn cancel_embedded_authentication(&mut self) {
+        self.cancel_authentication_if_connecting();
+        self.generations.begin_connection();
+        self.embedded_authentication = None;
+        self.status = Status::normal("SSH authentication cancelled.");
+    }
+
+    fn reconnect_remote(&mut self) {
+        self.cancel_authentication_if_connecting();
+        self.embedded_authentication = None;
+        self.generations.begin_connection();
+        self.open_remote_path();
+    }
+
+    fn remote_connection_mode(&self) -> RemoteConnectionMode {
+        if self.use_terminal_fallback {
+            RemoteConnectionMode::TerminalBridge
+        } else {
+            RemoteConnectionMode::Embedded
         }
     }
 
@@ -1561,8 +1850,46 @@ impl ViewerApp {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_worker_event(&mut self, event: WorkerEvent) {
         match event {
+            WorkerEvent::AuthenticationStarted {
+                profile,
+                console,
+                cancellation,
+                connection_generation,
+            } if self.generations.accepts_connection(connection_generation) => {
+                self.embedded_authentication = Some(EmbeddedAuthentication {
+                    profile,
+                    console,
+                    cancellation,
+                    generation: connection_generation,
+                    status: AuthenticationStatus::Connecting,
+                });
+                self.status = Status::normal("SSH authentication is waiting for terminal input.");
+            }
+            WorkerEvent::AuthenticationSucceeded {
+                connection_generation,
+            } if self.generations.accepts_connection(connection_generation) => {
+                if let Some(authentication) = self.embedded_authentication.as_mut()
+                    && authentication.generation == connection_generation
+                {
+                    authentication.status = AuthenticationStatus::Authenticated;
+                    self.status =
+                        Status::normal("SSH authentication succeeded; opening SFTP session.");
+                }
+            }
+            WorkerEvent::AuthenticationFailed {
+                message,
+                connection_generation,
+            } if self.generations.accepts_connection(connection_generation) => {
+                if let Some(authentication) = self.embedded_authentication.as_mut()
+                    && authentication.generation == connection_generation
+                {
+                    authentication.status = AuthenticationStatus::Failed;
+                }
+                self.status = Status::error(message);
+            }
             WorkerEvent::Opened {
                 info,
                 source_generation,
@@ -1653,7 +1980,10 @@ impl ViewerApp {
             {
                 self.status = Status::error(message);
             }
-            WorkerEvent::OpenFailed { .. }
+            WorkerEvent::AuthenticationStarted { .. }
+            | WorkerEvent::AuthenticationSucceeded { .. }
+            | WorkerEvent::AuthenticationFailed { .. }
+            | WorkerEvent::OpenFailed { .. }
             | WorkerEvent::TileLoaded { .. }
             | WorkerEvent::ViewFinished { .. }
             | WorkerEvent::ViewFailed { .. } => {}
@@ -1762,6 +2092,77 @@ impl ViewerApp {
                 }
                 Err(error) => self.status = Status::error(error),
             }
+        }
+    }
+
+    fn show_embedded_authentication(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        let Some(authentication) = self.embedded_authentication.as_mut() else {
+            return;
+        };
+        let console_id = ui.make_persistent_id(("embedded-ssh-console", authentication.generation));
+        let connecting = authentication.status == AuthenticationStatus::Connecting;
+        let mut console_error = None;
+        if let Err(error) = authentication.console.drain_output() {
+            console_error = Some(sanitize_error(error));
+        }
+        let transcript = authentication.console.transcript().to_owned();
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.strong("SSH authentication console");
+            match authentication.status {
+                AuthenticationStatus::Connecting => {
+                    ui.spinner();
+                    ui.weak("Connecting — click the console to focus it.");
+                }
+                AuthenticationStatus::Authenticated => {
+                    ui.colored_label(egui::Color32::LIGHT_GREEN, "Authenticated");
+                    ui.weak("Input is disabled after SFTP VERSION.");
+                }
+                AuthenticationStatus::Failed => {
+                    ui.colored_label(egui::Color32::LIGHT_RED, "Authentication failed");
+                }
+            }
+        });
+        let response = ui.add_sized(
+            [ui.available_width(), 112.0],
+            egui::Label::new(egui::RichText::new(transcript).monospace())
+                .selectable(false)
+                .sense(egui::Sense::click()),
+        );
+        if response.clicked() && connecting {
+            context.memory_mut(|memory| memory.request_focus(console_id));
+        }
+        if connecting {
+            let focused = context.memory(|memory| memory.has_focus(console_id));
+            ui.weak(if focused {
+                "Console focused. Authentication keys are sent directly and never retained."
+            } else {
+                "Console not focused. Click it before typing authentication input."
+            });
+            if focused {
+                for event in context.input(|input| input.events.clone()) {
+                    let input = match event {
+                        egui::Event::Text(text) => Some(text.into_bytes()),
+                        egui::Event::Key {
+                            key,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } => console_key_input(key, modifiers),
+                        _ => None,
+                    };
+                    if let Some(input) = input
+                        && let Err(error) = authentication.console.write_input(&input)
+                    {
+                        console_error = Some(sanitize_error(error));
+                        break;
+                    }
+                }
+            }
+            context.request_repaint_after(Duration::from_millis(16));
+        }
+        if let Some(error) = console_error {
+            self.status = Status::error(error);
         }
     }
 
@@ -1883,6 +2284,7 @@ impl ViewerApp {
 
 impl Drop for ViewerApp {
     fn drop(&mut self) {
+        self.cancel_authentication_if_connecting();
         self.worker.shutdown();
         if let Some(control_path) = self
             .ssh_config
@@ -1910,6 +2312,37 @@ fn format_scale(scale: PyramidScale) -> String {
     } else {
         format!("{}/{}", scale.numerator, scale.denominator)
     }
+}
+
+fn console_key_input(key: egui::Key, modifiers: egui::Modifiers) -> Option<Vec<u8>> {
+    if modifiers.ctrl {
+        let control = match key {
+            egui::Key::A => 1,
+            egui::Key::C => 3,
+            egui::Key::D => 4,
+            egui::Key::U => 21,
+            egui::Key::W => 23,
+            _ => return None,
+        };
+        return Some(vec![control]);
+    }
+    let sequence = match key {
+        egui::Key::Enter => b"\r".as_slice(),
+        egui::Key::Backspace => b"\x7f".as_slice(),
+        egui::Key::Tab => b"\t".as_slice(),
+        egui::Key::Escape => b"\x1b".as_slice(),
+        egui::Key::ArrowUp => b"\x1b[A".as_slice(),
+        egui::Key::ArrowDown => b"\x1b[B".as_slice(),
+        egui::Key::ArrowRight => b"\x1b[C".as_slice(),
+        egui::Key::ArrowLeft => b"\x1b[D".as_slice(),
+        egui::Key::Home => b"\x1b[H".as_slice(),
+        egui::Key::End => b"\x1b[F".as_slice(),
+        egui::Key::Delete => b"\x1b[3~".as_slice(),
+        egui::Key::PageUp => b"\x1b[5~".as_slice(),
+        egui::Key::PageDown => b"\x1b[6~".as_slice(),
+        _ => return None,
+    };
+    Some(sequence.to_vec())
 }
 
 fn scene_label(scene: SceneId) -> String {
@@ -1941,7 +2374,7 @@ impl eframe::App for ViewerApp {
                 let local_mode = ui.selectable_value(&mut self.open_mode, OpenMode::Local, "Local");
                 ui.selectable_value(&mut self.open_mode, OpenMode::Ssh, "SSH");
                 if local_mode.changed() && self.open_mode == OpenMode::Local {
-                    self.invalidate_remote_browse();
+                    self.invalidate_remote_browse(true);
                 }
             });
             match self.open_mode {
@@ -1975,8 +2408,10 @@ impl eframe::App for ViewerApp {
                                 .hint_text("/absolute/path/image.czi")
                                 .desired_width(360.0),
                         );
-                        if profile_response.changed() || response.changed() {
-                            self.invalidate_remote_browse();
+                        if profile_response.changed() {
+                            self.invalidate_remote_browse(true);
+                        } else if response.changed() {
+                            self.invalidate_remote_browse(false);
                         }
                         if ui.button("Home").clicked() {
                             self.browse_remote_path(true);
@@ -1984,19 +2419,38 @@ impl eframe::App for ViewerApp {
                         if ui.button("Browse").clicked() {
                             self.browse_remote_path(false);
                         }
-                        let connect = ui.button("Connect").clicked()
+                        let authentication_connecting = self
+                            .embedded_authentication
+                            .as_ref()
+                            .is_some_and(|authentication| {
+                                authentication.status == AuthenticationStatus::Connecting
+                            });
+                        let connect = ui
+                            .add_enabled(!authentication_connecting, egui::Button::new("Connect"))
+                            .clicked()
                             || (response.lost_focus()
                                 && ui.input(|input| input.key_pressed(egui::Key::Enter)));
                         if connect {
                             self.open_remote_path();
                         }
-                        if ui.button("Retry").clicked() {
-                            self.open_remote_path();
+                        if ui.button("Reconnect").clicked() {
+                            self.reconnect_remote();
                         }
                     });
                     ui.weak(
-                        "Read-only SFTP range reads · 1 MiB blocks · 256 MiB source cache · GUI connections never prompt.",
+                        "Read-only SFTP range reads · 1 MiB blocks · 256 MiB source cache.",
                     );
+                    self.show_embedded_authentication(ui, context);
+                    if self
+                        .embedded_authentication
+                        .as_ref()
+                        .is_some_and(|authentication| {
+                            authentication.status == AuthenticationStatus::Connecting
+                        })
+                        && ui.button("Cancel authentication").clicked()
+                    {
+                        self.cancel_embedded_authentication();
+                    }
                     if self.remote_browse_pending {
                         ui.horizontal(|ui| {
                             ui.spinner();
@@ -2030,21 +2484,25 @@ impl eframe::App for ViewerApp {
                     }
                     if let Some(command) = &self.terminal_bootstrap_command {
                         ui.separator();
-                        ui.label("SSH needs an interactive SFTP bridge:");
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(command).monospace())
-                                .selectable(true)
-                                .wrap(),
-                        );
-                        if ui.button("Copy command").clicked() {
-                            context.copy_text(command.clone());
+                        if self.use_terminal_fallback {
+                            ui.label("Terminal fallback command:");
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(command).monospace())
+                                    .selectable(true)
+                                    .wrap(),
+                            );
+                            if ui.button("Copy command").clicked() {
+                                context.copy_text(command.clone());
+                            }
+                            ui.weak(
+                                "Run this only as a fallback. Keep Terminal open while the remote file is in use.",
+                            );
+                        } else {
+                            ui.weak("Embedded SSH failed.");
+                            if ui.button("Use Terminal fallback").clicked() {
+                                self.use_terminal_fallback = true;
+                            }
                         }
-                        ui.weak(
-                            "Paste and run this command in Terminal. It waits for Retry, Home, or Browse; finish password, 2FA, or host-key prompts there. Keep Terminal open while the remote file is in use.",
-                        );
-                        ui.weak(
-                            "The private bridge socket accepts one SFTP stream and closes when that stream ends. Closing the viewer removes its local bridge directory. The viewer never writes to the remote host.",
-                        );
                     }
                 }
             }
@@ -2278,6 +2736,46 @@ mod tests {
     }
 
     #[test]
+    fn connection_generations_drop_stale_authentication_events() {
+        let mut generations = Generations::default();
+        let first = generations.begin_connection();
+        assert!(generations.accepts_connection(first));
+        let second = generations.begin_connection();
+        assert!(!generations.accepts_connection(first));
+        assert!(generations.accepts_connection(second));
+    }
+
+    #[test]
+    fn console_control_keys_use_terminal_bytes_without_input_state() {
+        assert_eq!(
+            console_key_input(egui::Key::Enter, egui::Modifiers::default()),
+            Some(vec![b'\r'])
+        );
+        assert_eq!(
+            console_key_input(egui::Key::Backspace, egui::Modifiers::default()),
+            Some(vec![0x7f])
+        );
+        assert_eq!(
+            console_key_input(egui::Key::ArrowUp, egui::Modifiers::default()),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            console_key_input(
+                egui::Key::C,
+                egui::Modifiers {
+                    ctrl: true,
+                    ..Default::default()
+                }
+            ),
+            Some(vec![3])
+        );
+        assert_eq!(
+            console_key_input(egui::Key::F1, egui::Modifiers::default()),
+            None
+        );
+    }
+
+    #[test]
     fn remote_browser_splits_parent_prefix_and_home_targets() {
         assert_eq!(
             remote_browse_target("", false),
@@ -2474,6 +2972,8 @@ mod tests {
                         "/dev/null/czi-viewer-missing-{source_generation}.czi"
                     ))),
                     source_generation,
+                    connection_generation: 0,
+                    connection_mode: RemoteConnectionMode::Embedded,
                 })
                 .expect("bounded command burst");
         }
