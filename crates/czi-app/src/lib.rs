@@ -1785,6 +1785,15 @@ impl Camera {
         self.pan = egui::Vec2::ZERO;
     }
 
+    fn rebase_bounds(&mut self, previous: SpatialRect, next: SpatialRect) {
+        let previous_center = Self::world_center(previous);
+        let next_center = Self::world_center(next);
+        self.pan += egui::vec2(
+            ((next_center.0 - previous_center.0) * self.zoom) as f32,
+            ((next_center.1 - previous_center.1) * self.zoom) as f32,
+        );
+    }
+
     fn one_to_one(&mut self) {
         *self = Self::default();
     }
@@ -2772,12 +2781,26 @@ impl ViewerApp {
                 before_selection.z != self.selection.z,
                 before_selection.t != self.selection.t,
             ];
+            let preserve_channel_fov = selection_change_preserves_fov(changed);
             if let Some(dataset) = self.dataset.as_ref() {
+                let previous_bounds = dataset
+                    .plane(before_selection)
+                    .map(|plane| plane.world_bounds);
                 self.selection = dataset.repair_selection(self.selection, changed);
+                let next_bounds = dataset
+                    .plane(self.selection)
+                    .map(|plane| plane.world_bounds);
+                if preserve_channel_fov {
+                    if let (Some(previous), Some(next)) = (previous_bounds, next_bounds) {
+                        self.camera.rebase_bounds(previous, next);
+                    }
+                }
             }
             self.cache.clear();
             self.invalidate_view();
-            self.fit_pending = true;
+            if !preserve_channel_fov {
+                self.fit_pending = true;
+            }
         }
 
         ui.separator();
@@ -4348,6 +4371,10 @@ impl eframe::App for ViewerApp {
     }
 }
 
+fn selection_change_preserves_fov(changed: [bool; 4]) -> bool {
+    changed == [true, false, false, false]
+}
+
 fn selection_selector(
     ui: &mut egui::Ui,
     label: &str,
@@ -5361,6 +5388,36 @@ mod tests {
         assert!((before.1 - after.1).abs() < 0.001);
         camera.one_to_one();
         assert_eq!(camera, Camera::default());
+    }
+
+    #[test]
+    fn channel_change_preserves_camera_fov_across_plane_bounds() {
+        assert!(selection_change_preserves_fov([true, false, false, false]));
+        assert!(!selection_change_preserves_fov([false, true, false, false]));
+        assert!(!selection_change_preserves_fov([false, false, true, false]));
+        assert!(!selection_change_preserves_fov([false, false, false, true]));
+        assert!(!selection_change_preserves_fov([true, false, true, false]));
+
+        let canvas = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(200.0, 100.0));
+        let previous = SpatialRect::new(-100, -50, 100, 50).unwrap();
+        let next = SpatialRect::new(300, 150, 700, 450).unwrap();
+        let mut camera = Camera {
+            zoom: 3.25,
+            pan: egui::vec2(47.0, -19.0),
+        };
+        let original_camera = camera;
+        let center_before = camera.screen_to_world_xy(canvas.center(), canvas, previous);
+
+        camera.rebase_bounds(previous, next);
+
+        let center_after = camera.screen_to_world_xy(canvas.center(), canvas, next);
+        assert!((center_before.0 - center_after.0).abs() < 0.001);
+        assert!((center_before.1 - center_after.1).abs() < 0.001);
+        assert!((camera.zoom - original_camera.zoom).abs() < f64::EPSILON);
+
+        camera.rebase_bounds(next, previous);
+        assert!((camera.pan.x - original_camera.pan.x).abs() < f32::EPSILON);
+        assert!((camera.pan.y - original_camera.pan.y).abs() < f32::EPSILON);
     }
 
     #[test]
