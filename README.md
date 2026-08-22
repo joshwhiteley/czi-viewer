@@ -2,7 +2,7 @@
 
 A macOS-first, pure-Rust desktop viewer for local and remote ZEISS CZI microscopy images.
 
-The viewer displays tiled and pyramidal CZI mosaics with sparse C/S/Z/T selection, metadata preview, display levels, pan, and zoom. It supports local files and read-only remote files over the system OpenSSH SFTP subsystem. Uncompressed Gray8 and Gray16 pixels are supported; compressed codecs are not yet supported.
+The viewer displays tiled and pyramidal CZI mosaics with sparse C/S/Z/T selection, organized metadata, channel labels, display levels, pan, zoom, scale bars, and annotated PNG snapshots. It supports local files and read-only remote files over the system OpenSSH SFTP subsystem. Uncompressed Gray8 and Gray16 pixels are supported; compressed codecs are not yet supported.
 
 ## Principles
 
@@ -46,6 +46,14 @@ Remote browsing, opening, and range reads use one authenticated, read-only SFTP 
 The viewer resolves home with `REALPATH('.')`, reads only the requested directory, scans at most 4,096 entries, filters unsafe names, and shows at most 200 entries. It lists directories first, then `.czi` files, with type, size, and modification time when the server supplies them. The filename filter is local and does not send another network request. An opened CZI uses a 1 MiB block cache with a 256 MiB budget, and indexes and decodes only the ranges it needs.
 
 Pyramid viewing follows the Deep Zoom/OpenSeadragon model: it requests the finest available level that is not undersampled, retains the prior coarser level until the requested level is complete, and warms a clamped 12% border around the viewport for the next pan.
+
+## Inspect, annotate, and export
+
+The left **Dataset** panel has **Display** and **Metadata** tabs. Display names each C channel from CZI metadata when available. Metadata provides a searchable, lazy tree of ordered XML elements, values, and attributes. It retains unknown elements and reports malformed or bounded metadata as diagnostics without blocking image opening. The optional **Raw XML** disclosure is retained only when it fits the 2 MiB metadata raw-XML limit.
+
+The compact strip above the canvas identifies the source file, Scene, named Channel, Z/T, and requested and displayed pyramid scales. The lower-left scale bar uses CZI X/Y physical calibration in micrometers when available; otherwise it reports logical pixels.
+
+Click **Save PNG** in the canvas toolbar to export only the annotated title strip and canvas. Side panels and controls are excluded. The viewer crops the native egui screenshot at the current display scale, then writes and encodes PNG on a background Rust thread. It saves to `~/Desktop` when it exists, otherwise the current working directory. Filenames are sanitized and include a Unix timestamp; collisions receive a numeric suffix.
 
 The viewer does not launch a shell, parse prompts, automate Terminal, prefill commands, use `SSH_ASKPASS`, or retain credentials, passwords, or one-time codes. OpenSSH stdin/stdout carry only binary SFTP packets; authentication output stays on the PTY. Closing the viewer stops its worker sessions. The viewer never writes to the remote host.
 

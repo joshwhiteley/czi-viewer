@@ -450,7 +450,7 @@ struct DatasetInfo {
 impl DatasetInfo {
     fn from_dataset(source_label: String, dataset: &CziDataset, query: &TileQueryIndex) -> Self {
         let tiles = &dataset.index().tiles;
-        let metadata = dataset.index().metadata.as_ref().map_or_else(
+        let mut metadata = dataset.index().metadata.as_ref().map_or_else(
             || MetadataDocument {
                 root: None,
                 diagnostics: vec![czi_core::MetadataDiagnostic {
@@ -467,6 +467,14 @@ impl DatasetInfo {
                     },
                 )
             },
+        );
+        metadata.diagnostics.extend(
+            dataset
+                .index()
+                .metadata_diagnostics
+                .iter()
+                .cloned()
+                .map(|message| czi_core::MetadataDiagnostic { message }),
         );
         let metadata_summary = summarize_metadata(&metadata);
         let pixel_type = tiles
@@ -2117,6 +2125,26 @@ enum InspectorTab {
     Metadata,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SnapshotRegion {
+    rect: egui::Rect,
+    pixels_per_point: f32,
+}
+
+#[derive(Clone, Debug)]
+struct SnapshotRequest {
+    generation: u64,
+    region: SnapshotRegion,
+    armed_frame: u64,
+    region_frozen: bool,
+    filename: String,
+}
+
+enum SnapshotWriteResult {
+    Saved { generation: u64, path: PathBuf },
+    Failed { generation: u64, message: String },
+}
+
 struct EmbeddedAuthentication {
     profile: String,
     console: ConsolePump,
@@ -2173,6 +2201,14 @@ pub struct ViewerApp {
     last_request: Option<ViewRequestKey>,
     pending_view: Option<(ViewRequest, ViewRequestKey)>,
     pending_open: Option<(DatasetLocator, u64)>,
+    snapshot_region: Option<SnapshotRegion>,
+    pending_snapshot: Option<SnapshotRequest>,
+    snapshot_writing: Option<u64>,
+    snapshot_generation: u64,
+    ui_frame: u64,
+    returned_screenshots: Vec<(u64, Arc<egui::ColorImage>)>,
+    snapshot_write_sender: mpsc::Sender<SnapshotWriteResult>,
+    snapshot_write_results: Receiver<SnapshotWriteResult>,
     embedded_authentication: Option<EmbeddedAuthentication>,
     retired_consoles: Vec<ConsolePump>,
 }
@@ -2182,6 +2218,7 @@ impl ViewerApp {
     #[must_use]
     pub fn new(_creation_context: &eframe::CreationContext<'_>) -> Self {
         let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
+        let (snapshot_write_sender, snapshot_write_results) = mpsc::channel();
         let mut app = Self {
             worker: DatasetWorker::spawn(),
             open_mode: OpenMode::Local,
@@ -2218,6 +2255,14 @@ impl ViewerApp {
             last_request: None,
             pending_view: None,
             pending_open: None,
+            snapshot_region: None,
+            pending_snapshot: None,
+            snapshot_writing: None,
+            snapshot_generation: 0,
+            ui_frame: 0,
+            returned_screenshots: Vec::new(),
+            snapshot_write_sender,
+            snapshot_write_results,
             embedded_authentication: None,
             retired_consoles: Vec::new(),
         };
@@ -2559,6 +2604,124 @@ impl ViewerApp {
         ) {
             self.last_request = None;
             self.status = Status::error(error);
+        }
+    }
+
+    fn poll_snapshot_results(&mut self) {
+        loop {
+            match self.snapshot_write_results.try_recv() {
+                Ok(SnapshotWriteResult::Saved { generation, path })
+                    if self.snapshot_writing == Some(generation) =>
+                {
+                    self.snapshot_writing = None;
+                    self.status = Status::normal(format!("Saved PNG: {}", path.display()));
+                }
+                Ok(SnapshotWriteResult::Failed {
+                    generation,
+                    message,
+                }) if self.snapshot_writing == Some(generation) => {
+                    self.snapshot_writing = None;
+                    self.status = Status::error(message);
+                }
+                Ok(SnapshotWriteResult::Saved { .. } | SnapshotWriteResult::Failed { .. }) => {}
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    fn handle_screenshot_events(&mut self, context: &egui::Context) {
+        let mut screenshots = Vec::new();
+        context.input_mut(|input| {
+            input.events.retain(|event| {
+                let egui::Event::Screenshot {
+                    user_data, image, ..
+                } = event
+                else {
+                    return true;
+                };
+                let Some(generation) = user_data
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.downcast_ref::<u64>())
+                    .copied()
+                else {
+                    return true;
+                };
+                screenshots.push((generation, image.clone()));
+                false
+            });
+        });
+        self.returned_screenshots.extend(screenshots);
+    }
+
+    fn process_returned_screenshots(&mut self) {
+        for (generation, image) in std::mem::take(&mut self.returned_screenshots) {
+            self.handle_screenshot(generation, image);
+        }
+    }
+
+    fn request_snapshot(&mut self, context: &egui::Context) {
+        if self.pending_snapshot.is_some() || self.snapshot_writing.is_some() {
+            self.status = Status::normal("A PNG snapshot is already in progress.");
+            return;
+        }
+        let Some(region) = self.snapshot_region else {
+            self.status = Status::error("The canvas is not ready to capture yet.");
+            return;
+        };
+        self.snapshot_generation = self.snapshot_generation.wrapping_add(1);
+        let filename = self.dataset.as_ref().map_or_else(
+            || String::from("czi-snapshot"),
+            |dataset| source_filename(&dataset.source_label),
+        );
+        let request = SnapshotRequest {
+            generation: self.snapshot_generation,
+            region,
+            armed_frame: self.ui_frame,
+            region_frozen: false,
+            filename,
+        };
+        context.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
+            request.generation,
+        )));
+        self.pending_snapshot = Some(request);
+        self.status = Status::normal("Capturing annotated canvas PNG…");
+    }
+
+    fn handle_screenshot(&mut self, generation: u64, image: Arc<egui::ColorImage>) {
+        let Some(request) = take_matching_snapshot_request(&mut self.pending_snapshot, generation)
+        else {
+            return;
+        };
+        let Some(crop) = screenshot_crop_bounds(image.size, request.region) else {
+            self.status = Status::error("The canvas snapshot area was outside the screenshot.");
+            return;
+        };
+        let sender = self.snapshot_write_sender.clone();
+        let filename = request.filename;
+        self.snapshot_writing = Some(request.generation);
+        self.status = Status::normal("Writing PNG snapshot…");
+        if thread::Builder::new()
+            .name(String::from("czi-png-writer"))
+            .spawn(move || {
+                let rgba = crop_screenshot_rgba(&image, crop);
+                let result = write_png_snapshot(&filename, crop.width, crop.height, &rgba)
+                    .map_or_else(
+                        |message| SnapshotWriteResult::Failed {
+                            generation: request.generation,
+                            message,
+                        },
+                        |path| SnapshotWriteResult::Saved {
+                            generation: request.generation,
+                            path,
+                        },
+                    );
+                let _ = sender.send(result);
+            })
+            .is_err()
+        {
+            self.snapshot_writing = None;
+            self.status = Status::error("Could not start the PNG writer thread.");
         }
     }
 
@@ -3334,6 +3497,17 @@ impl ViewerApp {
                 self.camera.one_to_one();
                 self.last_request = None;
             }
+            if ui
+                .add_enabled(
+                    self.snapshot_region.is_some()
+                        && self.pending_snapshot.is_none()
+                        && self.snapshot_writing.is_none(),
+                    egui::Button::new("Save PNG"),
+                )
+                .clicked()
+            {
+                self.request_snapshot(ui.ctx());
+            }
             ui.weak("Wheel: zoom at cursor · Drag: pan · logical world coordinates");
         });
         let (title_response, title_painter) =
@@ -3346,6 +3520,15 @@ impl ViewerApp {
             self.pyramid_display,
         );
         let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::drag());
+        let snapshot_region = SnapshotRegion {
+            rect: title_response.rect.union(response.rect),
+            pixels_per_point: ui.ctx().pixels_per_point(),
+        };
+        self.snapshot_region = Some(snapshot_region);
+        if let Some(request) = self.pending_snapshot.as_mut() {
+            freeze_snapshot_region(request, snapshot_region, self.ui_frame);
+        }
+        self.process_returned_screenshots();
         painter.rect_filled(response.rect, 0.0, egui::Color32::from_gray(24));
 
         let Some(dataset) = self.dataset.as_ref() else {
@@ -3555,15 +3738,22 @@ struct ScaleBar {
     label: String,
 }
 
-fn scale_bar_spec(zoom: f64, pixel_size_um: Option<f64>) -> Option<ScaleBar> {
+fn scale_bar_spec_for_width(
+    zoom: f64,
+    pixel_size_um: Option<f64>,
+    maximum_points: f64,
+) -> Option<ScaleBar> {
     if !zoom.is_finite() || zoom <= 0.0 {
+        return None;
+    }
+    if !maximum_points.is_finite() || maximum_points <= 0.0 {
         return None;
     }
     let (units_per_point, suffix) = match pixel_size_um {
         Some(size) if size.is_finite() && size > 0.0 => (size / zoom, "µm"),
         _ => (1.0 / zoom, "px"),
     };
-    let target_units = 100.0 * units_per_point;
+    let target_units = maximum_points.min(100.0) * units_per_point;
     let length = nice_scale_length(target_units)?;
     let points = (length / units_per_point) as f32;
     (points.is_finite() && points > 0.0).then(|| ScaleBar {
@@ -3579,7 +3769,7 @@ fn nice_scale_length(target: f64) -> Option<f64> {
     let base = 10.0_f64.powf(target.log10().floor());
     for factor in [5.0, 2.0, 1.0] {
         let candidate = factor * base;
-        if candidate <= target {
+        if candidate <= target * (1.0 + 1e-12) {
             return Some(candidate);
         }
     }
@@ -3594,7 +3784,7 @@ fn format_scale_length(length: f64) -> String {
     } else if length >= 0.01 {
         format!("{length:.2}")
     } else {
-        format!("{length:.3}")
+        format!("{length:.1e}")
     }
 }
 
@@ -3604,11 +3794,12 @@ fn draw_scale_bar(
     zoom: f64,
     pixel_size_um: Option<f64>,
 ) {
-    let Some(bar) = scale_bar_spec(zoom, pixel_size_um) else {
+    let available_points = f64::from((canvas.width() - 36.0).max(0.0));
+    let Some(bar) = scale_bar_spec_for_width(zoom, pixel_size_um, available_points) else {
         return;
     };
     let start = egui::pos2(canvas.left() + 18.0, canvas.bottom() - 18.0);
-    let end = start + egui::vec2(bar.points.min((canvas.width() - 36.0).max(1.0)), 0.0);
+    let end = start + egui::vec2(bar.points, 0.0);
     let black = egui::Stroke::new(5.0, egui::Color32::BLACK);
     let white = egui::Stroke::new(2.0, egui::Color32::WHITE);
     painter.line_segment([start, end], black);
@@ -3638,6 +3829,225 @@ fn draw_scale_bar(
         egui::FontId::proportional(12.0),
         egui::Color32::WHITE,
     );
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PixelCrop {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+fn take_matching_snapshot_request(
+    request: &mut Option<SnapshotRequest>,
+    generation: u64,
+) -> Option<SnapshotRequest> {
+    request
+        .as_ref()
+        .is_some_and(|request| request.generation == generation)
+        .then(|| request.take())
+        .flatten()
+}
+
+fn freeze_snapshot_region(
+    request: &mut SnapshotRequest,
+    region: SnapshotRegion,
+    ui_frame: u64,
+) -> bool {
+    if request.region_frozen || ui_frame <= request.armed_frame {
+        return false;
+    }
+    request.region = region;
+    request.region_frozen = true;
+    true
+}
+
+fn screenshot_crop_bounds(image_size: [usize; 2], region: SnapshotRegion) -> Option<PixelCrop> {
+    let pixels_per_point = region.pixels_per_point;
+    if !pixels_per_point.is_finite() || pixels_per_point <= 0.0 {
+        return None;
+    }
+    let to_pixel = |point: f32| (point * pixels_per_point) as f64;
+    let (min_x, min_y, max_x, max_y) = (
+        to_pixel(region.rect.min.x),
+        to_pixel(region.rect.min.y),
+        to_pixel(region.rect.max.x),
+        to_pixel(region.rect.max.y),
+    );
+    if !min_x.is_finite()
+        || !min_y.is_finite()
+        || !max_x.is_finite()
+        || !max_y.is_finite()
+        || min_x < 0.0
+        || min_y < 0.0
+    {
+        return None;
+    }
+    let min_x = pixel_bound(min_x.floor());
+    let min_y = pixel_bound(min_y.floor());
+    let max_x = pixel_bound(max_x.ceil());
+    let max_y = pixel_bound(max_y.ceil());
+    if min_x > image_size[0]
+        || min_y > image_size[1]
+        || max_x > image_size[0]
+        || max_y > image_size[1]
+        || max_x <= min_x
+        || max_y <= min_y
+    {
+        return None;
+    }
+    Some(PixelCrop {
+        x: min_x,
+        y: min_y,
+        width: max_x - min_x,
+        height: max_y - min_y,
+    })
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn pixel_bound(value: f64) -> usize {
+    if !value.is_finite() || value <= 0.0 {
+        0
+    } else if value >= usize::MAX as f64 {
+        usize::MAX
+    } else {
+        value as usize
+    }
+}
+
+fn crop_screenshot_rgba(image: &egui::ColorImage, crop: PixelCrop) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(
+        crop.width
+            .saturating_mul(crop.height)
+            .saturating_mul(usize::from(4_u8)),
+    );
+    for y in crop.y..crop.y + crop.height {
+        let row_start = y.saturating_mul(image.size[0]).saturating_add(crop.x);
+        for pixel in &image.pixels[row_start..row_start + crop.width] {
+            rgba.extend_from_slice(&pixel.to_srgba_unmultiplied());
+        }
+    }
+    rgba
+}
+
+fn encode_png_rgba(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    let width = u32::try_from(width).map_err(|_| String::from("PNG width is too large."))?;
+    let height = u32::try_from(height).map_err(|_| String::from("PNG height is too large."))?;
+    let expected = usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| String::from("PNG dimensions are too large."))?;
+    if rgba.len() != expected {
+        return Err(String::from(
+            "PNG pixels did not match the crop dimensions.",
+        ));
+    }
+    let mut bytes = Vec::new();
+    let mut encoder = png::Encoder::new(&mut bytes, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|error| format!("Could not encode PNG header: {error}"))?;
+    writer
+        .write_image_data(rgba)
+        .map_err(|error| format!("Could not encode PNG pixels: {error}"))?;
+    drop(writer);
+    Ok(bytes)
+}
+
+fn write_png_snapshot(
+    filename: &str,
+    width: usize,
+    height: usize,
+    rgba: &[u8],
+) -> Result<PathBuf, String> {
+    let png = encode_png_rgba(width, height, rgba)?;
+    let directory = snapshot_directory();
+    let timestamp = unix_timestamp();
+    for sequence in 0_u16..1_000 {
+        let path = directory.join(snapshot_output_filename_with_sequence(
+            filename, timestamp, sequence,
+        ));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!("Could not save PNG to {}: {error}", path.display()));
+            }
+        };
+        if let Err(error) = std::io::Write::write_all(&mut file, &png) {
+            let _ = std::fs::remove_file(&path);
+            return Err(format!("Could not save PNG to {}: {error}", path.display()));
+        }
+        return Ok(path);
+    }
+    Err(String::from(
+        "Could not choose an unused PNG snapshot filename.",
+    ))
+}
+
+fn snapshot_directory() -> PathBuf {
+    let desktop = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("Desktop"));
+    desktop
+        .filter(|path| path.is_dir())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn snapshot_output_filename_with_sequence(source: &str, timestamp: u64, sequence: u16) -> String {
+    let suffix = if sequence > 0 {
+        format!("-{sequence}")
+    } else {
+        String::new()
+    };
+    format!(
+        "{}-{timestamp}{}.png",
+        sanitize_snapshot_filename(source),
+        suffix
+    )
+}
+
+fn sanitize_snapshot_filename(source: &str) -> String {
+    let stem = Path::new(source)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("czi-snapshot");
+    let sanitized = stem
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(80)
+        .collect::<String>();
+    let sanitized = sanitized.trim_matches('_');
+    if sanitized.is_empty() {
+        String::from("czi-snapshot")
+    } else {
+        sanitized.to_owned()
+    }
+}
+
+fn unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 fn console_key_input(key: egui::Key, modifiers: egui::Modifiers) -> Option<Vec<u8>> {
@@ -3820,6 +4230,9 @@ fn canvas_message(painter: &egui::Painter, rect: egui::Rect, message: &str) {
 impl eframe::App for ViewerApp {
     #[allow(clippy::too_many_lines)]
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ui_frame = self.ui_frame.wrapping_add(1);
+        self.handle_screenshot_events(context);
+        self.poll_snapshot_results();
         self.handle_dropped_files(context);
         self.handle_worker_events();
         self.poll_embedded_authentication(context);
@@ -4395,21 +4808,133 @@ mod tests {
     #[test]
     fn scale_bar_uses_nice_physical_lengths_and_pixel_fallback() {
         assert_eq!(
-            scale_bar_spec(2.0, Some(0.5)),
+            scale_bar_spec_for_width(2.0, Some(0.5), 100.0),
             Some(ScaleBar {
                 points: 80.0,
                 label: String::from("20 µm"),
             })
         );
         assert_eq!(
-            scale_bar_spec(0.5, None),
+            scale_bar_spec_for_width(0.5, None, 100.0),
             Some(ScaleBar {
                 points: 100.0,
                 label: String::from("200 px"),
             })
         );
         assert_eq!(nice_scale_length(0.37), Some(0.2));
-        assert_eq!(scale_bar_spec(0.0, Some(0.5)), None);
+        assert_eq!(
+            scale_bar_spec_for_width(2.0, Some(0.5), 30.0),
+            Some(ScaleBar {
+                points: 20.0,
+                label: String::from("5 µm"),
+            })
+        );
+        assert_eq!(
+            scale_bar_spec_for_width(1_000_000.0, None, 100.0),
+            Some(ScaleBar {
+                points: 100.0,
+                label: String::from("1.0e-4 px"),
+            })
+        );
+        assert_eq!(scale_bar_spec_for_width(0.0, Some(0.5), 100.0), None);
+    }
+
+    #[test]
+    fn screenshot_crop_handles_one_and_two_pixel_displays() {
+        let rect = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 70.0));
+        assert_eq!(
+            screenshot_crop_bounds(
+                [160, 100],
+                SnapshotRegion {
+                    rect,
+                    pixels_per_point: 1.0,
+                }
+            ),
+            Some(PixelCrop {
+                x: 10,
+                y: 20,
+                width: 100,
+                height: 50,
+            })
+        );
+        assert_eq!(
+            screenshot_crop_bounds(
+                [320, 200],
+                SnapshotRegion {
+                    rect,
+                    pixels_per_point: 2.0,
+                }
+            ),
+            Some(PixelCrop {
+                x: 20,
+                y: 40,
+                width: 200,
+                height: 100,
+            })
+        );
+        assert_eq!(
+            screenshot_crop_bounds(
+                [100, 100],
+                SnapshotRegion {
+                    rect: egui::Rect::from_min_max(egui::pos2(90.0, 0.0), egui::pos2(110.0, 10.0),),
+                    pixels_per_point: 1.0,
+                }
+            ),
+            None,
+            "a mismatched screenshot is rejected instead of silently clamped"
+        );
+    }
+
+    #[test]
+    fn snapshot_filename_encoder_and_stale_request_are_safe() {
+        assert_eq!(
+            snapshot_output_filename_with_sequence("My slide?.czi", 42, 0),
+            "My_slide-42.png"
+        );
+        let png = encode_png_rgba(1, 1, &[255, 0, 0, 255]).expect("encode png");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        assert!(encode_png_rgba(2, 1, &[255, 0, 0, 255]).is_err());
+
+        let mut request = Some(SnapshotRequest {
+            generation: 2,
+            region: SnapshotRegion {
+                rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1.0, 1.0)),
+                pixels_per_point: 1.0,
+            },
+            armed_frame: 1,
+            region_frozen: false,
+            filename: String::from("test"),
+        });
+        assert!(take_matching_snapshot_request(&mut request, 1).is_none());
+        assert!(request.is_some());
+        let capture_region = SnapshotRegion {
+            rect: egui::Rect::from_min_size(egui::pos2(2.0, 3.0), egui::vec2(4.0, 5.0)),
+            pixels_per_point: 2.0,
+        };
+        assert!(!freeze_snapshot_region(
+            request.as_mut().expect("pending request"),
+            capture_region,
+            1,
+        ));
+        assert!(freeze_snapshot_region(
+            request.as_mut().expect("pending request"),
+            capture_region,
+            2,
+        ));
+        assert!(!freeze_snapshot_region(
+            request.as_mut().expect("frozen request"),
+            SnapshotRegion {
+                rect: egui::Rect::NOTHING,
+                pixels_per_point: 1.0,
+            },
+            3,
+        ));
+        assert_eq!(
+            take_matching_snapshot_request(&mut request, 2)
+                .expect("matching screenshot request")
+                .generation,
+            2
+        );
     }
 
     #[test]
@@ -4874,6 +5399,7 @@ mod tests {
                 ]),
             ],
             metadata: None,
+            metadata_diagnostics: Vec::new(),
             attachments: Vec::new(),
         })
         .expect("query index");
