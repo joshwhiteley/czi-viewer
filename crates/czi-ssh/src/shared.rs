@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -18,6 +19,7 @@ struct SharedSftpSessionInner {
     deferred_close_tx: Sender<Vec<u8>>,
     deferred_close_rx: Mutex<Receiver<Vec<u8>>>,
     embedded_cancellation: Option<EmbeddedConnectionCancellation>,
+    usable: AtomicBool,
 }
 
 struct EmbeddedConnectionCancellation {
@@ -59,6 +61,7 @@ impl SharedSftpSession {
                 deferred_close_tx,
                 deferred_close_rx: Mutex::new(deferred_close_rx),
                 embedded_cancellation,
+                usable: AtomicBool::new(true),
             }),
         }
     }
@@ -66,6 +69,12 @@ impl SharedSftpSession {
     /// Queue a remote file handle for closure without waiting on an active SFTP operation.
     pub fn defer_close(&self, handle: Vec<u8>) {
         let _ = self.inner.deferred_close_tx.send(handle);
+    }
+
+    /// Returns whether the negotiated SFTP transport can serve another operation.
+    #[must_use]
+    pub fn is_usable(&self) -> bool {
+        self.inner.usable.load(Ordering::Acquire)
     }
 
     /// Terminate this embedded connection only when `generation` owns it.
@@ -96,19 +105,41 @@ impl SharedSftpSession {
         &self,
         operation: impl FnOnce(&mut SftpSession) -> Result<T, SftpError>,
     ) -> Result<T, SftpError> {
-        let mut session = self
-            .inner
-            .session
-            .lock()
-            .map_err(|_| SftpError::SessionPoisoned)?;
-        self.drain_deferred_closes(&mut session)?;
+        let mut session = self.inner.session.lock().map_err(|_| {
+            self.inner.usable.store(false, Ordering::Release);
+            SftpError::SessionPoisoned
+        })?;
+        if let Err(error) = self.drain_deferred_closes(&mut session) {
+            self.record_error(&error);
+            self.reconcile_session(&session);
+            return Err(error);
+        }
         let result = operation(&mut session);
-        if result.is_err() {
+        self.reconcile_session(&session);
+        if let Err(error) = &result {
+            self.record_error(error);
             self.discard_deferred_closes();
             return result;
         }
-        self.drain_deferred_closes(&mut session)?;
+        if let Err(error) = self.drain_deferred_closes(&mut session) {
+            self.record_error(&error);
+            self.reconcile_session(&session);
+            return Err(error);
+        }
+        self.reconcile_session(&session);
         result
+    }
+
+    fn record_error(&self, error: &SftpError) {
+        if !error.leaves_session_usable() {
+            self.inner.usable.store(false, Ordering::Release);
+        }
+    }
+
+    fn reconcile_session(&self, session: &SftpSession) {
+        if !session.is_usable() {
+            self.inner.usable.store(false, Ordering::Release);
+        }
     }
 
     fn drain_deferred_closes(&self, session: &mut SftpSession) -> Result<(), SftpError> {

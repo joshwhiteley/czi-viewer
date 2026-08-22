@@ -58,6 +58,7 @@ const KNOWN_ATTRIBUTE_FLAGS: u32 = SSH_FILEXFER_ATTR_SIZE
 pub struct SftpSession {
     transport: Transport,
     next_request_id: Option<u32>,
+    usable: bool,
 }
 
 /// The visible local-terminal side of an embedded OpenSSH child.
@@ -320,6 +321,7 @@ impl SftpSession {
                 stderr: Some(stderr),
             },
             next_request_id: Some(1),
+            usable: true,
         };
         let result = session.initialize_inner();
         session.finish(result)?;
@@ -416,6 +418,7 @@ impl SftpSession {
                 stdout: Some(stdout),
             },
             next_request_id: Some(1),
+            usable: true,
         };
         Ok((
             PendingEmbeddedSftpSession {
@@ -495,6 +498,7 @@ impl SftpSession {
                 registration,
             },
             next_request_id: Some(1),
+            usable: true,
         };
         let result = session.initialize_inner();
         session.finish(result)?;
@@ -564,11 +568,16 @@ impl SftpSession {
     fn finish<T>(&mut self, result: Result<T, SftpError>) -> Result<T, SftpError> {
         if result
             .as_ref()
-            .is_err_and(|error| !error.is_recoverable_server_status())
+            .is_err_and(|error| !error.leaves_session_usable())
         {
+            self.usable = false;
             self.transport.shutdown();
         }
         result
+    }
+
+    pub(crate) fn is_usable(&self) -> bool {
+        self.usable
     }
 
     fn initialize_inner(&mut self) -> Result<(), SftpError> {
@@ -770,7 +779,12 @@ impl SftpSession {
                 self.close_inner(&handle)?;
                 Ok(entries)
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                if self.close_inner(&handle).is_err() {
+                    return Err(SftpProtocolError::DirectoryCleanupFailed.into());
+                }
+                Err(error)
+            }
         }
     }
 
@@ -1610,6 +1624,7 @@ impl SftpSession {
                 writer: Some(stream),
             },
             next_request_id: Some(1),
+            usable: true,
         };
         let result = session.initialize_inner();
         session.finish(result)?;

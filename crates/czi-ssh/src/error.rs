@@ -201,6 +201,8 @@ pub enum SftpProtocolError {
         /// Maximum permitted entries.
         limit: usize,
     },
+    /// The server did not confirm closing a directory after a listing failure.
+    DirectoryCleanupFailed,
     /// A fallible packet allocation failed.
     Allocation {
         /// Requested allocation size.
@@ -264,6 +266,9 @@ impl fmt::Display for SftpProtocolError {
                     "SFTP directory listing exceeds the {limit}-entry limit"
                 )
             }
+            Self::DirectoryCleanupFailed => {
+                formatter.write_str("SFTP could not close a directory after a listing failure")
+            }
             Self::Allocation { size } => write!(formatter, "cannot allocate {size} bytes for SFTP"),
         }
     }
@@ -322,13 +327,31 @@ pub enum SftpError {
 }
 
 impl SftpError {
-    /// Returns true when the server completed a request with a normal SFTP STATUS response.
+    /// Returns true when a synchronized server STATUS response leaves the session usable.
     ///
-    /// Such errors describe that request only. The negotiated transport remains usable for a
-    /// later request. Framing, I/O, child-exit, and protocol errors are never recoverable.
+    /// Such errors describe that request only. Pipelined READ requests are the exception: a
+    /// STATUS can leave unread responses in the stream, so every READ error is fatal.
     #[must_use]
     pub fn is_recoverable_server_status(&self) -> bool {
-        matches!(self, Self::RemoteStatus { .. })
+        matches!(self, Self::RemoteStatus { operation, .. } if *operation != "READ")
+    }
+
+    /// Returns true when this completed operation did not desynchronize the SFTP session.
+    ///
+    /// A parsed server STATUS is usable except for READ, which can have outstanding pipelined
+    /// responses. Missing source attributes are a capability failure after a complete FSTAT
+    /// response and do not invalidate an authenticated browser session.
+    #[must_use]
+    pub fn leaves_session_usable(&self) -> bool {
+        self.is_recoverable_server_status()
+            || matches!(
+                self,
+                Self::InvalidProfile(_)
+                    | Self::InvalidLocation(_)
+                    | Self::InvalidConfig(_)
+                    | Self::UnsupportedPlatform { .. }
+                    | Self::Protocol(SftpProtocolError::MissingRequiredAttribute { .. })
+            )
     }
 
     pub(crate) fn io(context: &'static str, source: io::Error) -> Self {

@@ -3,7 +3,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::thread;
 
-use czi_core::{RandomAccessSource, SourceError};
+use czi_core::{CziDataset, RandomAccessSource, SourceError};
 
 #[cfg(unix)]
 use crate::command::SOCKET_PATH_LIMIT;
@@ -55,10 +55,9 @@ impl FakeSsh {
     }
 
     fn send(&mut self, packet_type: u8, payload: &[u8]) {
-        let length = u32::try_from(payload.len() + 1).unwrap();
-        self.stream.write_all(&length.to_be_bytes()).unwrap();
-        self.stream.write_all(&[packet_type]).unwrap();
-        self.stream.write_all(payload).unwrap();
+        self.stream
+            .write_all(&packet_frame(packet_type, payload))
+            .unwrap();
         self.stream.flush().unwrap();
     }
 
@@ -137,6 +136,14 @@ fn profile(value: &str) -> SshProfile {
 fn push_string(payload: &mut Vec<u8>, value: &[u8]) {
     payload.extend_from_slice(&u32::try_from(value.len()).unwrap().to_be_bytes());
     payload.extend_from_slice(value);
+}
+
+fn packet_frame(packet_type: u8, payload: &[u8]) -> Vec<u8> {
+    let length = u32::try_from(payload.len() + 1).unwrap();
+    let mut frame = length.to_be_bytes().to_vec();
+    frame.push(packet_type);
+    frame.extend_from_slice(payload);
+    frame
 }
 
 fn request_id(request: &Request) -> u32 {
@@ -1176,6 +1183,62 @@ fn read_pipeline_accepts_out_of_order_responses() {
 }
 
 #[test]
+fn read_status_with_pipelined_responses_invalidates_the_shared_session() {
+    let requested = location("/input/failed-pipeline.czi");
+    let canonical = "/canonical/failed-pipeline.czi";
+    let total = 512 * 1024_u64;
+    let (session, worker) = fake_session(move |fake| {
+        fake.expect_init();
+        fake.send_version(false);
+        let realpath = fake.read_request();
+        send_name(
+            fake,
+            request_id(&realpath),
+            &[(canonical, canonical, 0_u32.to_be_bytes().to_vec())],
+        );
+        let open = fake.read_request();
+        fake.send_handle(request_id(&open), b"pipeline");
+        let fstat = fake.read_request();
+        fake.send(
+            SSH_FXP_ATTRS,
+            &attrs_response(request_id(&fstat), &attrs(total, 9)),
+        );
+        let first = fake.read_request();
+        let second = fake.read_request();
+        assert_eq!(first.packet_type, SSH_FXP_READ);
+        assert_eq!(second.packet_type, SSH_FXP_READ);
+
+        let mut status = request_id(&first).to_be_bytes().to_vec();
+        status.extend_from_slice(&4_u32.to_be_bytes());
+        push_string(&mut status, b"read failed");
+        push_string(&mut status, b"en");
+        let mut frames = packet_frame(SSH_FXP_STATUS, &status);
+        let data = request_id(&second).to_be_bytes();
+        let mut data_payload = data.to_vec();
+        push_string(&mut data_payload, &vec![b'x'; 256 * 1024]);
+        frames.extend_from_slice(&packet_frame(SSH_FXP_DATA, &data_payload));
+        fake.stream.write_all(&frames).unwrap();
+        fake.stream.flush().unwrap();
+    });
+    let shared = SharedSftpSession::new(session);
+    let source = SftpSource::open_with_shared_session(shared.clone(), &requested).unwrap();
+    let mut bytes = vec![0_u8; usize::try_from(total).unwrap()];
+    assert!(matches!(
+        source.read_at(0, &mut bytes),
+        Err(SourceError::Io(_))
+    ));
+    assert!(!shared.is_usable());
+    assert!(
+        shared
+            .with_session(|session| session.realpath(&location(".")))
+            .is_err()
+    );
+    drop(source);
+    drop(shared);
+    worker.join().unwrap();
+}
+
+#[test]
 fn bounded_read_rejects_eof_before_captured_length() {
     let requested = location("/input/eof.czi");
     let canonical = "/canonical/eof.czi";
@@ -1267,6 +1330,75 @@ fn readdir_reaches_eof_and_closes_handle() {
 }
 
 #[test]
+fn readdir_status_closes_its_handle_and_keeps_the_session_usable() {
+    let directory = location("/forbidden");
+    let (session, worker) = fake_session(|fake| {
+        fake.expect_init();
+        fake.send_version(false);
+        let open = fake.read_request();
+        assert_eq!(open.packet_type, SSH_FXP_OPENDIR);
+        fake.send_handle(request_id(&open), b"dir");
+        let readdir = fake.read_request();
+        assert_eq!(readdir.packet_type, SSH_FXP_READDIR);
+        fake.send_status(request_id(&readdir), 3);
+        let close = fake.read_request();
+        assert_eq!(close.packet_type, SSH_FXP_CLOSE);
+        fake.send_status(request_id(&close), SSH_FX_OK);
+        let realpath = fake.read_request();
+        assert_eq!(realpath.packet_type, SSH_FXP_REALPATH);
+        send_name(
+            fake,
+            request_id(&realpath),
+            &[("/home/test", "/home/test", 0_u32.to_be_bytes().to_vec())],
+        );
+    });
+    let shared = SharedSftpSession::new(session);
+    assert!(matches!(
+        shared.with_session(|session| session.read_dir(&directory)),
+        Err(SftpError::RemoteStatus {
+            operation: "READDIR",
+            ..
+        })
+    ));
+    assert!(shared.is_usable());
+    assert_eq!(
+        shared
+            .with_session(|session| session.realpath(&location(".")))
+            .unwrap()
+            .as_str(),
+        "/home/test"
+    );
+    drop(shared);
+    worker.join().unwrap();
+}
+
+#[test]
+fn readdir_status_with_a_failed_cleanup_invalidates_the_session() {
+    let directory = location("/forbidden");
+    let (session, worker) = fake_session(|fake| {
+        fake.expect_init();
+        fake.send_version(false);
+        let open = fake.read_request();
+        fake.send_handle(request_id(&open), b"dir");
+        let readdir = fake.read_request();
+        fake.send_status(request_id(&readdir), 3);
+        let close = fake.read_request();
+        assert_eq!(close.packet_type, SSH_FXP_CLOSE);
+        fake.send_status(request_id(&close), 4);
+    });
+    let shared = SharedSftpSession::new(session);
+    assert!(matches!(
+        shared.with_session(|session| session.read_dir(&directory)),
+        Err(SftpError::Protocol(
+            SftpProtocolError::DirectoryCleanupFailed
+        ))
+    ));
+    assert!(!shared.is_usable());
+    drop(shared);
+    worker.join().unwrap();
+}
+
+#[test]
 fn readdir_limit_rejects_a_page_that_exceeds_the_budget() {
     let directory = location("/data");
     let (mut session, worker) = fake_session(|fake| {
@@ -1284,6 +1416,9 @@ fn readdir_limit_rejects_a_page_that_exceeds_the_budget() {
                 ("two.czi", "two", 0_u32.to_be_bytes().to_vec()),
             ],
         );
+        let close = fake.read_request();
+        assert_eq!(close.packet_type, SSH_FXP_CLOSE);
+        fake.send_status(request_id(&close), SSH_FX_OK);
     });
     assert!(matches!(
         session.read_dir_limited(&directory, 1),
@@ -1306,6 +1441,9 @@ fn readdir_rejects_an_empty_name_page() {
         let page = fake.read_request();
         let payload = [request_id(&page).to_be_bytes(), 0_u32.to_be_bytes()].concat();
         fake.send(SSH_FXP_NAME, &payload);
+        let close = fake.read_request();
+        assert_eq!(close.packet_type, SSH_FXP_CLOSE);
+        fake.send_status(request_id(&close), SSH_FX_OK);
     });
     assert!(matches!(
         session.read_dir(&directory),
@@ -1359,6 +1497,96 @@ fn source_requires_fstat_size_and_modification_time() {
         SftpError::Protocol(SftpProtocolError::MissingRequiredAttribute { .. }) => {}
         other => panic!("unexpected error: {other:?}"),
     }
+    assert!(shared.is_usable());
+    assert_eq!(
+        shared
+            .with_session(|session| session.realpath(&location(".")))
+            .unwrap()
+            .as_str(),
+        "/home/test"
+    );
+    drop(shared);
+    worker.join().unwrap();
+}
+
+#[test]
+fn source_open_cleanup_failure_marks_the_shared_session_unusable() {
+    let requested = location("/input/unreadable.czi");
+    let (session, worker) = fake_session(|fake| {
+        fake.expect_init();
+        fake.send_version(false);
+        let realpath = fake.read_request();
+        send_name(
+            fake,
+            request_id(&realpath),
+            &[(
+                "/canonical/unreadable.czi",
+                "unreadable.czi",
+                0_u32.to_be_bytes().to_vec(),
+            )],
+        );
+        let open = fake.read_request();
+        fake.send_handle(request_id(&open), b"unreadable");
+        let fstat = fake.read_request();
+        fake.send_status(request_id(&fstat), 3);
+        let close = fake.read_request();
+        assert_eq!(close.packet_type, SSH_FXP_CLOSE);
+        fake.send_data(request_id(&close), b"");
+    });
+    let shared = SharedSftpSession::new(session);
+    assert!(matches!(
+        SftpSource::open_with_shared_session(shared.clone(), &requested),
+        Err(SftpError::RemoteStatus {
+            operation: "FSTAT",
+            ..
+        })
+    ));
+    assert!(!shared.is_usable());
+    drop(shared);
+    worker.join().unwrap();
+}
+
+#[test]
+fn malformed_czi_bytes_leave_the_shared_session_available_for_browsing() {
+    let requested = location("/input/malformed.czi");
+    let (session, worker) = fake_session(|fake| {
+        fake.expect_init();
+        fake.send_version(false);
+        let realpath = fake.read_request();
+        send_name(
+            fake,
+            request_id(&realpath),
+            &[(
+                "/canonical/malformed.czi",
+                "malformed.czi",
+                0_u32.to_be_bytes().to_vec(),
+            )],
+        );
+        let open = fake.read_request();
+        fake.send_handle(request_id(&open), b"malformed");
+        let fstat = fake.read_request();
+        fake.send(
+            SSH_FXP_ATTRS,
+            &attrs_response(request_id(&fstat), &attrs(32, 77)),
+        );
+        let read = fake.read_request();
+        assert_eq!(read.packet_type, SSH_FXP_READ);
+        fake.send_data(request_id(&read), &[0_u8; 32]);
+        let close = fake.read_request();
+        assert_eq!(close.packet_type, SSH_FXP_CLOSE);
+        fake.send_status(request_id(&close), SSH_FX_OK);
+        let browse = fake.read_request();
+        assert_eq!(browse.packet_type, SSH_FXP_REALPATH);
+        send_name(
+            fake,
+            request_id(&browse),
+            &[("/home/test", "/home/test", 0_u32.to_be_bytes().to_vec())],
+        );
+    });
+    let shared = SharedSftpSession::new(session);
+    let source = SftpSource::open_with_shared_session(shared.clone(), &requested).unwrap();
+    assert!(CziDataset::open(source).is_err());
+    assert!(shared.is_usable());
     assert_eq!(
         shared
             .with_session(|session| session.realpath(&location(".")))

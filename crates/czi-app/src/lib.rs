@@ -96,14 +96,14 @@ impl DatasetLocator {
     fn open_failure(error: impl std::fmt::Display) -> OpenFailure {
         OpenFailure {
             message: sanitize_error(error),
-            recoverable_remote_status: false,
+            session_usable: true,
         }
     }
 }
 
 struct OpenFailure {
     message: String,
-    recoverable_remote_status: bool,
+    session_usable: bool,
 }
 
 #[derive(Clone)]
@@ -194,23 +194,39 @@ impl Default for EmbeddedCancellationSlot {
 fn validation_failure(error: impl std::fmt::Display) -> OpenFailure {
     OpenFailure {
         message: sanitize_error(error),
-        recoverable_remote_status: false,
+        session_usable: true,
     }
 }
 
 fn remote_failure(error: impl std::fmt::Display) -> OpenFailure {
     OpenFailure {
         message: sanitize_error(error),
-        recoverable_remote_status: false,
+        session_usable: false,
     }
 }
 
-fn recoverable_remote_failure(error: czi_ssh::SftpError) -> OpenFailure {
-    let recoverable_remote_status = error.is_recoverable_server_status();
+fn remote_session_failure(error: impl std::fmt::Display, session_usable: bool) -> OpenFailure {
     OpenFailure {
         message: sanitize_error(error),
-        recoverable_remote_status,
+        session_usable,
     }
+}
+
+fn classify_remote_open_failure(
+    browse_session: &mut Option<WorkerBrowseSession>,
+    error: impl std::fmt::Display,
+) -> OpenFailure {
+    let session_usable = browse_session
+        .as_ref()
+        .is_some_and(|session| session.session.is_usable());
+    if !session_usable {
+        *browse_session = None;
+    }
+    remote_session_failure(error, session_usable)
+}
+
+fn requires_remote_reauthentication(session_usable: bool) -> bool {
+    !session_usable
 }
 
 fn sanitize_error(error: impl std::fmt::Display) -> String {
@@ -691,7 +707,7 @@ enum WorkerEvent {
     },
     OpenFailed {
         message: String,
-        recoverable_remote_status: bool,
+        session_usable: bool,
         source_generation: u64,
         connection_generation: u64,
         remote: bool,
@@ -990,13 +1006,13 @@ fn send_open_result(
         }
         Err(OpenFailure {
             message,
-            recoverable_remote_status,
+            session_usable,
         }) => (
             None,
             events
                 .send(WorkerEvent::OpenFailed {
                     message,
-                    recoverable_remote_status,
+                    session_usable,
                     source_generation,
                     connection_generation,
                     remote,
@@ -1028,11 +1044,11 @@ fn send_remote_browse_result(
             .is_ok(),
         Err(OpenFailure {
             message,
-            recoverable_remote_status,
+            session_usable,
         }) => events
             .send(WorkerEvent::RemotePathsFailed {
                 message,
-                recoverable_remote_status,
+                recoverable_remote_status: session_usable,
                 browse_generation,
                 connection_generation,
             })
@@ -1095,13 +1111,13 @@ fn browse_remote_paths(
             .session,
         target,
     );
-    if result
+    let session_usable = browse_session
         .as_ref()
-        .is_err_and(|error| !error.is_recoverable_server_status())
-    {
+        .is_some_and(|session| session.session.is_usable());
+    if result.is_err() && !session_usable {
         *browse_session = None;
     }
-    result.map_err(recoverable_remote_failure)
+    result.map_err(|error| remote_session_failure(error, session_usable))
 }
 
 fn browse_with_session(
@@ -1144,11 +1160,11 @@ fn open_dataset(
                 .and_then(CziDataset::open)
                 .map_err(|error| OpenFailure {
                     message: sanitize_error(error),
-                    recoverable_remote_status: false,
+                    session_usable: false,
                 })?;
             finish_open(source_label, opened).map_err(|error| OpenFailure {
                 message: sanitize_error(error),
-                recoverable_remote_status: false,
+                session_usable: false,
             })
         }
         remote @ DatasetLocator::Remote { .. } => {
@@ -1199,32 +1215,18 @@ fn open_dataset(
             };
             let source = match source {
                 Ok(source) => source,
-                Err(error) => {
-                    if !error.is_recoverable_server_status() {
-                        *browse_session = None;
-                    }
-                    return Err(recoverable_remote_failure(error));
-                }
+                Err(error) => return Err(classify_remote_open_failure(browse_session, error)),
             };
             let cache = match BlockCache::with_defaults(source) {
                 Ok(cache) => cache,
-                Err(error) => {
-                    *browse_session = None;
-                    return Err(remote_failure(error));
-                }
+                Err(error) => return Err(classify_remote_open_failure(browse_session, error)),
             };
             let opened = match CziDataset::open(cache) {
                 Ok(opened) => opened,
-                Err(error) => {
-                    *browse_session = None;
-                    return Err(remote_failure(error));
-                }
+                Err(error) => return Err(classify_remote_open_failure(browse_session, error)),
             };
-            let result = finish_open(source_label, opened).map_err(remote_failure);
-            if result.is_err() {
-                *browse_session = None;
-            }
-            result
+            finish_open(source_label, opened)
+                .map_err(|error| classify_remote_open_failure(browse_session, error))
         }
     }
 }
@@ -2374,7 +2376,7 @@ impl ViewerApp {
             }
             WorkerEvent::OpenFailed {
                 message,
-                recoverable_remote_status,
+                session_usable,
                 source_generation,
                 connection_generation,
                 remote,
@@ -2387,7 +2389,7 @@ impl ViewerApp {
             {
                 self.opening_origin = None;
                 self.pending_open = None;
-                if remote && !recoverable_remote_status {
+                if remote && requires_remote_reauthentication(session_usable) {
                     self.remote_session = None;
                     self.cancel_active_remote_connection();
                     self.retire_embedded_authentication();
@@ -2537,15 +2539,18 @@ impl ViewerApp {
     fn handle_remote_paths_failed(
         &mut self,
         message: String,
-        recoverable_remote_status: bool,
+        session_usable: bool,
         browse_generation: u64,
     ) {
         if !self.generations.accepts_browse(browse_generation) {
             return;
         }
         self.status = Status::error(message);
-        if !recoverable_remote_status {
+        if requires_remote_reauthentication(session_usable) {
             self.remote_session = None;
+            self.cancel_active_remote_connection();
+            self.retire_embedded_authentication();
+            self.generations.begin_connection();
         }
         self.remote_browse_pending = false;
     }
@@ -3418,6 +3423,19 @@ mod tests {
     }
 
     #[test]
+    fn usable_remote_file_failures_do_not_require_reauthentication() {
+        let content_error = remote_session_failure("invalid CZI bytes", true);
+        let transport_error = remote_session_failure("SFTP READ failed", false);
+        assert!(content_error.session_usable);
+        assert!(!requires_remote_reauthentication(
+            content_error.session_usable
+        ));
+        assert!(requires_remote_reauthentication(
+            transport_error.session_usable
+        ));
+    }
+
+    #[test]
     fn local_open_results_ignore_ssh_generation_changes() {
         let mut generations = Generations::default();
         let source = generations.begin_source();
@@ -3864,7 +3882,7 @@ mod tests {
             sender
                 .send(WorkerEvent::OpenFailed {
                     message: source_generation.to_string(),
-                    recoverable_remote_status: false,
+                    session_usable: false,
                     source_generation: u64::try_from(source_generation).expect("generation"),
                     connection_generation: 0,
                     remote: false,
@@ -3875,7 +3893,7 @@ mod tests {
         sender
             .send(WorkerEvent::OpenFailed {
                 message: String::from("next"),
-                recoverable_remote_status: false,
+                session_usable: false,
                 source_generation: 0,
                 connection_generation: 0,
                 remote: false,
