@@ -22,5 +22,8 @@ pub use error::{
 pub use location::{
     RemoteDirEntry, SftpAttributes, SftpExtendedAttribute, SftpLocation, SshProfile,
 };
-pub use protocol::SftpSession;
+pub use protocol::{
+    EMBEDDED_PTY_EXEC_MODE, EmbeddedSshCancellation, PendingEmbeddedSftpSession,
+    SSH_CONSOLE_OUTPUT_LIMIT, SftpSession, SshConsole, run_embedded_pty_executor_if_requested,
+};
 pub use source::SftpSource;

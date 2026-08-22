@@ -325,6 +325,39 @@ fn command_builders_keep_paths_out_of_argv_and_preserve_host_checks() {
             .windows(2)
             .any(|pair| pair == ["-o", "ControlPath=none"])
     );
+    let embedded = OpenSshConfig::embedded_sftp_argv(&destination)
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        embedded,
+        [
+            OPENSSH_PATH,
+            "-o",
+            "BatchMode=no",
+            "-o",
+            "ForwardAgent=no",
+            "-o",
+            "ForwardX11=no",
+            "-o",
+            "ClearAllForwardings=yes",
+            "-o",
+            "PermitLocalCommand=no",
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ControlPath=none",
+            "-o",
+            "StrictHostKeyChecking=ask",
+            "-T",
+            "-s",
+            "alice@example.test",
+            "sftp",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+    );
 
     let bridge = config
         .terminal_bridge_command(
@@ -1043,4 +1076,15 @@ fn source_version_is_stable_fnv1a() {
         ),
         0x9680_0614_a0c7_5c3e
     );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn embedded_pty_reports_unsupported_platform() {
+    assert!(matches!(
+        SftpSession::start_embedded(&profile("host.example"), &OpenSshConfig::new()),
+        Err(SftpError::UnsupportedPlatform {
+            feature: "embedded SSH console"
+        })
+    ));
 }

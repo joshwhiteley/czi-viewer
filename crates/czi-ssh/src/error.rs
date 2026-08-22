@@ -287,6 +287,11 @@ pub enum SftpError {
         /// Underlying local I/O error.
         source: io::Error,
     },
+    /// The requested embedded-SSH feature is not implemented on this platform.
+    UnsupportedPlatform {
+        /// Feature name.
+        feature: &'static str,
+    },
     /// `/usr/bin/ssh` could not be started.
     Spawn {
         /// Underlying process-launch error.
@@ -335,6 +340,9 @@ impl fmt::Display for SftpError {
                 write!(formatter, "invalid OpenSSH configuration: {error}")
             }
             Self::Io { context, source } => write!(formatter, "{context}: {source}"),
+            Self::UnsupportedPlatform { feature } => {
+                write!(formatter, "{feature} is supported only on macOS")
+            }
             Self::Spawn { source } => write!(formatter, "could not start /usr/bin/ssh: {source}"),
             Self::ChildExited {
                 operation,
@@ -366,7 +374,10 @@ impl Error for SftpError {
             Self::InvalidConfig(error) => Some(error),
             Self::Io { source, .. } | Self::Spawn { source } => Some(source),
             Self::Protocol(error) => Some(error),
-            Self::ChildExited { .. } | Self::RemoteStatus { .. } | Self::SessionPoisoned => None,
+            Self::UnsupportedPlatform { .. }
+            | Self::ChildExited { .. }
+            | Self::RemoteStatus { .. }
+            | Self::SessionPoisoned => None,
         }
     }
 }

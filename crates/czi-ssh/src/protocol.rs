@@ -4,6 +4,8 @@ use std::thread::{self, JoinHandle};
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(target_os = "macos")]
+use std::os::unix::process::ExitStatusExt;
 
 use crate::{
     OpenSshConfig, RemoteDirEntry, SftpAttributes, SftpError, SftpExtendedAttribute, SftpLocation,
@@ -15,6 +17,12 @@ pub(crate) const MAX_READ_LENGTH: usize = 256 * 1024;
 const MAX_READ_REQUESTS: usize = 8;
 const MAX_READ_WINDOW: usize = 2 * 1024 * 1024;
 const STDERR_LIMIT: usize = 64 * 1024;
+
+/// Maximum retained and returned console output per drain.
+pub const SSH_CONSOLE_OUTPUT_LIMIT: usize = 64 * 1024;
+
+/// Hidden same-executable mode that claims the spawned PTY before `execve`-ing `/usr/bin/ssh`.
+pub const EMBEDDED_PTY_EXEC_MODE: &str = "--czi-embedded-ssh-pty-exec";
 
 const SSH_FXP_INIT: u8 = 1;
 const SSH_FXP_VERSION: u8 = 2;
@@ -50,6 +58,221 @@ const KNOWN_ATTRIBUTE_FLAGS: u32 = SSH_FILEXFER_ATTR_SIZE
 pub struct SftpSession {
     transport: Transport,
     next_request_id: Option<u32>,
+}
+
+/// The visible local-terminal side of an embedded OpenSSH child.
+///
+/// Output is ASCII-sanitized and retained only up to [`SSH_CONSOLE_OUTPUT_LIMIT`]. This type
+/// never stores input, interprets prompts, or decides what credentials to send. `write_input`
+/// writes its bytes directly to the PTY master.
+pub struct SshConsole {
+    #[cfg(target_os = "macos")]
+    master: czi_ssh_darwin::PtyMaster,
+    transcript: String,
+    latest_output: String,
+}
+
+impl SshConsole {
+    /// Read available PTY output into a bounded, terminal-control-safe display string.
+    ///
+    /// The returned reference remains valid until the next mutable console operation. It contains
+    /// at most [`SSH_CONSOLE_OUTPUT_LIMIT`] bytes. Use [`Self::transcript`] for the retained tail
+    /// across drains.
+    ///
+    /// # Errors
+    ///
+    /// Returns an unsupported-platform error outside macOS or an error reading the PTY master.
+    pub fn drain_output(&mut self) -> Result<&str, SftpError> {
+        self.latest_output.clear();
+        #[cfg(target_os = "macos")]
+        {
+            let mut raw = Vec::new();
+            self.master
+                .read_available(&mut raw, SSH_CONSOLE_OUTPUT_LIMIT)
+                .map_err(|source| SftpError::io("read embedded SSH console", source))?;
+            for byte in raw {
+                match byte {
+                    b'\n' | b'\r' => append_console_fragment(&mut self.latest_output, "\n"),
+                    b'\t' => append_console_fragment(&mut self.latest_output, "    "),
+                    b' '..=b'~' => append_console_byte(&mut self.latest_output, byte),
+                    _ => {}
+                }
+            }
+            append_bounded(&mut self.transcript, &self.latest_output);
+            Ok(&self.latest_output)
+        }
+        #[cfg(not(target_os = "macos"))]
+        Err(unsupported_embedded_console())
+    }
+
+    /// Return the bounded, sanitized output retained so far.
+    #[must_use]
+    pub fn transcript(&self) -> &str {
+        &self.transcript
+    }
+
+    /// Immediately write user-supplied bytes to the PTY master.
+    ///
+    /// This method intentionally has no input buffer or history. The PTY begins with echo
+    /// disabled, so password-like input is not copied back into output by the terminal line
+    /// discipline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an unsupported-platform error outside macOS or an error writing the PTY master.
+    pub fn write_input(&mut self, input: &[u8]) -> Result<(), SftpError> {
+        #[cfg(target_os = "macos")]
+        {
+            self.master
+                .write_input(input)
+                .map_err(|source| SftpError::io("write embedded SSH console", source))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = input;
+            Err(unsupported_embedded_console())
+        }
+    }
+}
+
+/// A cancellation handle for a pending or active embedded OpenSSH child.
+///
+/// Cancellation immediately terminates the child. The owner of the pending connection or final
+/// [`SftpSession`] reaps it while unwinding its blocked SFTP pipe operation.
+#[derive(Clone)]
+pub struct EmbeddedSshCancellation {
+    #[cfg(target_os = "macos")]
+    inner: czi_ssh_darwin::Cancellation,
+}
+
+impl EmbeddedSshCancellation {
+    /// Immediately terminate the embedded child without parsing any prompt text.
+    ///
+    /// # Errors
+    ///
+    /// Returns an unsupported-platform error outside macOS or an error signalling the process.
+    pub fn cancel(&self) -> Result<(), SftpError> {
+        #[cfg(target_os = "macos")]
+        {
+            self.inner
+                .cancel()
+                .map_err(|source| SftpError::io("cancel embedded OpenSSH", source))
+        }
+        #[cfg(not(target_os = "macos"))]
+        Err(unsupported_embedded_console())
+    }
+}
+
+/// An embedded OpenSSH child that has not yet passed strict SFTP VERSION negotiation.
+///
+/// Call [`Self::cancellation`] before moving this into a worker, keep the paired [`SshConsole`]
+/// in the UI, then call [`Self::initialize`] in that worker. Authentication success is determined
+/// only by a strict SFTP v3 `VERSION` packet; console text is never parsed.
+pub struct PendingEmbeddedSftpSession {
+    session: SftpSession,
+    cancellation: EmbeddedSshCancellation,
+}
+
+impl PendingEmbeddedSftpSession {
+    /// Clone a cancellation handle that remains usable after [`Self::initialize`] moves this
+    /// pending connection into an [`SftpSession`].
+    #[must_use]
+    pub fn cancellation(&self) -> EmbeddedSshCancellation {
+        self.cancellation.clone()
+    }
+
+    /// Negotiate strict SFTP v3 over the child binary pipes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the child does not respond with a strict SFTP v3 `VERSION` packet.
+    pub fn initialize(mut self) -> Result<SftpSession, SftpError> {
+        let result = self.session.initialize_inner();
+        self.session.finish(result)?;
+        Ok(self.session)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn append_bounded(transcript: &mut String, output: &str) {
+    let combined = transcript.len().saturating_add(output.len());
+    if combined > SSH_CONSOLE_OUTPUT_LIMIT {
+        transcript.drain(..combined - SSH_CONSOLE_OUTPUT_LIMIT);
+    }
+    transcript.push_str(output);
+}
+
+#[cfg(target_os = "macos")]
+fn append_console_fragment(output: &mut String, fragment: &str) {
+    let remaining = SSH_CONSOLE_OUTPUT_LIMIT.saturating_sub(output.len());
+    output.push_str(&fragment[..fragment.len().min(remaining)]);
+}
+
+#[cfg(target_os = "macos")]
+fn append_console_byte(output: &mut String, byte: u8) {
+    if output.len() < SSH_CONSOLE_OUTPUT_LIMIT {
+        output.push(char::from(byte));
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn unsupported_embedded_console() -> SftpError {
+    SftpError::UnsupportedPlatform {
+        feature: "embedded SSH console",
+    }
+}
+
+/// Run the short same-executable PTY executor when the process was launched in that mode.
+///
+/// The normal application binary must call this before initializing threads or its GUI. On macOS,
+/// the executor claims its already-opened PTY slave as the controlling terminal, removes any
+/// ASKPASS environment, and `execve`s the absolute `/usr/bin/ssh` argument vector. It never
+/// returns after a successful exec. Other platforms return `Ok(false)`.
+///
+/// # Errors
+///
+/// Returns an error for malformed executor arguments or if claiming the terminal or starting
+/// OpenSSH fails.
+pub fn run_embedded_pty_executor_if_requested() -> io::Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        let arguments = std::env::args_os().collect::<Vec<_>>();
+        if arguments
+            .get(1)
+            .is_none_or(|argument| argument != EMBEDDED_PTY_EXEC_MODE)
+        {
+            Ok(false)
+        } else {
+            let executable = arguments.get(2).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "embedded SSH executor requires an OpenSSH executable",
+                )
+            })?;
+            if executable != std::ffi::OsStr::new(crate::OPENSSH_PATH) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "embedded SSH executor accepts only /usr/bin/ssh",
+                ));
+            }
+            if arguments.len() < 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "embedded SSH executor requires OpenSSH arguments",
+                ));
+            }
+            let ssh_argv = arguments[2..].to_vec();
+            match czi_ssh_darwin::claim_controlling_terminal_and_exec(
+                std::path::Path::new(executable),
+                &ssh_argv,
+            ) {
+                Ok(never) => match never {},
+                Err(error) => Err(error),
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    Ok(false)
 }
 
 impl SftpSession {
@@ -101,6 +324,110 @@ impl SftpSession {
         let result = session.initialize_inner();
         session.finish(result)?;
         Ok(session)
+    }
+
+    /// Start the macOS embedded OpenSSH PTY transport without waiting for authentication.
+    ///
+    /// The returned pending connection must be initialized on the SFTP worker while the paired
+    /// console is driven by the UI. This leaves the existing visible-Terminal bridge selection
+    /// unchanged. OpenSSH always receives the absolute `/usr/bin/ssh` executable and an argument
+    /// vector; no shell, ASKPASS environment, or `ControlMaster` is used.
+    ///
+    /// # Errors
+    ///
+    /// Returns an unsupported-platform error outside macOS or an error setting up the child.
+    pub fn start_embedded(
+        profile: &SshProfile,
+        config: &OpenSshConfig,
+    ) -> Result<(PendingEmbeddedSftpSession, SshConsole), SftpError> {
+        #[cfg(target_os = "macos")]
+        {
+            let executor = std::env::current_exe()
+                .map_err(|source| SftpError::io("locate embedded SSH executor", source))?;
+            Self::start_embedded_with_executor(profile, config, &executor)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (profile, config);
+            Err(unsupported_embedded_console())
+        }
+    }
+
+    /// Start the embedded transport through a caller-supplied same-executable PTY executor.
+    ///
+    /// The executor is spawned with [`EMBEDDED_PTY_EXEC_MODE`] followed by the exact production
+    /// `/usr/bin/ssh` argument vector. It must dispatch that mode before it starts application
+    /// threads and call [`run_embedded_pty_executor_if_requested`]. This explicit variant supports
+    /// application launchers whose executable differs from the current process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an unsupported-platform error outside macOS or an error setting up the child.
+    pub fn start_embedded_with_executor(
+        profile: &SshProfile,
+        config: &OpenSshConfig,
+        executor: &std::path::Path,
+    ) -> Result<(PendingEmbeddedSftpSession, SshConsole), SftpError> {
+        let _ = config;
+        let ssh_argv = OpenSshConfig::embedded_sftp_argv(profile);
+        #[cfg(target_os = "macos")]
+        {
+            let mut argv = Vec::with_capacity(ssh_argv.len() + 2);
+            argv.push(executor.as_os_str().to_os_string());
+            argv.push(EMBEDDED_PTY_EXEC_MODE.into());
+            argv.extend(ssh_argv);
+            Self::start_embedded_argv(&argv, &[])
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (executor, ssh_argv);
+            Err(unsupported_embedded_console())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn start_embedded_argv(
+        argv: &[std::ffi::OsString],
+        extra_environment: &[(std::ffi::OsString, std::ffi::OsString)],
+    ) -> Result<(PendingEmbeddedSftpSession, SshConsole), SftpError> {
+        let executable = argv.first().ok_or_else(|| {
+            SftpError::io(
+                "start embedded OpenSSH",
+                io::Error::new(io::ErrorKind::InvalidInput, "missing OpenSSH executable"),
+            )
+        })?;
+        let spawned =
+            czi_ssh_darwin::spawn(std::path::Path::new(executable), argv, extra_environment)
+                .map_err(|source| SftpError::Spawn { source })?;
+        let czi_ssh_darwin::SpawnedPty {
+            stdin,
+            stdout,
+            pty_master,
+            child,
+            cancellation,
+        } = spawned;
+        let cancellation = EmbeddedSshCancellation {
+            inner: cancellation,
+        };
+        let session = Self {
+            transport: Transport::MacosPty {
+                child,
+                stdin: Some(stdin),
+                stdout: Some(stdout),
+            },
+            next_request_id: Some(1),
+        };
+        Ok((
+            PendingEmbeddedSftpSession {
+                session,
+                cancellation,
+            },
+            SshConsole {
+                master: pty_master,
+                transcript: String::new(),
+                latest_output: String::new(),
+            },
+        ))
     }
 
     /// Connect through a waiting interactive bridge when available, otherwise use direct batch
@@ -740,6 +1067,12 @@ enum Transport {
         stdout: Option<ChildStdout>,
         stderr: Option<JoinHandle<io::Result<Vec<u8>>>>,
     },
+    #[cfg(target_os = "macos")]
+    MacosPty {
+        child: czi_ssh_darwin::Child,
+        stdin: Option<std::fs::File>,
+        stdout: Option<std::fs::File>,
+    },
     #[cfg(unix)]
     Unix {
         reader: Option<UnixStream>,
@@ -754,9 +1087,26 @@ enum Transport {
 }
 
 impl Transport {
+    fn is_child_process(&self) -> bool {
+        match self {
+            Self::Process { .. } => true,
+            #[cfg(target_os = "macos")]
+            Self::MacosPty { .. } => true,
+            #[cfg(unix)]
+            Self::Unix { .. } => false,
+            #[cfg(test)]
+            Self::Test { .. } => false,
+        }
+    }
+
     fn write_all(&mut self, bytes: &[u8], operation: &'static str) -> Result<(), SftpError> {
         let result = match self {
             Self::Process { stdin, .. } => stdin.as_mut().map_or_else(
+                || Err(io::Error::new(io::ErrorKind::BrokenPipe, "stdin closed")),
+                |stdin| stdin.write_all(bytes),
+            ),
+            #[cfg(target_os = "macos")]
+            Self::MacosPty { stdin, .. } => stdin.as_mut().map_or_else(
                 || Err(io::Error::new(io::ErrorKind::BrokenPipe, "stdin closed")),
                 |stdin| stdin.write_all(bytes),
             ),
@@ -790,6 +1140,11 @@ impl Transport {
                 || Err(io::Error::new(io::ErrorKind::BrokenPipe, "stdin closed")),
                 ChildStdin::flush,
             ),
+            #[cfg(target_os = "macos")]
+            Self::MacosPty { stdin, .. } => stdin.as_mut().map_or_else(
+                || Err(io::Error::new(io::ErrorKind::BrokenPipe, "stdin closed")),
+                Write::flush,
+            ),
             #[cfg(unix)]
             Self::Unix { writer, .. } => writer.as_mut().map_or_else(
                 || {
@@ -822,8 +1177,7 @@ impl Transport {
         match result {
             Ok(()) => Ok(()),
             Err(source)
-                if source.kind() == io::ErrorKind::BrokenPipe
-                    && matches!(self, Self::Process { .. }) =>
+                if source.kind() == io::ErrorKind::BrokenPipe && self.is_child_process() =>
             {
                 Err(self.child_exited(operation))
             }
@@ -834,6 +1188,16 @@ impl Transport {
     fn read_exact(&mut self, bytes: &mut [u8], operation: &'static str) -> Result<(), SftpError> {
         let result = match self {
             Self::Process { stdout, .. } => stdout
+                .as_mut()
+                .ok_or_else(|| {
+                    SftpError::io(
+                        operation,
+                        io::Error::new(io::ErrorKind::UnexpectedEof, "stdout closed"),
+                    )
+                })?
+                .read_exact(bytes),
+            #[cfg(target_os = "macos")]
+            Self::MacosPty { stdout, .. } => stdout
                 .as_mut()
                 .ok_or_else(|| {
                     SftpError::io(
@@ -866,7 +1230,7 @@ impl Transport {
         match result {
             Ok(()) => Ok(()),
             Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => {
-                if matches!(self, Self::Process { .. }) {
+                if self.is_child_process() {
                     Err(self.child_exited(operation))
                 } else {
                     Err(SftpError::io(operation, source))
@@ -899,6 +1263,28 @@ impl Transport {
                     stderr,
                 }
             }
+            #[cfg(target_os = "macos")]
+            Self::MacosPty {
+                child,
+                stdin,
+                stdout,
+            } => {
+                drop(stdin.take());
+                drop(stdout.take());
+                let status = match child.try_wait() {
+                    Ok(Some(raw_status)) => Some(std::process::ExitStatus::from_raw(raw_status)),
+                    Ok(None) | Err(_) => child
+                        .terminate_and_wait()
+                        .ok()
+                        .flatten()
+                        .map(std::process::ExitStatus::from_raw),
+                };
+                SftpError::ChildExited {
+                    operation,
+                    status,
+                    stderr: String::new(),
+                }
+            }
             #[cfg(unix)]
             Self::Unix { .. } => SftpError::io(
                 operation,
@@ -925,6 +1311,16 @@ impl Transport {
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = collect_stderr(stderr);
+            }
+            #[cfg(target_os = "macos")]
+            Self::MacosPty {
+                child,
+                stdin,
+                stdout,
+            } => {
+                drop(stdin.take());
+                drop(stdout.take());
+                let _ = child.terminate_and_wait();
             }
             #[cfg(unix)]
             Self::Unix {

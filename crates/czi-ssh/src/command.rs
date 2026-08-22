@@ -191,19 +191,29 @@ impl OpenSshConfig {
         argv
     }
 
-    /// Build an interactive direct OpenSSH SFTP-subsystem argument vector for a Terminal bridge.
+    /// Build the interactive SFTP-subsystem arguments for the embedded PTY transport.
     ///
-    /// SSH stdin and stdout are reserved for binary SFTP packets. OpenSSH retains the controlling
-    /// terminal through stderr and `/dev/tty` for host-key, password, and 2FA prompts. This never
-    /// configures `ControlMaster` or a control path.
+    /// SSH stdin and stdout remain reserved for binary SFTP packets. Host-key, password, and 2FA
+    /// interaction uses the child process's local controlling terminal through stderr and
+    /// `/dev/tty`. The `-T` option disables only a *remote* terminal; it does not affect that local
+    /// PTY. This never configures `ControlMaster` or a control path.
     #[must_use]
-    pub fn interactive_sftp_argv(profile: &SshProfile) -> Vec<OsString> {
+    pub fn embedded_sftp_argv(profile: &SshProfile) -> Vec<OsString> {
         let mut argv = common_argv(false);
         argv.push(OsString::from("-T"));
         argv.push(OsString::from("-s"));
         argv.push(OsString::from(profile.as_str()));
         argv.push(OsString::from("sftp"));
         argv
+    }
+
+    /// Build an interactive direct OpenSSH SFTP-subsystem argument vector for a Terminal bridge.
+    ///
+    /// This remains the visible-Terminal fallback and uses the same security arguments as the
+    /// embedded PTY transport.
+    #[must_use]
+    pub fn interactive_sftp_argv(profile: &SshProfile) -> Vec<OsString> {
+        Self::embedded_sftp_argv(profile)
     }
 
     /// Build a safely shell-quoted command that starts the same executable's interactive SFTP

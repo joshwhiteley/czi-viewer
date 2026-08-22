@@ -363,6 +363,14 @@ name = "czi-ssh"
 version = "0.1.0"
 dependencies = [
  "czi-core",
+ "czi-ssh-darwin",
+]
+
+[[package]]
+name = "czi-ssh-darwin"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
