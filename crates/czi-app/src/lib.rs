@@ -5,7 +5,7 @@
 )]
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -13,8 +13,9 @@ use std::time::Duration;
 
 use czi_core::{
     BlockCache, CziDataset, DecodedPixels, DecodedTile, DimensionCode, LocalFileSource,
-    PhysicalSize, PixelType, PlaneInfo, PlaneKey, PlaneSelector, PyramidScale, SceneId,
-    SpatialRect, TileHit, TileId, TileIndex, TileQueryIndex, ViewQuery,
+    MetadataDocument, MetadataParseOptions, MetadataSummary, PhysicalSize, PixelType, PlaneInfo,
+    PlaneKey, PlaneSelector, PyramidScale, SceneId, SpatialRect, TileHit, TileId, TileIndex,
+    TileQueryIndex, ViewQuery, summarize_metadata,
 };
 use czi_ssh::{
     EmbeddedSshCancellation, OpenSshConfig, RemoteDirEntry, SftpLocation, SftpSession, SftpSource,
@@ -23,7 +24,6 @@ use czi_ssh::{
 use eframe::egui;
 
 const CHANNEL_CAPACITY: usize = 8;
-const METADATA_PREVIEW_CHARS: usize = 4_096;
 const TEXTURE_CACHE_LIMIT: usize = 256 * 1024 * 1024;
 const MAX_REMOTE_SUGGESTIONS: usize = 200;
 const MAX_REMOTE_DIRECTORY_ENTRIES: usize = 4_096;
@@ -433,7 +433,7 @@ fn remote_selection_action(
     })
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct DatasetInfo {
     source_label: String,
     tile_count: usize,
@@ -443,16 +443,32 @@ struct DatasetInfo {
     t: DimensionChoices,
     planes: Vec<PlaneInfo>,
     pixel_type: PixelType,
-    metadata_preview: String,
+    metadata: MetadataDocument,
+    metadata_summary: MetadataSummary,
 }
 
 impl DatasetInfo {
     fn from_dataset(source_label: String, dataset: &CziDataset, query: &TileQueryIndex) -> Self {
         let tiles = &dataset.index().tiles;
-        let metadata_preview = dataset.index().metadata.as_ref().map_or_else(
-            || String::from("No global metadata XML."),
-            |metadata| metadata.xml.chars().take(METADATA_PREVIEW_CHARS).collect(),
+        let metadata = dataset.index().metadata.as_ref().map_or_else(
+            || MetadataDocument {
+                root: None,
+                diagnostics: vec![czi_core::MetadataDiagnostic {
+                    message: String::from("This CZI has no global metadata XML."),
+                }],
+                raw_xml: None,
+            },
+            |metadata| {
+                MetadataDocument::parse(
+                    &metadata.xml,
+                    MetadataParseOptions {
+                        retain_raw_xml: true,
+                        ..MetadataParseOptions::default()
+                    },
+                )
+            },
         );
+        let metadata_summary = summarize_metadata(&metadata);
         let pixel_type = tiles
             .first()
             .map_or(PixelType::Gray8, |tile| tile.entry.pixel_type);
@@ -465,7 +481,8 @@ impl DatasetInfo {
             t: dimension_choices(tiles, DimensionCode::T),
             planes: query.planes().cloned().collect(),
             pixel_type,
-            metadata_preview,
+            metadata,
+            metadata_summary,
         }
     }
 
@@ -711,7 +728,7 @@ fn set_console_pump_error(snapshot: &Mutex<ConsolePumpSnapshot>, error: String) 
 
 enum WorkerEvent {
     Opened {
-        info: DatasetInfo,
+        info: Box<DatasetInfo>,
         source_generation: u64,
         connection_generation: u64,
         remote: bool,
@@ -1065,7 +1082,7 @@ fn send_open_result(
         Ok((dataset, query, info)) => {
             let sent = events
                 .send(WorkerEvent::Opened {
-                    info,
+                    info: Box::new(info),
                     source_generation,
                     connection_generation,
                     remote,
@@ -2042,7 +2059,7 @@ struct PendingTile {
     view_generation: u64,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct PyramidDisplay {
     requested: Option<PyramidScale>,
     displayed: Option<PyramidScale>,
@@ -2094,6 +2111,12 @@ impl RemoteBrowserVisibility {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum InspectorTab {
+    Display,
+    Metadata,
+}
+
 struct EmbeddedAuthentication {
     profile: String,
     console: ConsolePump,
@@ -2132,6 +2155,8 @@ pub struct ViewerApp {
     remote_session: Option<(String, u64)>,
     profile_editing: bool,
     authentication_focus_request: Option<u64>,
+    inspector_tab: InspectorTab,
+    metadata_filter: String,
     dataset: Option<DatasetInfo>,
     dataset_origin: Option<DatasetOrigin>,
     opening_origin: Option<DatasetOrigin>,
@@ -2175,6 +2200,8 @@ impl ViewerApp {
             remote_session: None,
             profile_editing: false,
             authentication_focus_request: None,
+            inspector_tab: InspectorTab::Display,
+            metadata_filter: String::new(),
             dataset: None,
             dataset_origin: None,
             opening_origin: None,
@@ -2558,6 +2585,127 @@ impl ViewerApp {
         }
     }
 
+    fn show_display_inspector(&mut self, ui: &mut egui::Ui) {
+        let before_selection = self.selection;
+        let selection_changed = if let Some(dataset) = self.dataset.as_ref() {
+            ui.weak(format!("{} indexed tile(s)", dataset.tile_count));
+            ui.separator();
+            channel_selector(
+                ui,
+                &dataset.c,
+                &dataset.metadata_summary,
+                &mut self.selection.c,
+            ) | scene_selector(ui, &dataset.s, &mut self.selection.scene)
+                | selection_selector(ui, "Z", &dataset.z, &mut self.selection.z)
+                | selection_selector(ui, "T", &dataset.t, &mut self.selection.t)
+        } else {
+            ui.label("No dataset is open.");
+            false
+        };
+        if selection_changed {
+            let changed = [
+                before_selection.c != self.selection.c,
+                before_selection.scene != self.selection.scene,
+                before_selection.z != self.selection.z,
+                before_selection.t != self.selection.t,
+            ];
+            if let Some(dataset) = self.dataset.as_ref() {
+                self.selection = dataset.repair_selection(self.selection, changed);
+            }
+            self.cache.clear();
+            self.invalidate_view();
+            self.fit_pending = true;
+        }
+
+        ui.separator();
+        ui.heading("Display range");
+        let pixel_type = self
+            .dataset
+            .as_ref()
+            .map_or(PixelType::Gray16, |dataset| dataset.pixel_type);
+        if level_selector(ui, pixel_type, &mut self.levels) {
+            self.cache.clear();
+            self.invalidate_view();
+        }
+        if let Some(scale) = self.pyramid_display.requested {
+            ui.label(format!("Requested pyramid scale: {}×", format_scale(scale)));
+        }
+        if let Some(scale) = self.pyramid_display.displayed {
+            ui.label(format!("Displayed pyramid scale: {}×", format_scale(scale)));
+        }
+        if let Some(dataset) = self.dataset.as_ref() {
+            let (visible, resident, bytes) = self
+                .cache
+                .current_counts(self.generations.source, self.selection.key());
+            ui.label(format!(
+                "Visible: {visible} · Resident: {resident} · Cache: {}",
+                format_bytes(bytes)
+            ));
+            if let Some(plane) = dataset.plane(self.selection) {
+                ui.label(format!(
+                    "World bounds: [{}, {})..[{}, {})",
+                    plane.world_bounds.min_x,
+                    plane.world_bounds.min_y,
+                    plane.world_bounds.max_x,
+                    plane.world_bounds.max_y
+                ));
+            }
+        }
+    }
+
+    fn show_metadata_inspector(&mut self, ui: &mut egui::Ui) {
+        let Some(dataset) = self.dataset.as_ref() else {
+            ui.label("Open a CZI to inspect metadata.");
+            return;
+        };
+        if dataset.metadata_summary.channels.is_empty() {
+            ui.weak("No named channels were found.");
+        } else {
+            ui.label("Channels");
+            for channel in &dataset.metadata_summary.channels {
+                ui.weak(format!("C {} · {}", channel.index, channel.label));
+            }
+        }
+        if let Some(pixel_size) = dataset.metadata_summary.pixel_size {
+            ui.label(format!(
+                "Pixel size: {:.4} × {:.4} µm",
+                pixel_size.x_um, pixel_size.y_um
+            ));
+        } else {
+            ui.weak("No physical X/Y pixel calibration was found.");
+        }
+        for diagnostic in &dataset.metadata.diagnostics {
+            ui.colored_label(egui::Color32::GOLD, &diagnostic.message);
+        }
+        ui.separator();
+        ui.add(
+            egui::TextEdit::singleline(&mut self.metadata_filter)
+                .hint_text("Search metadata fields and values"),
+        );
+        let filter = self.metadata_filter.trim().to_ascii_lowercase();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            if let Some(root) = dataset.metadata.root.as_ref() {
+                metadata_tree(ui, root, &filter, 0);
+            } else {
+                ui.weak("No structured metadata is available.");
+            }
+            if let Some(raw_xml) = dataset.metadata.raw_xml.as_deref() {
+                egui::CollapsingHeader::new("Raw XML")
+                    .id_salt("czi-raw-metadata")
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(raw_xml).monospace())
+                                        .wrap(),
+                                );
+                            });
+                    });
+            }
+        });
+    }
+
     #[allow(clippy::too_many_lines)]
     fn handle_worker_event(&mut self, event: WorkerEvent) {
         match event {
@@ -2620,7 +2768,7 @@ impl ViewerApp {
                 remote,
             ) =>
             {
-                self.handle_opened(info, source_generation, remote);
+                self.handle_opened(*info, source_generation, remote);
             }
             WorkerEvent::OpenFailed {
                 message,
@@ -3188,6 +3336,15 @@ impl ViewerApp {
             }
             ui.weak("Wheel: zoom at cursor · Drag: pan · logical world coordinates");
         });
+        let (title_response, title_painter) =
+            ui.allocate_painter(egui::vec2(ui.available_width(), 26.0), egui::Sense::hover());
+        draw_canvas_title(
+            &title_painter,
+            title_response.rect,
+            self.dataset.as_ref(),
+            self.selection,
+            self.pyramid_display,
+        );
         let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::drag());
         painter.rect_filled(response.rect, 0.0, egui::Color32::from_gray(24));
 
@@ -3204,6 +3361,7 @@ impl ViewerApp {
             return;
         };
         let bounds = plane.world_bounds;
+        let pixel_size_um = dataset.metadata_summary.pixel_size.map(|size| size.x_um);
         if self.fit_pending {
             self.camera.fit(response.rect, bounds);
             self.fit_pending = false;
@@ -3288,6 +3446,7 @@ impl ViewerApp {
         if !has_visible {
             canvas_message(&painter, response.rect, "Loading visible tiles…");
         }
+        draw_scale_bar(&painter, response.rect, self.camera.zoom, pixel_size_um);
     }
 }
 
@@ -3339,6 +3498,146 @@ fn format_scale(scale: PyramidScale) -> String {
     } else {
         format!("{}/{}", scale.numerator, scale.denominator)
     }
+}
+
+fn draw_canvas_title(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    dataset: Option<&DatasetInfo>,
+    selection: PlaneSelection,
+    pyramid: PyramidDisplay,
+) {
+    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(20, 24, 29));
+    let text = dataset.map_or_else(
+        || String::from("No CZI loaded"),
+        |dataset| {
+            let requested = pyramid
+                .requested
+                .map_or_else(|| String::from("—"), format_scale);
+            let displayed = pyramid
+                .displayed
+                .map_or_else(|| String::from("—"), format_scale);
+            format!(
+                "{}  ·  Scene {}  ·  {}  ·  Z {}  ·  T {}  ·  Requested {}×  ·  Displayed {}×",
+                source_filename(&dataset.source_label),
+                scene_label(selection.scene),
+                channel_label(&dataset.metadata_summary, selection.c),
+                selection.z,
+                selection.t,
+                requested,
+                displayed,
+            )
+        },
+    );
+    painter.text(
+        rect.left_center() + egui::vec2(8.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::proportional(13.0),
+        egui::Color32::from_rgb(232, 236, 241),
+    );
+}
+
+fn source_filename(source: &str) -> String {
+    Path::new(source)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map_or_else(
+            || source.rsplit('/').next().unwrap_or(source).to_owned(),
+            str::to_owned,
+        )
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ScaleBar {
+    points: f32,
+    label: String,
+}
+
+fn scale_bar_spec(zoom: f64, pixel_size_um: Option<f64>) -> Option<ScaleBar> {
+    if !zoom.is_finite() || zoom <= 0.0 {
+        return None;
+    }
+    let (units_per_point, suffix) = match pixel_size_um {
+        Some(size) if size.is_finite() && size > 0.0 => (size / zoom, "µm"),
+        _ => (1.0 / zoom, "px"),
+    };
+    let target_units = 100.0 * units_per_point;
+    let length = nice_scale_length(target_units)?;
+    let points = (length / units_per_point) as f32;
+    (points.is_finite() && points > 0.0).then(|| ScaleBar {
+        points,
+        label: format!("{} {suffix}", format_scale_length(length)),
+    })
+}
+
+fn nice_scale_length(target: f64) -> Option<f64> {
+    if !target.is_finite() || target <= 0.0 {
+        return None;
+    }
+    let base = 10.0_f64.powf(target.log10().floor());
+    for factor in [5.0, 2.0, 1.0] {
+        let candidate = factor * base;
+        if candidate <= target {
+            return Some(candidate);
+        }
+    }
+    Some(base / 10.0)
+}
+
+fn format_scale_length(length: f64) -> String {
+    if length >= 1.0 {
+        format!("{length:.0}")
+    } else if length >= 0.1 {
+        format!("{length:.1}")
+    } else if length >= 0.01 {
+        format!("{length:.2}")
+    } else {
+        format!("{length:.3}")
+    }
+}
+
+fn draw_scale_bar(
+    painter: &egui::Painter,
+    canvas: egui::Rect,
+    zoom: f64,
+    pixel_size_um: Option<f64>,
+) {
+    let Some(bar) = scale_bar_spec(zoom, pixel_size_um) else {
+        return;
+    };
+    let start = egui::pos2(canvas.left() + 18.0, canvas.bottom() - 18.0);
+    let end = start + egui::vec2(bar.points.min((canvas.width() - 36.0).max(1.0)), 0.0);
+    let black = egui::Stroke::new(5.0, egui::Color32::BLACK);
+    let white = egui::Stroke::new(2.0, egui::Color32::WHITE);
+    painter.line_segment([start, end], black);
+    painter.line_segment([start, end], white);
+    for point in [start, end] {
+        painter.line_segment(
+            [point - egui::vec2(0.0, 5.0), point + egui::vec2(0.0, 5.0)],
+            black,
+        );
+        painter.line_segment(
+            [point - egui::vec2(0.0, 5.0), point + egui::vec2(0.0, 5.0)],
+            white,
+        );
+    }
+    let text_position = start + egui::vec2(0.0, -8.0);
+    painter.text(
+        text_position + egui::vec2(1.0, 1.0),
+        egui::Align2::LEFT_BOTTOM,
+        &bar.label,
+        egui::FontId::proportional(12.0),
+        egui::Color32::BLACK,
+    );
+    painter.text(
+        text_position,
+        egui::Align2::LEFT_BOTTOM,
+        bar.label,
+        egui::FontId::proportional(12.0),
+        egui::Color32::WHITE,
+    );
 }
 
 fn console_key_input(key: egui::Key, modifiers: egui::Modifiers) -> Option<Vec<u8>> {
@@ -3611,86 +3910,24 @@ impl eframe::App for ViewerApp {
             .max_width(320.0)
             .show(context, |ui| {
                 ui.heading("Dataset");
-                let before_selection = self.selection;
-                let selection_changed = if let Some(dataset) = self.dataset.as_ref() {
-                    ui.label(&dataset.source_label);
-                    ui.label(format!("{} indexed tile(s)", dataset.tile_count));
-                    ui.separator();
-                    selection_selector(ui, "C", &dataset.c, &mut self.selection.c)
-                        | scene_selector(ui, &dataset.s, &mut self.selection.scene)
-                        | selection_selector(ui, "Z", &dataset.z, &mut self.selection.z)
-                        | selection_selector(ui, "T", &dataset.t, &mut self.selection.t)
-                } else {
-                    ui.label("No dataset is open.");
-                    false
-                };
-                if selection_changed {
-                    let changed = [
-                        before_selection.c != self.selection.c,
-                        before_selection.scene != self.selection.scene,
-                        before_selection.z != self.selection.z,
-                        before_selection.t != self.selection.t,
-                    ];
-                    if let Some(dataset) = self.dataset.as_ref() {
-                        self.selection = dataset.repair_selection(self.selection, changed);
-                    }
-                    self.cache.clear();
-                    self.invalidate_view();
-                    self.fit_pending = true;
-                }
-
                 ui.separator();
-                ui.heading("Display range");
-                let pixel_type = self
-                    .dataset
-                    .as_ref()
-                    .map_or(PixelType::Gray16, |dataset| dataset.pixel_type);
-                if level_selector(ui, pixel_type, &mut self.levels) {
-                    self.cache.clear();
-                    self.invalidate_view();
-                }
-                if let Some(scale) = self.pyramid_display.requested {
-                    ui.label(format!("Requested pyramid scale: {}×", format_scale(scale)));
-                }
-                if let Some(scale) = self.pyramid_display.displayed {
-                    ui.label(format!("Displayed pyramid scale: {}×", format_scale(scale)));
-                }
-                if let Some(dataset) = self.dataset.as_ref() {
-                    let (visible, resident, bytes) = self
-                        .cache
-                        .current_counts(self.generations.source, self.selection.key());
-                    ui.label(format!(
-                        "Visible: {visible} · Resident: {resident} · Cache: {}",
-                        format_bytes(bytes)
-                    ));
-                    if let Some(plane) = dataset.plane(self.selection) {
-                        ui.label(format!(
-                            "World bounds: [{}, {})..[{}, {})",
-                            plane.world_bounds.min_x,
-                            plane.world_bounds.min_y,
-                            plane.world_bounds.max_x,
-                            plane.world_bounds.max_y
-                        ));
-                    }
-                }
-
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.inspector_tab, InspectorTab::Display, "Display");
+                    ui.selectable_value(
+                        &mut self.inspector_tab,
+                        InspectorTab::Metadata,
+                        "Metadata",
+                    );
+                });
                 ui.separator();
-                ui.heading("Raw metadata preview");
-                egui::ScrollArea::vertical()
-                    .max_height(260.0)
-                    .show(ui, |ui| {
-                        if let Some(dataset) = self.dataset.as_ref() {
-                            ui.monospace(&dataset.metadata_preview);
-                        } else {
-                            ui.label("Open a CZI to inspect its metadata.");
-                        }
-                    });
+                match self.inspector_tab {
+                    InspectorTab::Display => self.show_display_inspector(ui),
+                    InspectorTab::Metadata => self.show_metadata_inspector(ui),
+                }
             });
 
         self.refresh_textures(context);
         egui::CentralPanel::default().show(context, |ui| {
-            ui.heading("Canvas");
-            ui.separator();
             self.show_canvas(ui);
         });
 
@@ -3720,6 +3957,94 @@ fn selection_selector(
             }
         });
     *selected != before
+}
+
+fn channel_selector(
+    ui: &mut egui::Ui,
+    choices: &DimensionChoices,
+    summary: &MetadataSummary,
+    selected: &mut i32,
+) -> bool {
+    if !choices.present {
+        ui.horizontal(|ui| {
+            ui.label("C");
+            ui.weak("not present (0)");
+        });
+        return false;
+    }
+    let label = |channel| channel_label(summary, channel);
+    let before = *selected;
+    egui::ComboBox::from_label("C")
+        .selected_text(label(*selected))
+        .show_ui(ui, |ui| {
+            for value in &choices.values {
+                ui.selectable_value(selected, *value, label(*value));
+            }
+        });
+    *selected != before
+}
+
+fn channel_label(summary: &MetadataSummary, channel: i32) -> String {
+    summary
+        .channels
+        .iter()
+        .find(|metadata| metadata.index == channel)
+        .map_or_else(
+            || format!("C {channel} · Channel {channel}"),
+            |metadata| format!("C {channel} · {}", metadata.label),
+        )
+}
+
+fn metadata_tree(ui: &mut egui::Ui, node: &czi_core::MetadataNode, filter: &str, depth: usize) {
+    if !metadata_matches(node, filter) {
+        return;
+    }
+    let text = (!node.text.is_empty()).then(|| format!(" = {}", node.text));
+    let label = text.map_or_else(
+        || node.name.clone(),
+        |text| format!("{}{}", node.name, text),
+    );
+    ui.push_id((depth, &node.name), |ui| {
+        egui::CollapsingHeader::new(label)
+            .default_open(depth < 2 || !filter.is_empty())
+            .show(ui, |ui| {
+                if !node.text.is_empty() {
+                    egui::Grid::new("value").show(ui, |ui| {
+                        ui.weak("Value");
+                        ui.monospace(&node.text);
+                        ui.end_row();
+                    });
+                }
+                if !node.attributes.is_empty() {
+                    egui::Grid::new("attributes").striped(true).show(ui, |ui| {
+                        for attribute in &node.attributes {
+                            ui.weak(&attribute.name);
+                            ui.monospace(&attribute.value);
+                            ui.end_row();
+                        }
+                    });
+                }
+                for (index, child) in node.children.iter().enumerate() {
+                    ui.push_id(index, |ui| metadata_tree(ui, child, filter, depth + 1));
+                }
+            });
+    });
+}
+
+fn metadata_matches(node: &czi_core::MetadataNode, filter: &str) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    node.name.to_ascii_lowercase().contains(filter)
+        || node.text.to_ascii_lowercase().contains(filter)
+        || node.attributes.iter().any(|attribute| {
+            attribute.name.to_ascii_lowercase().contains(filter)
+                || attribute.value.to_ascii_lowercase().contains(filter)
+        })
+        || node
+            .children
+            .iter()
+            .any(|child| metadata_matches(child, filter))
 }
 
 fn scene_selector(ui: &mut egui::Ui, choices: &SceneChoices, selected: &mut SceneId) -> bool {
@@ -4065,6 +4390,26 @@ mod tests {
         assert_eq!(display.displayed, Some(two));
         assert!(display.finish(6, one));
         assert_eq!(display.displayed, Some(one));
+    }
+
+    #[test]
+    fn scale_bar_uses_nice_physical_lengths_and_pixel_fallback() {
+        assert_eq!(
+            scale_bar_spec(2.0, Some(0.5)),
+            Some(ScaleBar {
+                points: 80.0,
+                label: String::from("20 µm"),
+            })
+        );
+        assert_eq!(
+            scale_bar_spec(0.5, None),
+            Some(ScaleBar {
+                points: 100.0,
+                label: String::from("200 px"),
+            })
+        );
+        assert_eq!(nice_scale_length(0.37), Some(0.2));
+        assert_eq!(scale_bar_spec(0.0, Some(0.5)), None);
     }
 
     #[test]
