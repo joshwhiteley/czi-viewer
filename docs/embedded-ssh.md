@@ -28,4 +28,4 @@ The console appears only for SSH authentication. It is not a password field.
 
 The browser resolves Home through SFTP, reads one directory at a time, scans at most 4,096 entries, and shows at most 200 safe directories and `.czi` files. The filename filter is local. Remote paths are SFTP packets only; they are never added to an OpenSSH command line.
 
-Use **Use Terminal fallback** only if embedded SSH cannot authenticate. The viewer then shows a copyable command. Keep that Terminal session open while the remote CZI is in use.
+If embedded SSH cannot authenticate, correct the profile or SSH configuration and select **Reconnect**. The app does not provide a Terminal fallback workflow.

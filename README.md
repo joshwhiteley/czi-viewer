@@ -45,11 +45,7 @@ Remote browsing, opening, and range reads use one authenticated, read-only SFTP 
 
 The viewer resolves home with `REALPATH('.')`, reads only the requested directory, scans at most 4,096 entries, filters unsafe names, and shows at most 200 entries. It lists directories first, then `.czi` files, with type, size, and modification time when the server supplies them. The filename filter is local and does not send another network request. An opened CZI uses a 1 MiB block cache with a 256 MiB budget, and indexes and decodes only the ranges it needs.
 
-### Explicit Terminal fallback
-
-The primary macOS path is the embedded authentication console. If it cannot start or authenticate, select **Use Terminal fallback** to reveal a copyable interactive SFTP bridge command. Run it in Terminal, then select **Reconnect**, **Home**, **Refresh**, or **Go** in the viewer. Keep that Terminal open while the remote file is in use.
-
-The viewer does not launch a shell, parse prompts, automate Terminal, prefill commands, use `SSH_ASKPASS`, or retain credentials, passwords, or one-time codes. OpenSSH stdin/stdout carry only binary SFTP packets; authentication output stays on the PTY. Closing the viewer stops its worker sessions and removes its local bridge directory. The viewer never writes to the remote host.
+The viewer does not launch a shell, parse prompts, automate Terminal, prefill commands, use `SSH_ASKPASS`, or retain credentials, passwords, or one-time codes. OpenSSH stdin/stdout carry only binary SFTP packets; authentication output stays on the PTY. Closing the viewer stops its worker sessions. The viewer never writes to the remote host.
 
 A real Tufts connection is out of scope until a user provides a remote path and is present to authenticate.
 
