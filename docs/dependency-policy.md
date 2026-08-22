@@ -20,7 +20,9 @@ Other permissive licenses require explicit review. GPL, LGPL, AGPL, SSPL, and pr
 
 The eframe `default_fonts` feature embeds font assets under OFL-1.1 and Ubuntu-font-1.0. These two font licenses are allowed only for those bundled assets.
 
-The metadata parser uses `quick-xml` with default features disabled. It is pure Rust and MIT licensed. PNG snapshot export uses `png` with default features disabled. It is pure Rust and dual MIT/Apache-2.0 licensed.
+The metadata parser uses `quick-xml` 0.41 with default features disabled. It is pure Rust and MIT licensed. It uses the plain reader rather than `NsReader`; namespace declarations are ordinary attributes and are bounded by the parser's aggregate attribute-byte limit. PNG snapshot export uses `png` 0.18 with default features disabled. It is pure Rust and dual MIT/Apache-2.0 licensed.
+
+`cargo deny check advisories` currently reports two upstream, transitive, unmaintained crates with no safe upgrade: `paste` (`RUSTSEC-2024-0436`) through `metal`/`wgpu`, and `ttf-parser` (`RUSTSEC-2026-0192`) through `epaint`. Review them when updating the pinned eframe/wgpu stack. The metadata-parser advisories `RUSTSEC-2026-0194` and `RUSTSEC-2026-0195` are removed by the quick-xml 0.41 upgrade.
 
 ## Review requirements
 

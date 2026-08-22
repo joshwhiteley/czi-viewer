@@ -3,9 +3,11 @@
 //! CZI metadata is vendor XML and is intentionally optional for opening an image. This module
 //! retains only a bounded ordered tree and records diagnostics instead of failing callers when
 //! XML is malformed or exceeds a configured limit.
+//! It deliberately uses plain [`Reader`], not `NsReader`: namespace declarations remain ordinary
+//! bounded attributes, while retained names use their namespace-local suffixes.
 
-use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
+use quick_xml::{Reader, XmlVersion};
 
 /// A field on a [`MetadataNode`]. Names are namespace-local.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -107,7 +109,10 @@ impl MetadataDocument {
         }
 
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
+        let config = reader.config_mut();
+        config.trim_text(true);
+        config.check_end_names = true;
+        config.check_comments = true;
         let mut stack = Vec::<MetadataNode>::new();
         let mut roots = Vec::<MetadataNode>::new();
         let mut counts = ParseCounts::default();
@@ -188,6 +193,20 @@ impl MetadataDocument {
                         break;
                     }
                 }
+                Event::GeneralRef(reference) => {
+                    let Some(node) = stack.last_mut() else {
+                        continue;
+                    };
+                    if !retain_general_reference(
+                        node,
+                        reference.as_ref(),
+                        options.limits,
+                        &mut counts,
+                        &mut document.diagnostics,
+                    ) {
+                        break;
+                    }
+                }
                 Event::Eof => {
                     if !stack.is_empty() {
                         document.diagnostics.push(MetadataDiagnostic {
@@ -240,7 +259,7 @@ fn build_node(
     }
     let name = local_name(name_bytes);
     let mut attributes = Vec::new();
-    for attribute in element.attributes().with_checks(false) {
+    for attribute in element.attributes() {
         let attribute = match attribute {
             Ok(attribute) => attribute,
             Err(error) => {
@@ -265,7 +284,7 @@ fn build_node(
         counts.attribute_bytes = counts.attribute_bytes.saturating_add(bytes);
         let attribute_name = local_name(attribute.key.as_ref());
         let value = attribute
-            .decode_and_unescape_value(reader.decoder())
+            .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
             .map_or_else(
                 |_| decode_text(attribute.value.as_ref()),
                 std::borrow::Cow::into_owned,
@@ -301,6 +320,43 @@ fn retain_text(
     counts.text_bytes = counts.text_bytes.saturating_add(bytes.len());
     node.text.push_str(&decode_text(bytes));
     true
+}
+
+fn retain_general_reference(
+    node: &mut MetadataNode,
+    reference: &[u8],
+    limits: MetadataParseLimits,
+    counts: &mut ParseCounts,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> bool {
+    let bytes = reference.len().saturating_add(2);
+    if counts.text_bytes.saturating_add(bytes) > limits.max_text_bytes {
+        diagnostic_limit(diagnostics, "text", limits.max_text_bytes);
+        return false;
+    }
+    if !reserve_allocation(counts, limits, bytes, diagnostics) {
+        return false;
+    }
+    counts.text_bytes = counts.text_bytes.saturating_add(bytes);
+    if let Some(decoded) = predefined_reference(reference) {
+        node.text.push_str(decoded);
+    } else {
+        node.text.push('&');
+        node.text.push_str(&String::from_utf8_lossy(reference));
+        node.text.push(';');
+    }
+    true
+}
+
+fn predefined_reference(reference: &[u8]) -> Option<&'static str> {
+    match reference {
+        b"amp" => Some("&"),
+        b"apos" => Some("'"),
+        b"gt" => Some(">"),
+        b"lt" => Some("<"),
+        b"quot" => Some("\""),
+        _ => None,
+    }
 }
 
 fn reserve_allocation(
