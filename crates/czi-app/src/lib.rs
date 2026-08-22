@@ -1910,7 +1910,7 @@ pub struct ViewerApp {
     remote_selected_path: Option<String>,
     remote_browser_visibility: RemoteBrowserVisibility,
     remote_session: Option<(String, u64)>,
-    authentication_console_open_request: Option<bool>,
+    authentication_focus_request: Option<u64>,
     dataset: Option<DatasetInfo>,
     dataset_origin: Option<DatasetOrigin>,
     opening_origin: Option<DatasetOrigin>,
@@ -1951,7 +1951,7 @@ impl ViewerApp {
             remote_selected_path: None,
             remote_browser_visibility: RemoteBrowserVisibility::Open,
             remote_session: None,
-            authentication_console_open_request: None,
+            authentication_focus_request: None,
             dataset: None,
             dataset_origin: None,
             opening_origin: None,
@@ -2251,6 +2251,7 @@ impl ViewerApp {
     }
 
     fn retire_embedded_authentication(&mut self) {
+        self.authentication_focus_request = None;
         if let Some(authentication) = self.embedded_authentication.take() {
             self.retired_consoles.push(authentication.console);
         }
@@ -2329,7 +2330,7 @@ impl ViewerApp {
                     status: AuthenticationStatus::Connecting,
                 });
                 self.remote_browser_visibility = RemoteBrowserVisibility::Open;
-                self.authentication_console_open_request = Some(true);
+                self.authentication_focus_request = Some(connection_generation);
                 self.status = Status::normal("SSH authentication is waiting for terminal input.");
             }
             WorkerEvent::AuthenticationSucceeded {
@@ -2341,7 +2342,7 @@ impl ViewerApp {
                     authentication.status = AuthenticationStatus::Authenticated;
                     self.remote_session =
                         Some((authentication.profile.clone(), connection_generation));
-                    self.authentication_console_open_request = Some(false);
+                    self.authentication_focus_request = None;
                     self.status =
                         Status::normal("SSH authentication succeeded; opening SFTP session.");
                 }
@@ -2357,7 +2358,7 @@ impl ViewerApp {
                 }
                 self.remote_session = None;
                 self.remote_browser_visibility = RemoteBrowserVisibility::Open;
-                self.authentication_console_open_request = Some(true);
+                self.authentication_focus_request = None;
                 self.status = Status::error(message);
             }
             WorkerEvent::Opened {
@@ -2617,52 +2618,43 @@ impl ViewerApp {
         }
     }
 
-    fn show_embedded_authentication(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
-        let Some(authentication) = self.embedded_authentication.as_mut() else {
+    fn show_embedded_authentication(&mut self, ui: &mut egui::Ui) {
+        let Some(generation) = self
+            .embedded_authentication
+            .as_ref()
+            .map(|authentication| authentication.generation)
+        else {
             return;
         };
-        let console_id = ui.make_persistent_id(("embedded-ssh-console", authentication.generation));
-        let connecting = authentication.status == AuthenticationStatus::Connecting;
-        let transcript = authentication.console.snapshot().transcript;
-        ui.weak(
-            "Typing goes directly to system ssh. Passwords and one-time codes are never saved.",
-        );
-        let response = ui.add_sized(
-            [ui.available_width(), 112.0],
-            egui::Label::new(egui::RichText::new(transcript).monospace())
-                .selectable(false)
-                .sense(egui::Sense::click()),
-        );
-        if response.clicked() && connecting {
-            context.memory_mut(|memory| memory.request_focus(console_id));
-        }
-        if connecting {
-            let focused = context.memory(|memory| memory.has_focus(console_id));
+        let request_focus =
+            take_authentication_focus_request(&mut self.authentication_focus_request, generation);
+        let mut input_error = None;
+        if let Some(authentication) = self.embedded_authentication.as_mut() {
+            let connecting = authentication.status == AuthenticationStatus::Connecting;
+            let transcript = authentication.console.snapshot().transcript;
+            let (focused, inputs) = authentication_terminal(
+                ui,
+                authentication.generation,
+                &transcript,
+                connecting,
+                request_focus,
+            );
             ui.weak(if focused {
-                "Console focused. Authentication keys are sent directly and never retained."
+                "Keyboard input active. Authentication input is sent directly and never saved."
             } else {
-                "Console not focused. Click it before typing authentication input."
+                "Click to type. Passwords and one-time codes are never saved."
             });
-            if focused {
-                for event in context.input(|input| input.events.clone()) {
-                    let input = match event {
-                        egui::Event::Text(text) => Some(text.into_bytes()),
-                        egui::Event::Key {
-                            key,
-                            pressed: true,
-                            modifiers,
-                            ..
-                        } => console_key_input(key, modifiers),
-                        _ => None,
-                    };
-                    if let Some(input) = input
-                        && let Err(error) = authentication.console.try_send_input(input)
-                    {
-                        self.status = Status::error(error);
+            if connecting {
+                for input in inputs {
+                    if let Err(error) = authentication.console.try_send_input(input) {
+                        input_error = Some(error);
                         break;
                     }
                 }
             }
+        }
+        if let Some(error) = input_error {
+            self.status = Status::error(error);
         }
     }
 
@@ -2869,12 +2861,9 @@ impl ViewerApp {
         if self.embedded_authentication.is_some() {
             ui.separator();
             let console_id = ui.make_persistent_id("embedded-ssh-console-panel");
-            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+            let state = egui::collapsing_header::CollapsingState::load_with_default_open(
                 context, console_id, true,
             );
-            if let Some(open) = self.authentication_console_open_request.take() {
-                state.set_open(open);
-            }
             state
                 .show_header(ui, |ui| {
                     ui.strong("SSH authentication console");
@@ -2892,7 +2881,7 @@ impl ViewerApp {
                         None => {}
                     }
                 })
-                .body(|ui| self.show_embedded_authentication(ui, context));
+                .body(|ui| self.show_embedded_authentication(ui));
             if connecting && ui.button("Cancel authentication").clicked() {
                 self.cancel_embedded_authentication();
             }
@@ -3094,6 +3083,106 @@ fn console_key_input(key: egui::Key, modifiers: egui::Modifiers) -> Option<Vec<u
         _ => return None,
     };
     Some(sequence.to_vec())
+}
+
+fn console_event_input(event: &egui::Event) -> Option<Vec<u8>> {
+    match event {
+        egui::Event::Text(text) | egui::Event::Paste(text) if !text.is_empty() => {
+            Some(text.as_bytes().to_vec())
+        }
+        egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } => console_key_input(*key, *modifiers),
+        _ => None,
+    }
+}
+
+fn authentication_terminal(
+    ui: &mut egui::Ui,
+    generation: u64,
+    transcript: &str,
+    connecting: bool,
+    request_focus: bool,
+) -> (bool, Vec<Vec<u8>>) {
+    let terminal_id = ui.make_persistent_id(("ssh-auth-terminal", generation));
+    let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), 96.0));
+    let response = ui.interact(rect, terminal_id, egui::Sense::click());
+    if connecting && (request_focus || response.clicked()) {
+        response.request_focus();
+    }
+    if !connecting {
+        response.surrender_focus();
+    }
+    let focused = connecting && response.has_focus();
+    let painter = ui.painter_at(rect);
+    let background = egui::Color32::from_rgb(15, 18, 22);
+    let accent = if focused {
+        egui::Color32::from_rgb(90, 174, 220)
+    } else {
+        egui::Color32::from_gray(70)
+    };
+    painter.rect_filled(rect, 4.0, background);
+    painter.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(if focused { 2.0 } else { 1.0 }, accent),
+        egui::StrokeKind::Inside,
+    );
+    let text_rect = rect.shrink(8.0);
+    let text = terminal_display_text(transcript);
+    let galley = painter.layout(
+        text,
+        egui::FontId::monospace(12.0),
+        egui::Color32::from_rgb(214, 221, 230),
+        text_rect.width(),
+    );
+    painter.galley(
+        text_rect.min,
+        galley,
+        egui::Color32::from_rgb(214, 221, 230),
+    );
+    let inputs = if focused {
+        ui.ctx().input_mut(|input| {
+            let mut inputs = Vec::new();
+            input.events.retain(|event| {
+                if let Some(bytes) = console_event_input(event) {
+                    inputs.push(bytes);
+                    false
+                } else {
+                    true
+                }
+            });
+            inputs
+        })
+    } else {
+        Vec::new()
+    };
+    (focused, inputs)
+}
+
+fn terminal_display_text(transcript: &str) -> String {
+    const MAX_TERMINAL_DISPLAY_BYTES: usize = 4_096;
+
+    if transcript.len() <= MAX_TERMINAL_DISPLAY_BYTES {
+        return transcript.to_owned();
+    }
+    let mut start = transcript.len() - MAX_TERMINAL_DISPLAY_BYTES;
+    while !transcript.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &transcript[start..])
+}
+
+fn take_authentication_focus_request(request: &mut Option<u64>, generation: u64) -> bool {
+    if *request == Some(generation) {
+        *request = None;
+        true
+    } else {
+        false
+    }
 }
 
 fn scene_label(scene: SceneId) -> String {
@@ -3423,6 +3512,16 @@ mod tests {
     }
 
     #[test]
+    fn authentication_focus_request_is_generation_scoped_and_single_use() {
+        let mut request = Some(7);
+        assert!(!take_authentication_focus_request(&mut request, 6));
+        assert_eq!(request, Some(7));
+        assert!(take_authentication_focus_request(&mut request, 7));
+        assert_eq!(request, None);
+        assert!(!take_authentication_focus_request(&mut request, 7));
+    }
+
+    #[test]
     fn usable_remote_file_failures_do_not_require_reauthentication() {
         let content_error = remote_session_failure("invalid CZI bytes", true);
         let transport_error = remote_session_failure("SFTP READ failed", false);
@@ -3535,6 +3634,15 @@ mod tests {
             console_key_input(egui::Key::F1, egui::Modifiers::default()),
             None
         );
+        assert_eq!(
+            console_event_input(&egui::Event::Paste(String::from("one-time-code"))),
+            Some(b"one-time-code".to_vec())
+        );
+        assert_eq!(
+            console_event_input(&egui::Event::Text(String::from("p"))),
+            Some(vec![b'p'])
+        );
+        assert_eq!(console_event_input(&egui::Event::Copy), None);
     }
 
     #[test]
