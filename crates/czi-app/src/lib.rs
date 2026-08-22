@@ -1910,6 +1910,7 @@ pub struct ViewerApp {
     remote_selected_path: Option<String>,
     remote_browser_visibility: RemoteBrowserVisibility,
     remote_session: Option<(String, u64)>,
+    profile_editing: bool,
     authentication_focus_request: Option<u64>,
     dataset: Option<DatasetInfo>,
     dataset_origin: Option<DatasetOrigin>,
@@ -1951,6 +1952,7 @@ impl ViewerApp {
             remote_selected_path: None,
             remote_browser_visibility: RemoteBrowserVisibility::Open,
             remote_session: None,
+            profile_editing: false,
             authentication_focus_request: None,
             dataset: None,
             dataset_origin: None,
@@ -2000,24 +2002,6 @@ impl ViewerApp {
             path: self.remote_path_input.trim().to_owned(),
             config: OpenSshConfig::new(),
         });
-    }
-
-    fn invalidate_remote_browse(&mut self, profile_changed: bool) {
-        self.generations.begin_browse();
-        self.remote_browse_pending = false;
-        if profile_changed {
-            self.close_remote_dataset();
-            self.cancel_active_remote_connection();
-            self.retire_embedded_authentication();
-            self.remote_session = None;
-            self.generations.begin_connection();
-            self.remote_browse_directory = None;
-            self.remote_suggestions.clear();
-            self.remote_browser_path_input.clear();
-            self.remote_path_input.clear();
-            self.remote_selected_path = None;
-            let _ = self.worker.send(WorkerCommand::ClearBrowse);
-        }
     }
 
     fn close_remote_dataset(&mut self) {
@@ -2247,7 +2231,20 @@ impl ViewerApp {
         self.cancel_active_remote_connection();
         self.retire_embedded_authentication();
         self.remote_session = None;
+        self.clear_remote_listing();
         self.refresh_remote_browser();
+    }
+
+    fn begin_profile_change(&mut self) {
+        self.profile_editing = true;
+        self.clear_remote_listing();
+    }
+
+    fn clear_remote_listing(&mut self) {
+        self.remote_browse_pending = false;
+        self.remote_browse_directory = None;
+        self.remote_suggestions.clear();
+        self.remote_selected_path = None;
     }
 
     fn retire_embedded_authentication(&mut self) {
@@ -2330,6 +2327,7 @@ impl ViewerApp {
                     status: AuthenticationStatus::Connecting,
                 });
                 self.remote_browser_visibility = RemoteBrowserVisibility::Open;
+                self.profile_editing = false;
                 self.authentication_focus_request = Some(connection_generation);
                 self.status = Status::normal("SSH authentication is waiting for terminal input.");
             }
@@ -2547,6 +2545,7 @@ impl ViewerApp {
             return;
         }
         self.status = Status::error(message);
+        self.clear_remote_listing();
         if requires_remote_reauthentication(session_usable) {
             self.remote_session = None;
             self.cancel_active_remote_connection();
@@ -2659,74 +2658,123 @@ impl ViewerApp {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn show_remote_browser(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+    fn show_remote_browser(&mut self, ui: &mut egui::Ui) {
+        let authentication_status = self
+            .embedded_authentication
+            .as_ref()
+            .map(|authentication| authentication.status);
+        let connected =
+            remote_browser_connected(authentication_status, self.remote_session.is_some());
+        let connecting = authentication_status == Some(AuthenticationStatus::Connecting);
+        let failed = authentication_status == Some(AuthenticationStatus::Failed);
+        let profile_ready = !self.ssh_profile_input.trim().is_empty();
+        let profile_locked = !profile_is_editable(
+            self.profile_editing,
+            authentication_status,
+            self.remote_session.is_some(),
+        );
+
         ui.horizontal(|ui| {
-            ui.heading("Remote files");
+            ui.heading("Remote inspector");
+            let (badge, color) = if connecting {
+                ("Connecting", egui::Color32::from_rgb(112, 180, 230))
+            } else if connected {
+                ("Connected", egui::Color32::from_rgb(112, 210, 154))
+            } else if failed {
+                ("Failed", egui::Color32::from_rgb(235, 120, 120))
+            } else {
+                ("Offline", egui::Color32::GRAY)
+            };
+            ui.colored_label(color, badge);
             if ui.button("Hide").clicked() {
                 self.remote_browser_visibility = RemoteBrowserVisibility::Hidden;
             }
         });
 
-        ui.horizontal(|ui| {
-            ui.label("Profile:");
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.ssh_profile_input)
-                    .hint_text("my-ssh-profile")
-                    .desired_width(190.0),
-            );
-            if response.changed() {
-                self.invalidate_remote_browse(true);
-            }
-        });
+        egui::Frame::group(ui.style())
+            .fill(egui::Color32::from_gray(30))
+            .show(ui, |ui| {
+                ui.label("Connection");
+                ui.horizontal(|ui| {
+                    ui.label("Profile");
+                    ui.add_enabled(
+                        !profile_locked,
+                        egui::TextEdit::singleline(&mut self.ssh_profile_input)
+                            .hint_text("my-ssh-profile")
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    if profile_locked {
+                        if ui.button("Change").clicked() {
+                            self.begin_profile_change();
+                        }
+                    } else {
+                        let action = if failed {
+                            "Try again"
+                        } else if connected {
+                            "Reconnect"
+                        } else {
+                            "Connect"
+                        };
+                        if ui
+                            .add_enabled(profile_ready && !connecting, egui::Button::new(action))
+                            .clicked()
+                        {
+                            self.profile_editing = false;
+                            if connected || self.embedded_authentication.is_some() {
+                                self.reconnect_remote();
+                            } else {
+                                self.browse_remote_path(true);
+                            }
+                        }
+                    }
+                    if connecting {
+                        ui.spinner();
+                    }
+                    ui.weak("Read-only SFTP. SSH input stays in the terminal below.");
+                });
+            });
 
-        let authentication_status = self
-            .embedded_authentication
-            .as_ref()
-            .map(|authentication| authentication.status);
-        let connecting = authentication_status == Some(AuthenticationStatus::Connecting);
-        let profile_ready = !self.ssh_profile_input.trim().is_empty();
-        let browse_enabled = profile_ready && !connecting && !self.remote_browse_pending;
-        ui.horizontal(|ui| {
-            let connect = ui
-                .add_enabled(browse_enabled, egui::Button::new("Connect"))
-                .clicked();
-            if connect {
-                self.browse_remote_path(true);
-            }
-            if ui
-                .add_enabled(profile_ready, egui::Button::new("Reconnect"))
-                .clicked()
-            {
-                self.reconnect_remote();
-            }
-            match authentication_status {
-                Some(AuthenticationStatus::Connecting) => {
-                    ui.spinner();
-                    ui.weak("Connecting");
-                }
-                Some(AuthenticationStatus::Authenticated) => {
-                    ui.colored_label(egui::Color32::LIGHT_GREEN, "Connected");
-                }
-                Some(AuthenticationStatus::Failed) => {
-                    ui.colored_label(egui::Color32::LIGHT_RED, "Connection failed");
-                }
-                None if self.remote_session.is_some() => {
-                    ui.colored_label(egui::Color32::LIGHT_GREEN, "Connected");
-                }
-                None => {
-                    ui.weak("Not connected");
-                }
-            }
-        });
-        ui.weak("Connect once, then browse and open over the same read-only SFTP session.");
+        if connecting || failed {
+            ui.add_space(4.0);
+            egui::Frame::group(ui.style())
+                .fill(egui::Color32::from_gray(24))
+                .show(ui, |ui| {
+                    ui.strong("Authentication");
+                    self.show_embedded_authentication(ui);
+                    ui.horizontal(|ui| {
+                        if connecting {
+                            if ui.button("Cancel").clicked() {
+                                self.cancel_embedded_authentication();
+                            }
+                        } else if ui
+                            .add_enabled(profile_ready, egui::Button::new("Try again"))
+                            .clicked()
+                        {
+                            self.profile_editing = false;
+                            self.reconnect_remote();
+                        }
+                    });
+                });
+            return;
+        }
+
+        if !connected {
+            ui.add_space(8.0);
+            ui.weak("Enter an SSH profile, then select Connect to browse remote CZI files.");
+            return;
+        }
 
         ui.separator();
-        ui.label("Current directory:");
+        ui.label("Current directory");
         let directory = self
             .remote_browse_directory
             .as_deref()
             .unwrap_or("Not listed yet");
         ui.add(egui::Label::new(egui::RichText::new(directory).monospace()).selectable(true));
+        let browse_enabled =
+            remote_actions_enabled(connected, self.profile_editing, self.remote_browse_pending);
 
         ui.horizontal(|ui| {
             if ui
@@ -2755,13 +2803,17 @@ impl ViewerApp {
         });
         ui.horizontal(|ui| {
             ui.label("Path:");
+            let input_width = (ui.available_width() - 46.0).max(64.0);
             let path_response = ui.add(
                 egui::TextEdit::singleline(&mut self.remote_browser_path_input)
                     .hint_text("/absolute/directory/")
-                    .desired_width(f32::INFINITY),
+                    .desired_width(input_width),
             );
             let go = ui
-                .add_enabled(browse_enabled, egui::Button::new("Go"))
+                .add_enabled_ui(browse_enabled, |ui| {
+                    ui.add_sized([42.0, 22.0], egui::Button::new("Go"))
+                })
+                .inner
                 .clicked()
                 || (path_response.lost_focus()
                     && browse_enabled
@@ -2773,10 +2825,11 @@ impl ViewerApp {
         });
         ui.horizontal(|ui| {
             ui.label("Filter:");
+            let input_width = ui.available_width().max(64.0);
             let filter_response = ui.add(
                 egui::TextEdit::singleline(&mut self.remote_filename_filter)
                     .hint_text("filename")
-                    .desired_width(f32::INFINITY),
+                    .desired_width(input_width),
             );
             if filter_response.changed() {
                 self.remote_selected_path = None;
@@ -2800,7 +2853,7 @@ impl ViewerApp {
         });
         egui::ScrollArea::vertical()
             .id_salt("remote-file-list")
-            .max_height(360.0)
+            .max_height((ui.available_height() - 54.0).max(120.0))
             .show(ui, |ui| {
                 for suggestion in &visible {
                     ui.push_id(&suggestion.path, |ui| {
@@ -2808,8 +2861,8 @@ impl ViewerApp {
                             let selected = self.remote_selected_path.as_deref()
                                 == Some(suggestion.path.as_str());
                             let label = match suggestion.kind {
-                                RemotePathKind::Directory => format!("📁 {}/", suggestion.name),
-                                RemotePathKind::CziFile => format!("▣ {}", suggestion.name),
+                                RemotePathKind::Directory => format!("DIR  {}/", suggestion.name),
+                                RemotePathKind::CziFile => format!("CZI  {}", suggestion.name),
                             };
                             let response = ui
                                 .selectable_label(selected, label)
@@ -2817,7 +2870,7 @@ impl ViewerApp {
                             if response.clicked() {
                                 selected_path = Some(suggestion.path.clone());
                             }
-                            if response.double_clicked() {
+                            if response.double_clicked() && browse_enabled {
                                 action = remote_selection_action(suggestion, true);
                             }
                             ui.weak(match suggestion.kind {
@@ -2852,39 +2905,13 @@ impl ViewerApp {
                 })
             });
         if ui
-            .add_enabled(selected_czi, egui::Button::new("Open selected CZI"))
+            .add_enabled(
+                browse_enabled && selected_czi,
+                egui::Button::new("Open selected CZI"),
+            )
             .clicked()
         {
             self.open_selected_remote_czi();
-        }
-
-        if self.embedded_authentication.is_some() {
-            ui.separator();
-            let console_id = ui.make_persistent_id("embedded-ssh-console-panel");
-            let state = egui::collapsing_header::CollapsingState::load_with_default_open(
-                context, console_id, true,
-            );
-            state
-                .show_header(ui, |ui| {
-                    ui.strong("SSH authentication console");
-                    match authentication_status {
-                        Some(AuthenticationStatus::Connecting) => {
-                            ui.spinner();
-                            ui.weak("Click the transcript before typing.");
-                        }
-                        Some(AuthenticationStatus::Authenticated) => {
-                            ui.colored_label(egui::Color32::LIGHT_GREEN, "Authenticated");
-                        }
-                        Some(AuthenticationStatus::Failed) => {
-                            ui.colored_label(egui::Color32::LIGHT_RED, "Authentication failed");
-                        }
-                        None => {}
-                    }
-                })
-                .body(|ui| self.show_embedded_authentication(ui));
-            if connecting && ui.button("Cancel authentication").clicked() {
-                self.cancel_embedded_authentication();
-            }
         }
     }
 
@@ -3185,6 +3212,35 @@ fn take_authentication_focus_request(request: &mut Option<u64>, generation: u64)
     }
 }
 
+fn remote_browser_connected(
+    authentication_status: Option<AuthenticationStatus>,
+    has_remote_session: bool,
+) -> bool {
+    authentication_status == Some(AuthenticationStatus::Authenticated) || has_remote_session
+}
+
+fn remote_profile_is_locked(
+    authentication_status: Option<AuthenticationStatus>,
+    has_remote_session: bool,
+) -> bool {
+    matches!(
+        authentication_status,
+        Some(AuthenticationStatus::Connecting | AuthenticationStatus::Authenticated)
+    ) || has_remote_session
+}
+
+fn profile_is_editable(
+    profile_editing: bool,
+    authentication_status: Option<AuthenticationStatus>,
+    has_remote_session: bool,
+) -> bool {
+    profile_editing || !remote_profile_is_locked(authentication_status, has_remote_session)
+}
+
+fn remote_actions_enabled(connected: bool, profile_editing: bool, browse_pending: bool) -> bool {
+    connected && !profile_editing && !browse_pending
+}
+
 fn scene_label(scene: SceneId) -> String {
     match scene {
         SceneId::Implicit => String::from("implicit"),
@@ -3210,79 +3266,88 @@ impl eframe::App for ViewerApp {
         self.poll_embedded_authentication(context);
         self.retry_pending_open();
 
-        egui::TopBottomPanel::top("open_bar").show(context, |ui| {
-            ui.horizontal(|ui| {
-                let local_mode = ui.selectable_value(&mut self.open_mode, OpenMode::Local, "Local");
-                let ssh_mode = ui.selectable_value(&mut self.open_mode, OpenMode::Ssh, "SSH");
-                if local_mode.changed()
-                    && self.open_mode == OpenMode::Local
-                    && self
-                        .embedded_authentication
-                        .as_ref()
-                        .is_some_and(|authentication| {
-                            authentication.status == AuthenticationStatus::Connecting
-                        })
-                {
-                    self.cancel_embedded_authentication();
-                }
-                if ssh_mode.changed() && self.open_mode == OpenMode::Ssh {
-                    self.remote_browser_visibility = RemoteBrowserVisibility::Open;
-                }
-            });
-            match self.open_mode {
-                OpenMode::Local => {
-                    ui.horizontal(|ui| {
-                        ui.label("CZI path:");
-                        let response = ui.add(
-                            egui::TextEdit::singleline(&mut self.path_input)
-                                .hint_text("/path/to/image.czi")
-                                .desired_width(f32::INFINITY),
-                        );
-                        let open = ui.button("Open").clicked()
-                            || (response.lost_focus()
-                                && ui.input(|input| input.key_pressed(egui::Key::Enter)));
-                        if open {
-                            self.open_local_path();
+        egui::TopBottomPanel::top("top_toolbar_v2")
+            .exact_height(40.0)
+            .show(context, |ui| {
+                ui.horizontal(|ui| {
+                    let local_mode =
+                        ui.selectable_value(&mut self.open_mode, OpenMode::Local, "Local");
+                    let ssh_mode = ui.selectable_value(&mut self.open_mode, OpenMode::Ssh, "SSH");
+                    if local_mode.changed()
+                        && self.open_mode == OpenMode::Local
+                        && self
+                            .embedded_authentication
+                            .as_ref()
+                            .is_some_and(|authentication| {
+                                authentication.status == AuthenticationStatus::Connecting
+                            })
+                    {
+                        self.cancel_embedded_authentication();
+                    }
+                    if ssh_mode.changed() && self.open_mode == OpenMode::Ssh {
+                        self.remote_browser_visibility = RemoteBrowserVisibility::Open;
+                    }
+                    ui.separator();
+                    match self.open_mode {
+                        OpenMode::Local => {
+                            ui.label("CZI");
+                            let field_width = (ui.available_width() - 146.0).max(120.0);
+                            let response = ui.add_sized(
+                                [field_width, 24.0],
+                                egui::TextEdit::singleline(&mut self.path_input)
+                                    .hint_text("/path/to/image.czi"),
+                            );
+                            let open = ui.button("Open").clicked()
+                                || (response.lost_focus()
+                                    && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+                            if open {
+                                self.open_local_path();
+                            }
                         }
-                    });
-                }
-                OpenMode::Ssh => {
-                    ui.horizontal(|ui| {
-                        ui.label("SSH remote source");
-                        let browser_label = if self.remote_browser_visibility.is_open() {
-                            "Hide remote browser"
+                        OpenMode::Ssh => {
+                            let browser_label = if self.remote_browser_visibility.is_open() {
+                                "Remote"
+                            } else {
+                                "Show remote"
+                            };
+                            if ui.button(browser_label).clicked() {
+                                self.remote_browser_visibility.toggle();
+                            }
+                            if let Some(path) = self.remote_selected_path.as_deref() {
+                                ui.weak(format!("Selected: {path}"));
+                            }
+                        }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let color = if self.status.is_error {
+                            egui::Color32::LIGHT_RED
                         } else {
-                            "Show remote browser"
+                            egui::Color32::LIGHT_GRAY
                         };
-                        if ui.button(browser_label).clicked() {
-                            self.remote_browser_visibility.toggle();
-                        }
-                        if let Some(path) = self.remote_selected_path.as_deref() {
-                            ui.weak(format!("Selected: {path}"));
-                        }
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&self.status.message).color(color),
+                            )
+                            .truncate(),
+                        );
                     });
-                    ui.weak("Read-only SFTP range reads · 1 MiB blocks · 256 MiB source cache.");
-                }
-            }
-            let color = if self.status.is_error {
-                egui::Color32::LIGHT_RED
-            } else {
-                egui::Color32::LIGHT_GRAY
-            };
-            ui.colored_label(color, &self.status.message);
-        });
+                });
+            });
 
         if self.open_mode == OpenMode::Ssh && self.remote_browser_visibility.is_open() {
-            egui::SidePanel::right("remote_browser_panel")
+            egui::SidePanel::right("remote_inspector_v2")
                 .resizable(true)
-                .default_width(390.0)
-                .min_width(300.0)
-                .show(context, |ui| self.show_remote_browser(ui, context));
+                .default_width(360.0)
+                .min_width(320.0)
+                .max_width(420.0)
+                .show(context, |ui| self.show_remote_browser(ui));
         }
 
-        egui::SidePanel::left("dataset_panel")
+        egui::SidePanel::left("dataset_panel_v2")
             .resizable(true)
-            .default_width(300.0)
+            .default_width(260.0)
+            .min_width(220.0)
+            .max_width(320.0)
             .show(context, |ui| {
                 ui.heading("Dataset");
                 let before_selection = self.selection;
@@ -3519,6 +3584,46 @@ mod tests {
         assert!(take_authentication_focus_request(&mut request, 7));
         assert_eq!(request, None);
         assert!(!take_authentication_focus_request(&mut request, 7));
+    }
+
+    #[test]
+    fn profile_editing_and_remote_actions_are_explicitly_gated() {
+        assert!(remote_profile_is_locked(
+            Some(AuthenticationStatus::Connecting),
+            false
+        ));
+        assert!(remote_profile_is_locked(
+            Some(AuthenticationStatus::Authenticated),
+            false
+        ));
+        assert!(!profile_is_editable(
+            false,
+            Some(AuthenticationStatus::Authenticated),
+            false
+        ));
+        assert!(profile_is_editable(
+            true,
+            Some(AuthenticationStatus::Authenticated),
+            false
+        ));
+        assert!(!remote_profile_is_locked(
+            Some(AuthenticationStatus::Failed),
+            false
+        ));
+        assert!(remote_browser_connected(
+            Some(AuthenticationStatus::Authenticated),
+            false
+        ));
+        assert!(remote_browser_connected(None, true));
+        assert!(!remote_browser_connected(
+            Some(AuthenticationStatus::Connecting),
+            false
+        ));
+        assert!(!remote_browser_connected(None, false));
+        assert!(remote_actions_enabled(true, false, false));
+        assert!(!remote_actions_enabled(true, true, false));
+        assert!(!remote_actions_enabled(true, false, true));
+        assert!(!remote_actions_enabled(false, false, false));
     }
 
     #[test]
