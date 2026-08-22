@@ -21,6 +21,11 @@ name = "embedded_pty"
 path = "tests/embedded_pty.rs"
 required-features = ["test-fake-child"]
 
+[[test]]
+name = "embedded_pty_reconnect"
+path = "tests/embedded_pty_reconnect.rs"
+required-features = ["test-fake-child"]
+
 [dependencies]
 czi-core = { path = "../czi-core" }
 

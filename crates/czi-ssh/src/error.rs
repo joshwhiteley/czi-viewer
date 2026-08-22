@@ -322,6 +322,15 @@ pub enum SftpError {
 }
 
 impl SftpError {
+    /// Returns true when the server completed a request with a normal SFTP STATUS response.
+    ///
+    /// Such errors describe that request only. The negotiated transport remains usable for a
+    /// later request. Framing, I/O, child-exit, and protocol errors are never recoverable.
+    #[must_use]
+    pub fn is_recoverable_server_status(&self) -> bool {
+        matches!(self, Self::RemoteStatus { .. })
+    }
+
     pub(crate) fn io(context: &'static str, source: io::Error) -> Self {
         Self::Io { context, source }
     }

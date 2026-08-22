@@ -562,7 +562,10 @@ impl SftpSession {
     }
 
     fn finish<T>(&mut self, result: Result<T, SftpError>) -> Result<T, SftpError> {
-        if result.is_err() {
+        if result
+            .as_ref()
+            .is_err_and(|error| !error.is_recoverable_server_status())
+        {
             self.transport.shutdown();
         }
         result

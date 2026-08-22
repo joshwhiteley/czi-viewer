@@ -871,6 +871,72 @@ fn shared_session_reuses_one_init_across_browse_open_and_browse() {
 }
 
 #[test]
+fn remote_status_keeps_the_shared_session_available_for_browse_and_read() {
+    let requested = location("/input/image.czi");
+    let (session, worker) = fake_session(|fake| {
+        fake.expect_init();
+        fake.send_version(false);
+
+        let missing = fake.read_request();
+        assert_eq!(missing.packet_type, SSH_FXP_REALPATH);
+        fake.send_status(request_id(&missing), 2);
+
+        let opendir = fake.read_request();
+        assert_eq!(opendir.packet_type, SSH_FXP_OPENDIR);
+        fake.send_handle(request_id(&opendir), b"directory");
+        let readdir = fake.read_request();
+        assert_eq!(readdir.packet_type, SSH_FXP_READDIR);
+        fake.send_status(request_id(&readdir), SSH_FX_EOF);
+        let close_directory = fake.read_request();
+        assert_eq!(close_directory.packet_type, SSH_FXP_CLOSE);
+        fake.send_status(request_id(&close_directory), SSH_FX_OK);
+
+        let realpath = fake.read_request();
+        assert_eq!(realpath.packet_type, SSH_FXP_REALPATH);
+        send_name(
+            fake,
+            request_id(&realpath),
+            &[(
+                "/canonical/image.czi",
+                "image.czi",
+                0_u32.to_be_bytes().to_vec(),
+            )],
+        );
+        let open = fake.read_request();
+        assert_eq!(open.packet_type, SSH_FXP_OPEN);
+        fake.send_handle(request_id(&open), b"file");
+        let fstat = fake.read_request();
+        assert_eq!(fstat.packet_type, SSH_FXP_FSTAT);
+        fake.send(
+            SSH_FXP_ATTRS,
+            &attrs_response(request_id(&fstat), &attrs(3, 77)),
+        );
+        let read = fake.read_request();
+        assert_eq!(read.packet_type, SSH_FXP_READ);
+        fake.send_data(request_id(&read), b"abc");
+        let close_file = fake.read_request();
+        assert_eq!(close_file.packet_type, SSH_FXP_CLOSE);
+        fake.send_status(request_id(&close_file), SSH_FX_OK);
+    });
+    let shared = SharedSftpSession::new(session);
+    let missing = shared.with_session(|session| session.realpath(&location("/missing")));
+    assert!(matches!(missing, Err(SftpError::RemoteStatus { .. })));
+    assert!(
+        shared
+            .with_session(|session| session.read_dir(&location("/home/test")))
+            .unwrap()
+            .is_empty()
+    );
+    let source = SftpSource::open_with_shared_session(shared.clone(), &requested).unwrap();
+    let mut bytes = [0_u8; 3];
+    source.read_at(0, &mut bytes).unwrap();
+    assert_eq!(bytes, *b"abc");
+    source.close().unwrap();
+    drop(shared);
+    worker.join().unwrap();
+}
+
+#[test]
 fn dropping_source_clone_keeps_shared_browser_session_alive() {
     let requested = location("/input/image.czi");
     let (session, worker) = fake_session(|fake| {

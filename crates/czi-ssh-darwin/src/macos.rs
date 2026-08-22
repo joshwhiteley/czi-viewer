@@ -7,6 +7,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 const POSIX_SPAWN_SETSID: libc::c_short = 0x0400;
@@ -18,8 +19,15 @@ const SSH_ASKPASS: &str = "SSH_ASKPASS";
 const SSH_ASKPASS_REQUIRE: &str = "SSH_ASKPASS_REQUIRE";
 const CHILD_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
+static EMBEDDED_CHILD_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn spawn_lock() -> &'static Mutex<()> {
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 
 #[cfg(test)]
 struct SignalHook {
@@ -37,6 +45,12 @@ fn signal_hook() -> &'static Mutex<Option<SignalHook>> {
 
 #[cfg(test)]
 fn signal_hook_test_lock() -> &'static Mutex<()> {
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(test)]
+fn embedded_child_test_lock() -> &'static Mutex<()> {
     static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
@@ -195,6 +209,7 @@ impl PtyMaster {
 /// A child process started by [`spawn`].
 pub struct Child {
     state: Arc<ProcessState>,
+    lease: Option<EmbeddedChildLease>,
 }
 
 /// A cloneable cancellation handle that never reaps the process itself.
@@ -213,6 +228,28 @@ struct ProcessLifecycle {
     // may be recycled and must never be signalled.
     leader_reaped: bool,
     process_group_terminated: bool,
+}
+
+struct EmbeddedChildLease;
+
+impl EmbeddedChildLease {
+    fn acquire() -> io::Result<Self> {
+        EMBEDDED_CHILD_ACTIVE
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map(|_| Self)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "an embedded SSH child is already active",
+                )
+            })
+    }
+}
+
+impl Drop for EmbeddedChildLease {
+    fn drop(&mut self) {
+        EMBEDDED_CHILD_ACTIVE.store(false, Ordering::Release);
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -238,7 +275,11 @@ impl Child {
     ///
     /// Returns an error when inspecting the child status fails.
     pub fn try_wait(&mut self) -> io::Result<Option<i32>> {
-        self.wait_once()
+        let result = self.wait_once();
+        if result.is_ok() {
+            self.release_lease_if_reaped();
+        }
+        result
     }
 
     /// Wait briefly for the child to be reaped.
@@ -253,9 +294,11 @@ impl Child {
         let deadline = std::time::Instant::now() + CHILD_REAP_TIMEOUT;
         loop {
             if let Some(status) = self.wait_once()? {
+                self.release_lease_if_reaped();
                 return Ok(Some(status));
             }
             if self.is_leader_reaped()? {
+                self.release_lease_if_reaped();
                 return Ok(None);
             }
             if std::time::Instant::now() >= deadline {
@@ -275,10 +318,15 @@ impl Child {
     /// Returns an error when signalling or waiting for the child fails.
     pub fn terminate_and_wait(&mut self) -> io::Result<Option<i32>> {
         if let Some(status) = self.wait_once()? {
+            self.release_lease_if_reaped();
             return Ok(Some(status));
         }
         self.terminate_process_group()?;
-        self.wait()
+        let result = self.wait();
+        if result.is_ok() {
+            self.release_lease_if_reaped();
+        }
+        result
     }
 
     fn is_leader_reaped(&self) -> io::Result<bool> {
@@ -287,6 +335,12 @@ impl Child {
             .lock()
             .map(|lifecycle| lifecycle.leader_reaped)
             .map_err(|_| io::Error::other("embedded child lifecycle lock poisoned"))
+    }
+
+    fn release_lease_if_reaped(&mut self) {
+        if self.is_leader_reaped().unwrap_or(false) {
+            self.lease = None;
+        }
     }
 
     fn wait_once(&mut self) -> io::Result<Option<i32>> {
@@ -352,7 +406,9 @@ impl Child {
 impl Drop for Child {
     fn drop(&mut self) {
         if self.terminate_and_wait().is_err() {
-            reap_child_in_background(Arc::clone(&self.state));
+            if let Some(lease) = self.lease.take() {
+                reap_child_in_background(Arc::clone(&self.state), lease);
+            }
         }
     }
 }
@@ -480,50 +536,63 @@ fn try_reap_terminated_child(
     Err(error)
 }
 
-fn reap_child_in_background(state: Arc<ProcessState>) {
-    let _ = std::thread::Builder::new()
+fn reap_child_in_background(state: Arc<ProcessState>, lease: EmbeddedChildLease) {
+    let lease = Arc::new(lease);
+    let reaper_lease = Arc::clone(&lease);
+    let spawned = std::thread::Builder::new()
         .name(String::from("czi-ssh-child-reaper"))
         .spawn(move || {
-            let needs_reap = {
-                let Ok(mut lifecycle) = state.lifecycle.lock() else {
-                    return;
-                };
-                if lifecycle.leader_reaped {
-                    return;
-                }
-                let Ok(ownership) = probe_leader_locked(state.pid, &mut lifecycle) else {
-                    return;
-                };
-                if ownership == LeaderProbe::Gone {
-                    return;
-                }
-                if !lifecycle.process_group_terminated {
-                    let _ = terminate_process_group_locked(state.pid, &mut lifecycle);
-                }
-                !lifecycle.leader_reaped
-            };
-            if !needs_reap {
-                return;
-            }
-            let mut status = 0;
-            loop {
-                // SAFETY: the background reaper owns the last Child lifecycle path for this PID.
-                let result = unsafe { libc::waitpid(state.pid, &mut status, 0) };
-                if result == state.pid
-                    || (result == -1
-                        && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
-                {
-                    if let Ok(mut lifecycle) = state.lifecycle.lock() {
-                        lifecycle.leader_reaped = true;
-                    }
-                    return;
-                }
-                if result == -1 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return;
+            if !background_reap_child(&state) {
+                std::mem::forget(reaper_lease);
             }
         });
+    if spawned.is_err() {
+        std::mem::forget(lease);
+    }
+}
+
+fn background_reap_child(state: &Arc<ProcessState>) -> bool {
+    let needs_reap = {
+        let Ok(mut lifecycle) = state.lifecycle.lock() else {
+            return false;
+        };
+        if lifecycle.leader_reaped {
+            return true;
+        }
+        let Ok(ownership) = probe_leader_locked(state.pid, &mut lifecycle) else {
+            return false;
+        };
+        if ownership == LeaderProbe::Gone {
+            return true;
+        }
+        if !lifecycle.process_group_terminated
+            && terminate_process_group_locked(state.pid, &mut lifecycle).is_err()
+        {
+            return false;
+        }
+        !lifecycle.leader_reaped
+    };
+    if !needs_reap {
+        return true;
+    }
+    let mut status = 0;
+    loop {
+        // SAFETY: the background reaper owns the last Child lifecycle path for this PID.
+        let result = unsafe { libc::waitpid(state.pid, &mut status, 0) };
+        if result == state.pid
+            || (result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+        {
+            if let Ok(mut lifecycle) = state.lifecycle.lock() {
+                lifecycle.leader_reaped = true;
+                return true;
+            }
+            return false;
+        }
+        if result == -1 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return false;
+    }
 }
 
 fn probe_leader_locked(
@@ -604,6 +673,10 @@ pub fn spawn(
         ));
     }
     ensure_child_reaping_is_available()?;
+    let lease = EmbeddedChildLease::acquire()?;
+    let _spawn_guard = spawn_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let executable = c_string(executable.as_os_str(), "embedded PTY executable")?;
     let arguments = argv
@@ -614,12 +687,12 @@ pub fn spawn(
 
     let (stdin_read, stdin_write) = binary_socket_pair()?;
     let (stdout_read, stdout_write) = binary_socket_pair()?;
-    let (pty_master, _pty_slave, slave_name) = open_pty()?;
+    let (pty_master, pty_slave) = open_pty()?;
 
     let mut actions = FileActions::new()?;
     actions.add_dup2(stdin_read.as_raw_fd(), libc::STDIN_FILENO)?;
     actions.add_dup2(stdout_write.as_raw_fd(), libc::STDOUT_FILENO)?;
-    actions.add_open(libc::STDERR_FILENO, &slave_name, libc::O_RDWR, 0)?;
+    actions.add_dup2(pty_slave.as_raw_fd(), libc::STDERR_FILENO)?;
 
     let mut attributes = SpawnAttributes::new()?;
     attributes.set_flags(POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT)?;
@@ -651,7 +724,6 @@ pub fn spawn(
     if result != 0 {
         return Err(io::Error::from_raw_os_error(result));
     }
-
     let state = Arc::new(ProcessState {
         pid,
         lifecycle: Mutex::new(ProcessLifecycle {
@@ -665,6 +737,7 @@ pub fn spawn(
         pty_master: PtyMaster { file: pty_master },
         child: Child {
             state: Arc::clone(&state),
+            lease: Some(lease),
         },
         cancellation: Cancellation { state },
     })
@@ -711,7 +784,7 @@ fn binary_socket_pair() -> io::Result<(File, File)> {
     ))
 }
 
-fn open_pty() -> io::Result<(File, File, CString)> {
+fn open_pty() -> io::Result<(File, File)> {
     // SAFETY: posix_openpt has no pointer arguments and returns an owned descriptor on success.
     let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
     if master == -1 {
@@ -747,8 +820,10 @@ fn open_pty() -> io::Result<(File, File, CString)> {
     // SAFETY: open returned an owned descriptor on success.
     let slave = unsafe { File::from_raw_fd(slave) };
     disable_echo(&slave)?;
-    let name = CString::new(name.to_bytes()).map_err(|_| invalid_input("PTY slave path"))?;
-    Ok((master, slave, name))
+    Ok((
+        duplicate_close_on_exec(master)?,
+        duplicate_close_on_exec(slave)?,
+    ))
 }
 
 fn duplicate_close_on_exec(file: File) -> io::Result<File> {
@@ -843,24 +918,6 @@ impl FileActions {
             Err(io::Error::from_raw_os_error(result))
         }
     }
-
-    fn add_open(
-        &mut self,
-        fd: RawFd,
-        path: &CStr,
-        flags: libc::c_int,
-        mode: libc::mode_t,
-    ) -> io::Result<()> {
-        // SAFETY: `raw` is initialized and `path` is NUL-terminated for the duration of this call.
-        let result = unsafe {
-            libc::posix_spawn_file_actions_addopen(&mut self.raw, fd, path.as_ptr(), flags, mode)
-        };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::from_raw_os_error(result))
-        }
-    }
 }
 
 impl Drop for FileActions {
@@ -909,9 +966,14 @@ mod tests {
 
     const DESCENDANT_MODE: &str = "CZI_SSH_DARWIN_TEST_DESCENDANT";
     const AUTO_REAP_MODE: &str = "CZI_SSH_DARWIN_TEST_AUTO_REAP";
+    const CLOSED_STANDARD_DESCRIPTORS_MODE: &str =
+        "CZI_SSH_DARWIN_TEST_CLOSED_STANDARD_DESCRIPTORS";
 
     #[test]
     fn spawn_removes_askpass_environment() {
+        let _guard = embedded_child_test_lock()
+            .lock()
+            .expect("embedded child test lock");
         let executable = std::path::Path::new("/usr/bin/env");
         let argv = vec![executable.as_os_str().to_os_string()];
         let extra_environment = vec![
@@ -934,6 +996,34 @@ mod tests {
         assert!(status.is_some());
         assert!(!output.contains("SSH_ASKPASS="));
         assert!(!output.contains("SSH_ASKPASS_REQUIRE="));
+    }
+
+    #[test]
+    fn parallel_spawns_reject_a_second_active_embedded_child() {
+        let _guard = embedded_child_test_lock()
+            .lock()
+            .expect("embedded child test lock");
+        let executable = std::path::PathBuf::from("/usr/bin/env");
+        let argv = vec![executable.as_os_str().to_os_string()];
+        let first = spawn(&executable, &argv, &[]).expect("start first embedded child");
+        let workers = (0..16)
+            .map(|_| {
+                let executable = executable.clone();
+                std::thread::spawn(move || {
+                    let argv = vec![executable.as_os_str().to_os_string()];
+                    let Err(error) = spawn(&executable, &argv, &[]) else {
+                        panic!("parallel second embedded child unexpectedly started");
+                    };
+                    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("parallel spawn worker");
+        }
+        drop(first);
+        let second = spawn(&executable, &argv, &[]).expect("start child after first reaped");
+        drop(second);
     }
 
     #[test]
@@ -965,6 +1055,55 @@ mod tests {
     }
 
     #[test]
+    fn closed_standard_descriptors_child_entry() {
+        if std::env::var_os(CLOSED_STANDARD_DESCRIPTORS_MODE).is_none() {
+            return;
+        }
+        // SAFETY: this runs in a dedicated test process and closes only its own inherited
+        // standard descriptors before exercising the spawn normalization path.
+        unsafe {
+            libc::close(libc::STDIN_FILENO);
+            libc::close(libc::STDOUT_FILENO);
+        }
+        let executable = Path::new("/usr/bin/env");
+        let argv = vec![executable.as_os_str().to_os_string()];
+        let SpawnedPty {
+            stdin,
+            mut stdout,
+            pty_master,
+            mut child,
+            cancellation: _,
+        } = spawn(executable, &argv, &[]).expect("spawn with closed standard descriptors");
+        assert!(stdin.as_raw_fd() >= MIN_CHILD_FD);
+        assert!(stdout.as_raw_fd() >= MIN_CHILD_FD);
+        assert!(pty_master.file.as_raw_fd() >= MIN_CHILD_FD);
+        drop((stdin, pty_master));
+        let mut output = String::new();
+        stdout
+            .read_to_string(&mut output)
+            .expect("read spawned output");
+        assert!(child.wait().expect("reap spawned child").is_some());
+    }
+
+    #[test]
+    fn spawn_normalizes_pty_descriptors_when_parent_standard_descriptors_are_closed() {
+        let _guard = embedded_child_test_lock()
+            .lock()
+            .expect("embedded child test lock");
+        let executable = std::env::current_exe().expect("current czi-ssh-darwin test executable");
+        let status = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "macos::tests::closed_standard_descriptors_child_entry",
+                "--nocapture",
+            ])
+            .env(CLOSED_STANDARD_DESCRIPTORS_MODE, "1")
+            .status()
+            .expect("run closed-standard-descriptor test process");
+        assert!(status.success());
+    }
+
+    #[test]
     #[allow(
         clippy::zombie_processes,
         reason = "the parent test must reap the session leader and kill this inherited descendant"
@@ -981,6 +1120,9 @@ mod tests {
 
     #[test]
     fn reaping_a_leader_terminates_its_descendant_group() {
+        let _guard = embedded_child_test_lock()
+            .lock()
+            .expect("embedded child test lock");
         let executable = std::env::current_exe().expect("current czi-ssh-darwin test executable");
         let argv = vec![
             executable.clone().into_os_string(),
@@ -1045,6 +1187,7 @@ mod tests {
         .expect("cancelling an unowned leader is a no-op");
         drop(Child {
             state: Arc::clone(&state),
+            lease: None,
         });
         std::thread::sleep(std::time::Duration::from_millis(20));
         assert!(state.lifecycle.lock().expect("lifecycle").leader_reaped);

@@ -89,8 +89,9 @@ impl SharedSftpSession {
     ///
     /// # Errors
     ///
-    /// Returns deferred-close, operation, or [`SftpError::SessionPoisoned`] failures. A close or
-    /// operation error invalidates the transport under the normal [`SftpSession`] error policy.
+    /// Returns deferred-close, operation, or [`SftpError::SessionPoisoned`] failures. A server
+    /// STATUS error leaves the negotiated transport available for a later operation; transport,
+    /// framing, and protocol failures follow the normal [`SftpSession`] invalidation policy.
     pub fn with_session<T>(
         &self,
         operation: impl FnOnce(&mut SftpSession) -> Result<T, SftpError>,
