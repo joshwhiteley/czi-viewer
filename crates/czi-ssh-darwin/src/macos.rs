@@ -18,6 +18,29 @@ const SSH_ASKPASS: &str = "SSH_ASKPASS";
 const SSH_ASKPASS_REQUIRE: &str = "SSH_ASKPASS_REQUIRE";
 const CHILD_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(test)]
+struct SignalHook {
+    pid: libc::pid_t,
+    calls: Arc<AtomicUsize>,
+    pass_first_signal: bool,
+    after_first_signal: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[cfg(test)]
+fn signal_hook() -> &'static Mutex<Option<SignalHook>> {
+    static HOOK: std::sync::OnceLock<Mutex<Option<SignalHook>>> = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn signal_hook_test_lock() -> &'static Mutex<()> {
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 unsafe extern "C" {
     fn ptsname_r(
         fd: libc::c_int,
@@ -186,8 +209,17 @@ struct ProcessState {
 }
 
 struct ProcessLifecycle {
+    // This includes a leader that another wait operation has already reaped. Once set, `pid`
+    // may be recycled and must never be signalled.
     leader_reaped: bool,
     process_group_terminated: bool,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum LeaderProbe {
+    Live,
+    Waitable,
+    Gone,
 }
 
 impl Child {
@@ -270,10 +302,11 @@ impl Child {
             return try_reap_terminated_child(self.state.pid, &mut lifecycle);
         }
 
-        if !leader_is_waitable(self.state.pid)? {
-            return Ok(None);
+        match probe_leader_locked(self.state.pid, &mut lifecycle)? {
+            LeaderProbe::Live | LeaderProbe::Gone => return Ok(None),
+            LeaderProbe::Waitable => {}
         }
-        terminate_process_group_locked(self.state.pid, &mut lifecycle, true)?;
+        terminate_process_group_locked(self.state.pid, &mut lifecycle)?;
 
         let mut status = 0;
         loop {
@@ -288,6 +321,10 @@ impl Child {
                 if error.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    lifecycle.leader_reaped = true;
+                    return Ok(None);
+                }
                 return Err(error);
             }
             return Err(io::Error::other("waitpid returned an unexpected process"));
@@ -300,8 +337,15 @@ impl Child {
             .lifecycle
             .lock()
             .map_err(|_| io::Error::other("embedded child lifecycle lock poisoned"))?;
-        let leader_waitable = leader_is_waitable(self.state.pid)?;
-        terminate_process_group_locked(self.state.pid, &mut lifecycle, leader_waitable)
+        if lifecycle.process_group_terminated || lifecycle.leader_reaped {
+            return Ok(());
+        }
+        match probe_leader_locked(self.state.pid, &mut lifecycle)? {
+            LeaderProbe::Gone => Ok(()),
+            LeaderProbe::Live | LeaderProbe::Waitable => {
+                terminate_process_group_locked(self.state.pid, &mut lifecycle)
+            }
+        }
     }
 }
 
@@ -325,18 +369,21 @@ impl Cancellation {
             .lifecycle
             .lock()
             .map_err(|_| io::Error::other("embedded child lifecycle lock poisoned"))?;
-        if lifecycle.process_group_terminated {
+        if lifecycle.process_group_terminated || lifecycle.leader_reaped {
             return Ok(());
         }
-        let leader_waitable = leader_is_waitable(self.state.pid)?;
-        terminate_process_group_locked(self.state.pid, &mut lifecycle, leader_waitable)
+        match probe_leader_locked(self.state.pid, &mut lifecycle)? {
+            LeaderProbe::Gone => Ok(()),
+            LeaderProbe::Live | LeaderProbe::Waitable => {
+                terminate_process_group_locked(self.state.pid, &mut lifecycle)
+            }
+        }
     }
 }
 
 fn terminate_process_group_locked(
     pid: libc::pid_t,
     lifecycle: &mut ProcessLifecycle,
-    leader_waitable: bool,
 ) -> io::Result<()> {
     if lifecycle.process_group_terminated {
         return Ok(());
@@ -346,29 +393,69 @@ fn terminate_process_group_locked(
             "embedded child group was not terminated before its leader was reaped",
         ));
     }
-    // SAFETY: a live or waitable leader keeps its private session/process-group ID from being
-    // recycled. A negative PID targets the whole private group, including SSH helpers.
-    let group_result = unsafe { libc::kill(-pid, libc::SIGKILL) };
-    let group_error = io::Error::last_os_error();
+    let ownership = probe_leader_locked(pid, lifecycle)?;
+    if ownership == LeaderProbe::Gone {
+        return Ok(());
+    }
+    // SAFETY: the probe established that this is still our live or waitable leader. A negative
+    // PID targets its private group, including SSH helpers.
+    let (group_result, group_error) = send_signal(-pid, libc::SIGKILL);
     if group_result == -1
         && group_error.raw_os_error() != Some(libc::ESRCH)
         // Darwin returns EPERM for a zombie session leader whose group has no live members.
-        && !(leader_waitable && group_error.raw_os_error() == Some(libc::EPERM))
+        && !(ownership == LeaderProbe::Waitable && group_error.raw_os_error() == Some(libc::EPERM))
     {
         return Err(group_error);
     }
-    // SAFETY: pid is the unreaped leader returned by posix_spawn. This direct signal is a
-    // fallback for Darwin session/process-group edge cases; it cannot target a recycled PID.
-    let leader_result = unsafe { libc::kill(pid, libc::SIGKILL) };
-    let leader_error = io::Error::last_os_error();
+    // A group signal can make the leader exit. Probe again before the direct fallback because
+    // automatic or external reaping would otherwise allow this numeric PID to be recycled.
+    let ownership = probe_leader_locked(pid, lifecycle)?;
+    if ownership == LeaderProbe::Gone {
+        return Ok(());
+    }
+    // SAFETY: the second probe established that `pid` is still our leader. This direct signal is
+    // a fallback for Darwin session/process-group edge cases.
+    let (leader_result, leader_error) = send_signal(pid, libc::SIGKILL);
     if leader_result == -1
         && leader_error.raw_os_error() != Some(libc::ESRCH)
-        && !(leader_waitable && leader_error.raw_os_error() == Some(libc::EPERM))
+        && !(ownership == LeaderProbe::Waitable && leader_error.raw_os_error() == Some(libc::EPERM))
     {
         return Err(leader_error);
     }
     lifecycle.process_group_terminated = true;
     Ok(())
+}
+
+fn send_signal(pid: libc::pid_t, signal: libc::c_int) -> (libc::c_int, io::Error) {
+    #[cfg(test)]
+    {
+        let after_first_signal = if let Ok(hook) = signal_hook().lock()
+            && let Some(hook) = hook.as_ref()
+            && pid.unsigned_abs() == hook.pid.unsigned_abs()
+        {
+            if hook.calls.fetch_add(1, Ordering::SeqCst) != 0 {
+                return (-1, io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            if !hook.pass_first_signal {
+                return (-1, io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            hook.after_first_signal.clone()
+        } else {
+            None
+        };
+        if let Some(after_first_signal) = after_first_signal {
+            // SAFETY: callers only invoke this for the private, positively owned child group or
+            // leader. The test callback runs after this first signal to model external reaping
+            // before any direct fallback.
+            let result = unsafe { libc::kill(pid, signal) };
+            let error = io::Error::last_os_error();
+            after_first_signal();
+            return (result, error);
+        }
+    }
+    // SAFETY: callers only invoke this for the private, positively owned child group or leader.
+    let result = unsafe { libc::kill(pid, signal) };
+    (result, io::Error::last_os_error())
 }
 
 fn try_reap_terminated_child(
@@ -401,18 +488,23 @@ fn reap_child_in_background(state: Arc<ProcessState>) {
                 let Ok(mut lifecycle) = state.lifecycle.lock() else {
                     return;
                 };
-                if !lifecycle.leader_reaped && !lifecycle.process_group_terminated {
-                    let _ = terminate_process_group_locked(state.pid, &mut lifecycle, false);
+                if lifecycle.leader_reaped {
+                    return;
+                }
+                let Ok(ownership) = probe_leader_locked(state.pid, &mut lifecycle) else {
+                    return;
+                };
+                if ownership == LeaderProbe::Gone {
+                    return;
+                }
+                if !lifecycle.process_group_terminated {
+                    let _ = terminate_process_group_locked(state.pid, &mut lifecycle);
                 }
                 !lifecycle.leader_reaped
             };
             if !needs_reap {
                 return;
             }
-            // SAFETY: the leader remains unreaped, so its PID cannot be recycled. Retry the
-            // direct signal before the background wait in case an earlier group signal raced an
-            // exiting Darwin session leader.
-            let _ = unsafe { libc::kill(state.pid, libc::SIGKILL) };
             let mut status = 0;
             loop {
                 // SAFETY: the background reaper owns the last Child lifecycle path for this PID.
@@ -434,35 +526,52 @@ fn reap_child_in_background(state: Arc<ProcessState>) {
         });
 }
 
-fn leader_is_waitable(pid: libc::pid_t) -> io::Result<bool> {
+fn probe_leader_locked(
+    pid: libc::pid_t,
+    lifecycle: &mut ProcessLifecycle,
+) -> io::Result<LeaderProbe> {
+    let probe = probe_leader(pid)?;
+    if probe == LeaderProbe::Gone {
+        lifecycle.leader_reaped = true;
+    }
+    Ok(probe)
+}
+
+fn probe_leader(pid: libc::pid_t) -> io::Result<LeaderProbe> {
     // `WNOWAIT` keeps an exited leader waitable. That keeps its PID and process-group ID from
     // being recycled until the group is signalled and waitpid below reaps it.
     // SAFETY: a zeroed siginfo_t is valid writable storage for waitid.
     let mut information = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
     // SAFETY: `information` is valid writable storage and `pid` belongs to this child.
-    let wait_result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            libc::id_t::try_from(pid)
-                .map_err(|_| io::Error::other("invalid embedded child process identifier"))?,
-            &mut information,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if wait_result == -1 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
-            return Ok(false);
+    loop {
+        // SAFETY: `information` is valid writable storage and `pid` belongs to this child.
+        let wait_result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                libc::id_t::try_from(pid)
+                    .map_err(|_| io::Error::other("invalid embedded child process identifier"))?,
+                &mut information,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if wait_result == -1 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                return Ok(LeaderProbe::Gone);
+            }
+            return Err(error);
         }
-        return Err(error);
+        if information.si_pid == 0 {
+            return Ok(LeaderProbe::Live);
+        }
+        if information.si_pid != pid {
+            return Err(io::Error::other("waitid returned an unexpected process"));
+        }
+        return Ok(LeaderProbe::Waitable);
     }
-    if information.si_pid == 0 {
-        return Ok(false);
-    }
-    if information.si_pid != pid {
-        return Err(io::Error::other("waitid returned an unexpected process"));
-    }
-    Ok(true)
 }
 
 /// Spawn an absolute-path program with binary stdin/stdout pipes and a controlling PTY.
@@ -476,7 +585,8 @@ fn leader_is_waitable(pid: libc::pid_t) -> io::Result<bool> {
 /// # Errors
 ///
 /// Returns an error when the executable or arguments contain NUL, the PTY/pipes cannot be made,
-/// or Darwin rejects a spawn action.
+/// when the parent does not retain exclusive child-reaping ownership, or when Darwin rejects a
+/// spawn action.
 pub fn spawn(
     executable: &Path,
     argv: &[OsString],
@@ -493,6 +603,7 @@ pub fn spawn(
             "embedded PTY argv[0] must equal its executable",
         ));
     }
+    ensure_child_reaping_is_available()?;
 
     let executable = c_string(executable.as_os_str(), "embedded PTY executable")?;
     let arguments = argv
@@ -557,6 +668,23 @@ pub fn spawn(
         },
         cancellation: Cancellation { state },
     })
+}
+
+fn ensure_child_reaping_is_available() -> io::Result<()> {
+    // SAFETY: a zeroed sigaction is writable storage for this query.
+    let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    // SAFETY: a null new action queries the current process SIGCHLD disposition into `action`.
+    if unsafe { libc::sigaction(libc::SIGCHLD, ptr::null(), &mut action) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // The lifecycle mutex serializes this module's reaping. A non-default disposition may reap
+    // this child outside that mutex, invalidating numeric PID ownership between probe and signal.
+    if action.sa_sigaction != libc::SIG_DFL || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
+        return Err(io::Error::other(
+            "embedded PTY requires the default SIGCHLD disposition for exclusive child reaping",
+        ));
+    }
+    Ok(())
 }
 
 fn binary_socket_pair() -> io::Result<(File, File)> {
@@ -780,6 +908,7 @@ mod tests {
     use super::*;
 
     const DESCENDANT_MODE: &str = "CZI_SSH_DARWIN_TEST_DESCENDANT";
+    const AUTO_REAP_MODE: &str = "CZI_SSH_DARWIN_TEST_AUTO_REAP";
 
     #[test]
     fn spawn_removes_askpass_environment() {
@@ -805,6 +934,34 @@ mod tests {
         assert!(status.is_some());
         assert!(!output.contains("SSH_ASKPASS="));
         assert!(!output.contains("SSH_ASKPASS_REQUIRE="));
+    }
+
+    #[test]
+    fn automatic_reaping_child_entry() {
+        if std::env::var_os(AUTO_REAP_MODE).is_none() {
+            return;
+        }
+        // SAFETY: this runs in a dedicated test process and intentionally verifies the rejected
+        // inherited SIGCHLD mode.
+        unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
+        let executable = Path::new("/usr/bin/true");
+        let argv = vec![executable.as_os_str().to_os_string()];
+        assert!(spawn(executable, &argv, &[]).is_err());
+    }
+
+    #[test]
+    fn spawn_rejects_a_parent_that_automatically_reaps_children() {
+        let executable = std::env::current_exe().expect("current czi-ssh-darwin test executable");
+        let status = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "macos::tests::automatic_reaping_child_entry",
+                "--nocapture",
+            ])
+            .env(AUTO_REAP_MODE, "1")
+            .status()
+            .expect("run automatic reaping test process");
+        assert!(status.success());
     }
 
     #[test]
@@ -854,6 +1011,89 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn externally_reaped_leader_is_never_signalled_after_its_pid_is_unowned() {
+        let _hook_guard = signal_hook_test_lock()
+            .lock()
+            .expect("signal hook test lock");
+        let mut externally_owned = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawn externally reaped child");
+        let pid = libc::pid_t::try_from(externally_owned.id()).expect("valid child pid");
+        externally_owned.wait().expect("externally reap child");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        *signal_hook().lock().expect("signal hook") = Some(SignalHook {
+            pid,
+            calls: Arc::clone(&calls),
+            pass_first_signal: false,
+            after_first_signal: None,
+        });
+        let state = Arc::new(ProcessState {
+            pid,
+            lifecycle: Mutex::new(ProcessLifecycle {
+                leader_reaped: false,
+                process_group_terminated: false,
+            }),
+        });
+        Cancellation {
+            state: Arc::clone(&state),
+        }
+        .cancel()
+        .expect("cancelling an unowned leader is a no-op");
+        drop(Child {
+            state: Arc::clone(&state),
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(state.lifecycle.lock().expect("lifecycle").leader_reaped);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        *signal_hook().lock().expect("signal hook") = None;
+    }
+
+    #[test]
+    fn direct_fallback_does_not_signal_after_the_leader_is_externally_reaped() {
+        let _hook_guard = signal_hook_test_lock()
+            .lock()
+            .expect("signal hook test lock");
+        let child = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawn externally reaped child");
+        let pid = libc::pid_t::try_from(child.id()).expect("valid child pid");
+        let child = Arc::new(Mutex::new(Some(child)));
+        let reaper = Arc::clone(&child);
+        let calls = Arc::new(AtomicUsize::new(0));
+        *signal_hook().lock().expect("signal hook") = Some(SignalHook {
+            pid,
+            calls: Arc::clone(&calls),
+            pass_first_signal: true,
+            after_first_signal: Some(Arc::new(move || {
+                let mut child = reaper.lock().expect("external child");
+                child
+                    .take()
+                    .expect("reap once")
+                    .wait()
+                    .expect("externally reap child");
+            })),
+        });
+        let state = Arc::new(ProcessState {
+            pid,
+            lifecycle: Mutex::new(ProcessLifecycle {
+                leader_reaped: false,
+                process_group_terminated: false,
+            }),
+        });
+
+        Cancellation {
+            state: Arc::clone(&state),
+        }
+        .cancel()
+        .expect("cancel after external reap");
+
+        assert!(state.lifecycle.lock().expect("lifecycle").leader_reaped);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        *signal_hook().lock().expect("signal hook") = None;
     }
 
     fn process_group_is_gone(process_group: u32) -> io::Result<bool> {
