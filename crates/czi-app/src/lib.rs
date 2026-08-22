@@ -30,6 +30,8 @@ const MAX_REMOTE_DIRECTORY_ENTRIES: usize = 4_096;
 const CONSOLE_PUMP_INPUT_CAPACITY: usize = 32;
 const MAX_CONSOLE_INPUT_BYTES: usize = 4_096;
 const EMBEDDED_START_TIMEOUT: Duration = Duration::from_secs(10);
+const VIEWPORT_PREFETCH_PERCENT: u64 = 12;
+const MAX_PREFETCH_TILES: usize = 128;
 const S_IFMT: u32 = 0o170_000;
 const S_IFDIR: u32 = 0o040_000;
 const S_IFREG: u32 = 0o100_000;
@@ -575,6 +577,7 @@ struct ViewRequest {
     view_generation: u64,
     plane: PlaneSelector,
     viewport: SpatialRect,
+    prefetch_viewport: SpatialRect,
     target_downsample: f64,
     resident_tile_ids: Vec<TileId>,
 }
@@ -752,6 +755,7 @@ enum WorkerEvent {
         logical_rect: SpatialRect,
         scale: PyramidScale,
         paint_order: usize,
+        prefetch: bool,
         tile: DecodedTile,
         source_generation: u64,
         view_generation: u64,
@@ -784,6 +788,12 @@ enum DatasetOrigin {
 struct ViewInterruption {
     command: WorkerCommand,
     resume: Option<ViewRequest>,
+}
+
+enum TileDecodeResult {
+    Complete,
+    Interrupted(Box<ViewInterruption>),
+    Failed,
 }
 
 struct WorkerBrowseSession {
@@ -1454,6 +1464,24 @@ fn process_view(
             return None;
         }
     };
+    let prefetch = match ViewQuery::new(
+        request.plane,
+        request.prefetch_viewport,
+        request.target_downsample,
+    )
+    .map_err(|error| error.to_string())
+    .and_then(|view| opened.query.query(&view).map_err(|error| error.to_string()))
+    {
+        Ok(query) => query,
+        Err(message) => {
+            let _ = events.send(WorkerEvent::ViewFailed {
+                message,
+                source_generation: request.source_generation,
+                view_generation: request.view_generation,
+            });
+            return None;
+        }
+    };
 
     let visible_tile_ids = query.hits.iter().map(|hit| hit.tile_id).collect::<Vec<_>>();
     let resident = request
@@ -1461,44 +1489,107 @@ fn process_view(
         .iter()
         .copied()
         .collect::<HashSet<_>>();
-    let mut decode_order = query.hits.clone();
-    sort_center_first(&mut decode_order, request.viewport);
-    for hit in decode_order {
+    let visible = visible_tile_ids.iter().copied().collect::<HashSet<_>>();
+    let mut visible_decode = query.hits.clone();
+    sort_center_first(&mut visible_decode, request.viewport);
+    match decode_tiles(
+        commands,
+        events,
+        opened,
+        request,
+        &resident,
+        visible_decode,
+        false,
+    ) {
+        TileDecodeResult::Complete => {}
+        TileDecodeResult::Interrupted(interruption) => return Some(*interruption),
+        TileDecodeResult::Failed => return None,
+    }
+    if events
+        .send(WorkerEvent::ViewFinished {
+            plane: query.plane,
+            scale: query.scale,
+            visible_tile_ids,
+            source_generation: request.source_generation,
+            view_generation: request.view_generation,
+        })
+        .is_err()
+    {
+        return None;
+    }
+    let mut prefetch_decode = prefetch
+        .hits
+        .into_iter()
+        .filter(|hit| !visible.contains(&hit.tile_id))
+        .collect::<Vec<_>>();
+    sort_center_first(&mut prefetch_decode, request.viewport);
+    prefetch_decode.truncate(MAX_PREFETCH_TILES);
+    let mut interruption = match decode_tiles(
+        commands,
+        events,
+        opened,
+        request,
+        &resident,
+        prefetch_decode,
+        true,
+    ) {
+        TileDecodeResult::Complete | TileDecodeResult::Failed => return None,
+        TileDecodeResult::Interrupted(interruption) => *interruption,
+    };
+    if interruption
+        .resume
+        .as_ref()
+        .is_some_and(|resume| resume.view_generation == request.view_generation)
+    {
+        interruption.resume = None;
+    }
+    Some(interruption)
+}
+
+fn decode_tiles(
+    commands: &Receiver<WorkerCommand>,
+    events: &SyncSender<WorkerEvent>,
+    opened: &WorkerDataset,
+    request: &ViewRequest,
+    resident: &HashSet<TileId>,
+    hits: Vec<TileHit>,
+    prefetch: bool,
+) -> TileDecodeResult {
+    for hit in hits {
         if resident.contains(&hit.tile_id) {
             continue;
         }
-        let event = match opened.dataset.decoded_tile(hit.tile_id.index()) {
-            Ok(tile) => WorkerEvent::TileLoaded {
-                tile_id: hit.tile_id,
-                plane: hit.plane,
-                logical_rect: hit.logical_rect,
-                scale: hit.scale,
-                paint_order: hit.paint_order,
-                tile,
-                source_generation: request.source_generation,
-                view_generation: request.view_generation,
-            },
-            Err(error) => WorkerEvent::ViewFailed {
-                message: format!("tile {}: {error}", hit.tile_id),
-                source_generation: request.source_generation,
-                view_generation: request.view_generation,
-            },
+        let tile = match opened.dataset.decoded_tile(hit.tile_id.index()) {
+            Ok(tile) => tile,
+            Err(_) if prefetch => continue,
+            Err(error) => {
+                let _ = events.send(WorkerEvent::ViewFailed {
+                    message: format!("tile {}: {error}", hit.tile_id),
+                    source_generation: request.source_generation,
+                    view_generation: request.view_generation,
+                });
+                return TileDecodeResult::Failed;
+            }
+        };
+        let event = WorkerEvent::TileLoaded {
+            tile_id: hit.tile_id,
+            plane: hit.plane,
+            logical_rect: hit.logical_rect,
+            scale: hit.scale,
+            paint_order: hit.paint_order,
+            prefetch,
+            tile,
+            source_generation: request.source_generation,
+            view_generation: request.view_generation,
         };
         if events.send(event).is_err() {
-            return None;
+            return TileDecodeResult::Failed;
         }
         if let Some(newer) = take_newer_command(commands, request) {
-            return Some(newer);
+            return TileDecodeResult::Interrupted(Box::new(newer));
         }
     }
-    let _ = events.send(WorkerEvent::ViewFinished {
-        plane: query.plane,
-        scale: query.scale,
-        visible_tile_ids,
-        source_generation: request.source_generation,
-        view_generation: request.view_generation,
-    });
-    None
+    TileDecodeResult::Complete
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -1700,6 +1791,39 @@ fn ceil_i64(value: f64) -> Option<i64> {
     (value >= i64::MIN as f64 && value <= i64::MAX as f64).then_some(value as i64)
 }
 
+fn prefetch_viewport(viewport: SpatialRect, bounds: SpatialRect) -> SpatialRect {
+    let min_x = viewport.min_x.clamp(bounds.min_x, bounds.max_x);
+    let min_y = viewport.min_y.clamp(bounds.min_y, bounds.max_y);
+    let max_x = viewport.max_x.clamp(min_x, bounds.max_x);
+    let max_y = viewport.max_y.clamp(min_y, bounds.max_y);
+    let visible = SpatialRect::new(min_x, min_y, max_x, max_y)
+        .expect("clamped viewport remains a valid rectangle");
+    let margin_x = prefetch_margin(visible.width());
+    let margin_y = prefetch_margin(visible.height());
+    SpatialRect::new(
+        visible.min_x.saturating_sub(margin_x).max(bounds.min_x),
+        visible.min_y.saturating_sub(margin_y).max(bounds.min_y),
+        visible.max_x.saturating_add(margin_x).min(bounds.max_x),
+        visible.max_y.saturating_add(margin_y).min(bounds.max_y),
+    )
+    .expect("prefetch viewport remains a valid rectangle")
+}
+
+fn prefetch_margin(extent: u64) -> i64 {
+    let margin = (u128::from(extent) * u128::from(VIEWPORT_PREFETCH_PERCENT)).div_ceil(100);
+    i64::try_from(margin).unwrap_or(i64::MAX)
+}
+
+fn select_requested_scale(scales: &[PyramidScale], target_downsample: f64) -> Option<PyramidScale> {
+    let mut selected = *scales.first()?;
+    for scale in scales {
+        if scale.as_f64() <= target_downsample {
+            selected = *scale;
+        }
+    }
+    Some(selected)
+}
+
 fn display_intensity(value: u16, levels: Levels) -> u8 {
     if value <= levels.black {
         return 0;
@@ -1803,8 +1927,17 @@ impl TextureCache {
         for entry in self.entries.values_mut() {
             entry.visible = false;
         }
+        for key in &self.protected {
+            if let Some(entry) = self.entries.get_mut(key) {
+                entry.visible = true;
+            }
+        }
         self.evict_non_visible();
-        self.protected.iter().map(|key| key.tile_id).collect()
+        self.entries
+            .keys()
+            .filter(|key| key.source_generation == source_generation && key.plane == plane)
+            .map(|key| key.tile_id)
+            .collect()
     }
 
     fn insert(
@@ -1813,6 +1946,7 @@ impl TextureCache {
         texture: egui::TextureHandle,
         bytes: usize,
         hit: TileHit,
+        visible: bool,
     ) {
         self.clock = self.clock.wrapping_add(1);
         if let Some(previous) = self.entries.remove(&key) {
@@ -1825,7 +1959,7 @@ impl TextureCache {
                 texture,
                 bytes,
                 last_used: self.clock,
-                visible: true,
+                visible,
                 logical_rect: hit.logical_rect,
                 paint_order: hit.paint_order,
             },
@@ -1902,9 +2036,36 @@ struct PendingTile {
     logical_rect: SpatialRect,
     scale: PyramidScale,
     paint_order: usize,
+    prefetch: bool,
     tile: DecodedTile,
     source_generation: u64,
     view_generation: u64,
+}
+
+#[derive(Default)]
+struct PyramidDisplay {
+    requested: Option<PyramidScale>,
+    displayed: Option<PyramidScale>,
+    view_generation: Option<u64>,
+}
+
+impl PyramidDisplay {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn request(&mut self, view_generation: u64, scale: PyramidScale) {
+        self.requested = Some(scale);
+        self.view_generation = Some(view_generation);
+    }
+
+    fn finish(&mut self, view_generation: u64, scale: PyramidScale) -> bool {
+        if self.view_generation != Some(view_generation) || self.requested != Some(scale) {
+            return false;
+        }
+        self.displayed = Some(scale);
+        true
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1980,7 +2141,7 @@ pub struct ViewerApp {
     cache: TextureCache,
     pending_tiles: Vec<PendingTile>,
     visible_tile_ids: Vec<TileId>,
-    selected_scale: Option<PyramidScale>,
+    pyramid_display: PyramidDisplay,
     levels: Levels,
     camera: Camera,
     fit_pending: bool,
@@ -2023,7 +2184,7 @@ impl ViewerApp {
             cache: TextureCache::new(TEXTURE_CACHE_LIMIT),
             pending_tiles: Vec::new(),
             visible_tile_ids: Vec::new(),
-            selected_scale: None,
+            pyramid_display: PyramidDisplay::default(),
             levels: Levels::default_for(PixelType::Gray16),
             camera: Camera::default(),
             fit_pending: false,
@@ -2043,7 +2204,7 @@ impl ViewerApp {
         self.generations.begin_view();
         self.clear_pending_view();
         self.visible_tile_ids.clear();
-        self.selected_scale = None;
+        self.pyramid_display.clear();
         self.cache.clear_visibility();
     }
 
@@ -2089,7 +2250,7 @@ impl ViewerApp {
         self.cache.clear();
         self.pending_tiles.clear();
         self.visible_tile_ids.clear();
-        self.selected_scale = None;
+        self.pyramid_display.clear();
         self.clear_pending_view();
         self.fit_pending = false;
         if let Err(error) = self.worker.send(WorkerCommand::ClearDataset) {
@@ -2201,7 +2362,7 @@ impl ViewerApp {
         self.cache.clear();
         self.pending_tiles.clear();
         self.visible_tile_ids.clear();
-        self.selected_scale = None;
+        self.pyramid_display.clear();
         self.clear_pending_view();
         self.fit_pending = false;
         self.status = Status::normal(format!("Opening {source_label}…"));
@@ -2321,9 +2482,13 @@ impl ViewerApp {
     }
 
     fn request_view(&mut self, viewport: SpatialRect) {
-        if self.dataset.is_none() {
+        let Some((scales, bounds)) = self.dataset.as_ref().and_then(|dataset| {
+            dataset
+                .plane(self.selection)
+                .map(|plane| (plane.scales.clone(), plane.world_bounds))
+        }) else {
             return;
-        }
+        };
         let plane = self.selection;
         let target_downsample = (1.0 / self.camera.zoom).clamp(0.000_001, 1_000_000.0);
         let request_key = (plane.key(), viewport, target_downsample.to_bits());
@@ -2331,12 +2496,17 @@ impl ViewerApp {
             return;
         }
         let view_generation = self.generations.begin_view();
+        let requested_scale = select_requested_scale(&scales, target_downsample)
+            .expect("indexed plane has at least one pyramid scale");
+        self.pyramid_display
+            .request(view_generation, requested_scale);
         let resident_tile_ids = self.cache.begin_view(self.generations.source, plane.key());
         let request = ViewRequest {
             source_generation: self.generations.source,
             view_generation,
             plane,
             viewport,
+            prefetch_viewport: prefetch_viewport(viewport, bounds),
             target_downsample,
             resident_tile_ids,
         };
@@ -2497,6 +2667,7 @@ impl ViewerApp {
                 logical_rect,
                 scale,
                 paint_order,
+                prefetch,
                 tile,
                 source_generation,
                 view_generation,
@@ -2505,15 +2676,13 @@ impl ViewerApp {
                 .accepts_view(source_generation, view_generation)
                 && plane == self.selection.key() =>
             {
-                if !self.visible_tile_ids.contains(&tile_id) {
-                    self.visible_tile_ids.push(tile_id);
-                }
                 self.pending_tiles.push(PendingTile {
                     tile_id,
                     plane,
                     logical_rect,
                     scale,
                     paint_order,
+                    prefetch,
                     tile,
                     source_generation,
                     view_generation,
@@ -2530,15 +2699,26 @@ impl ViewerApp {
                 .accepts_view(source_generation, view_generation)
                 && plane == self.selection.key() =>
             {
-                self.selected_scale = Some(scale);
+                if !self.pyramid_display.finish(view_generation, scale) {
+                    return;
+                }
                 self.visible_tile_ids = visible_tile_ids;
                 self.cache
                     .finish_view(source_generation, plane, &self.visible_tile_ids);
                 let (visible, resident, bytes) =
                     self.cache.current_counts(source_generation, plane);
                 self.status = Status::normal(format!(
-                    "Scale {}× · {} visible · {} resident · {} cache",
-                    format_scale(scale),
+                    "Requested {}× · Displayed {}× · {} visible · {} resident · {} cache",
+                    format_scale(
+                        self.pyramid_display
+                            .requested
+                            .expect("finished request scale")
+                    ),
+                    format_scale(
+                        self.pyramid_display
+                            .displayed
+                            .expect("finished display scale")
+                    ),
                     visible,
                     resident,
                     format_bytes(bytes)
@@ -2676,6 +2856,7 @@ impl ViewerApp {
                         texture,
                         bytes,
                         hit,
+                        !pending.prefetch,
                     );
                 }
                 Err(error) => self.status = Status::error(error),
@@ -3468,8 +3649,11 @@ impl eframe::App for ViewerApp {
                     self.cache.clear();
                     self.invalidate_view();
                 }
-                if let Some(scale) = self.selected_scale {
-                    ui.label(format!("Selected pyramid scale: {}×", format_scale(scale)));
+                if let Some(scale) = self.pyramid_display.requested {
+                    ui.label(format!("Requested pyramid scale: {}×", format_scale(scale)));
+                }
+                if let Some(scale) = self.pyramid_display.displayed {
+                    ui.label(format!("Displayed pyramid scale: {}×", format_scale(scale)));
                 }
                 if let Some(dataset) = self.dataset.as_ref() {
                     let (visible, resident, bytes) = self
@@ -3764,6 +3948,7 @@ mod tests {
             view_generation,
             plane: PlaneSelector::default(),
             viewport: SpatialRect::new(0, 0, 1, 1).expect("unit viewport"),
+            prefetch_viewport: SpatialRect::new(0, 0, 1, 1).expect("unit prefetch viewport"),
             target_downsample: 1.0,
             resident_tile_ids: Vec::new(),
         }
@@ -3841,6 +4026,45 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn prefetch_viewport_expands_and_clamps_to_plane_bounds() {
+        let bounds = SpatialRect::new(0, 0, 1_000, 1_000).expect("bounds");
+        let viewport = SpatialRect::new(900, 900, 1_000, 1_000).expect("viewport");
+        assert_eq!(
+            prefetch_viewport(viewport, bounds),
+            SpatialRect::new(888, 888, 1_000, 1_000).expect("clamped prefetch")
+        );
+        let outside = SpatialRect::new(-50, 200, 50, 300).expect("outside viewport");
+        assert_eq!(
+            prefetch_viewport(outside, bounds),
+            SpatialRect::new(0, 188, 56, 312).expect("left-clamped prefetch")
+        );
+    }
+
+    #[test]
+    fn adaptive_pyramid_requests_finest_scale_and_retains_fallback_until_completion() {
+        let one = PyramidScale::new(1, 1).expect("one scale");
+        let two = PyramidScale::new(2, 1).expect("two scale");
+        let four = PyramidScale::new(4, 1).expect("four scale");
+        let scales = [one, two, four];
+        assert_eq!(select_requested_scale(&scales, 4.0), Some(four));
+        assert_eq!(select_requested_scale(&scales, 2.0), Some(two));
+        assert_eq!(select_requested_scale(&scales, 0.01), Some(one));
+
+        let mut display = PyramidDisplay::default();
+        display.request(4, four);
+        assert!(display.finish(4, four));
+        display.request(5, two);
+        assert_eq!(display.requested, Some(two));
+        assert_eq!(display.displayed, Some(four));
+        assert!(!display.finish(4, four));
+        assert!(display.finish(5, two));
+        display.request(6, one);
+        assert_eq!(display.displayed, Some(two));
+        assert!(display.finish(6, one));
+        assert_eq!(display.displayed, Some(one));
     }
 
     #[test]
