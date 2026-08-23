@@ -35,7 +35,7 @@ The helper reads `request.json`:
 }
 ```
 
-Each channel file contains exactly `sample_count * 128 * 128` row-major little-endian `u16` values. Gray8 input is widened without changing its 0–255 range. Channel sample counts may differ unless Phase-mask alignment requires common acquisition identities.
+Each channel file contains exactly `sample_count * 128 * 128` row-major little-endian `u16` values. Gray8 input is widened without changing its 0–255 range. Whole-CZI requests require the same raw native acquisition count for every channel.
 
 The helper writes `response.json` and one gain/support pair per channel:
 
@@ -67,9 +67,9 @@ The helper must normalize gain so raw division has the intended scale. Darkfield
 
 ## Sampling and scheduling
 
-The viewer fits every observed sparse C index. For each channel it uses every native acquisition position, so CZI pyramid duplicates do not increase the count and no position is stratified, capped, or silently omitted. When a Phase channel supplies shared masks, it uses every position aligned across channels by scene, Z/T, detector rectangle, and mosaic index. At least 32 aligned positions are required. The UI warns below 100.
+The viewer fits every observed sparse C index. For each channel it uses every native acquisition position, so CZI pyramid duplicates do not increase the count and no position is intersected, stratified, capped, subsampled, or silently omitted. All channels must have equal raw native acquisition counts. When a Phase channel supplies shared masks, every channel must have the exact same scene/Z/T/detector rectangle/mosaic acquisition identity set. A count or identity mismatch rejects the plan instead of taking an intersection. The UI warns below 100 positions but does not impose a sampling minimum.
 
-Before any tile payload read, the viewer rejects a whole-CZI plan when any channel exceeds 512 positions or the aggregate 128 × 128 `u16` samples exceed 32 MiB. The error includes exact per-channel counts, total tile reads, exact sample bytes, and guidance to use offline/cluster profile generation. For example, the HADA 300 × 3 plan retains all 900 tile reads and uses 29,491,200 sample bytes.
+Before Phase alignment checks or any tile payload read, the viewer rejects a whole-CZI plan when any raw channel exceeds 512 positions or the aggregate raw 128 × 128 `u16` samples exceed 32 MiB. The error includes exact per-channel counts, total tile reads, exact sample bytes, and guidance to use offline/cluster profile generation. For example, the HADA 300 × 3 plan retains all 900 tile reads and uses 29,491,200 sample bytes.
 
 For sample decoding, a pyramid tile is used only when its logical rectangle and mosaic index map one-to-one to one native detector tile and its stored dimensions remain at least 128 × 128. Otherwise the native tile is decoded. Every sample is resized to 128 × 128 in detector-tile orientation and written as little-endian `u16`.
 

@@ -20,7 +20,6 @@ use crate::settings::validate_helper_path;
 pub(crate) const GRID_WIDTH: u32 = 128;
 pub(crate) const GRID_HEIGHT: u32 = 128;
 pub(crate) const MAX_SAMPLES_PER_CHANNEL: usize = 512;
-pub(crate) const MIN_SAMPLES_PER_CHANNEL: usize = 32;
 pub(crate) const WARN_SAMPLES_PER_CHANNEL: usize = 100;
 const MAX_CHANNELS: usize = 64;
 const MAX_CHANNEL_NAME_CHARS: usize = 128;
@@ -464,23 +463,21 @@ pub(crate) fn plan_samples(
             );
         }
         native_hits.sort_unstable_by_key(hit_order_key);
-        let pixel_max = channel_pixel_max(index, &native_hits, cancelled)?;
-        native_channels.push((spec, pixel_max, native_hits));
+        native_channels.push((spec, native_hits));
     }
-    let selected_channels = aligned_channel_hits(
+    let selected_channels = select_whole_czi_hits(
+        specs,
         &native_channels
             .iter()
-            .map(|(_, _, hits)| hits.as_slice())
+            .map(|(_, hits)| hits.as_slice())
             .collect::<Vec<_>>(),
-        specs.iter().any(|spec| spec.is_phase),
         cancelled,
     )?;
-    let counts = selected_channels.iter().map(Vec::len).collect::<Vec<_>>();
-    validate_whole_czi_limits(specs, &counts)?;
     let verified_scales = verified_scales(index, query, cancelled)?;
     let mut channels = Vec::with_capacity(specs.len());
-    for ((spec, pixel_max, _), selected) in native_channels.into_iter().zip(selected_channels) {
+    for ((spec, native_hits), selected) in native_channels.into_iter().zip(selected_channels) {
         check_cancelled(cancelled)?;
+        let pixel_max = channel_pixel_max(index, &native_hits, cancelled)?;
         let candidates = selected
             .into_iter()
             .map(|native| {
@@ -1006,45 +1003,50 @@ fn unique_acquisition_hits(
     Ok(indexed)
 }
 
-fn aligned_channel_hits(
+fn select_whole_czi_hits(
+    specs: &[ChannelSpec],
     channels: &[&[TileHit]],
-    align_channels: bool,
     cancelled: &AtomicBool,
 ) -> Result<Vec<Vec<TileHit>>, String> {
-    if !align_channels {
+    let counts = channels.iter().map(|hits| hits.len()).collect::<Vec<_>>();
+    validate_whole_czi_limits(specs, &counts)?;
+    let phase_channels = specs
+        .iter()
+        .enumerate()
+        .filter(|(_, spec)| spec.is_phase)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let Some(&phase_index) = phase_channels.first() else {
         return Ok(channels.iter().map(|hits| hits.to_vec()).collect());
+    };
+    if phase_channels.len() != 1 {
+        return Err(String::from(
+            "BaSiC whole-CZI planning requires at most one Phase channel.",
+        ));
     }
     let mut indexed = Vec::with_capacity(channels.len());
     for hits in channels {
         check_cancelled(cancelled)?;
         indexed.push(unique_acquisition_hits(hits, cancelled)?);
     }
-    let Some(first) = indexed.first() else {
-        return Ok(Vec::new());
-    };
-    let identities = first
-        .keys()
-        .filter(|identity| {
-            indexed
-                .iter()
-                .skip(1)
-                .all(|channel| channel.contains_key(identity))
-        })
-        .copied()
-        .collect::<Vec<_>>();
-    indexed
-        .iter()
-        .map(|channel| {
-            identities
-                .iter()
-                .map(|identity| {
-                    channel.get(identity).copied().ok_or_else(|| {
-                        String::from("Aligned BaSiC acquisition position disappeared.")
-                    })
-                })
-                .collect()
-        })
-        .collect()
+    let phase = &indexed[phase_index];
+    for (channel_index, channel) in indexed.iter().enumerate() {
+        check_cancelled(cancelled)?;
+        if channel.keys().ne(phase.keys()) {
+            return Err(format!(
+                "BaSiC Phase acquisition identity mismatch: {} (C={}) and {} (C={}) each have {} positions, but their scene/Z/T/detector rectangle/mosaic identity sets differ. Whole-CZI planning never intersects or drops positions.",
+                specs[phase_index].name,
+                specs[phase_index].c_index,
+                specs[channel_index].name,
+                specs[channel_index].c_index,
+                counts[phase_index]
+            ));
+        }
+    }
+    Ok(indexed
+        .into_iter()
+        .map(|channel| channel.into_values().collect())
+        .collect())
 }
 
 fn validate_whole_czi_limits(specs: &[ChannelSpec], counts: &[usize]) -> Result<u64, String> {
@@ -1083,14 +1085,12 @@ fn validate_whole_czi_limits(specs: &[ChannelSpec], counts: &[usize]) -> Result<
             "BaSiC whole-CZI plan rejected before reads: {summary}; protocol v1 allows at most {MAX_INPUT_BYTES} sample bytes (32 MiB). Use offline/cluster profile generation for this dataset."
         ));
     }
-    if let Some((spec, count)) = specs
-        .iter()
-        .zip(counts)
-        .find(|(_, count)| **count < MIN_SAMPLES_PER_CHANNEL)
+    if counts
+        .first()
+        .is_some_and(|first| counts.iter().any(|count| count != first))
     {
         return Err(format!(
-            "{} has only {count} aligned acquisition positions; at least {MIN_SAMPLES_PER_CHANNEL} are required. Whole-CZI plan: {summary}.",
-            spec.name
+            "BaSiC whole-CZI plan requires equal raw native positions per channel; {summary}. No positions were intersected, dropped, or subsampled."
         ));
     }
     Ok(sample_bytes)
@@ -1212,6 +1212,8 @@ fn create_new_file(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    const TEST_SAMPLES: usize = 32;
+
     fn profile(gain: Vec<f32>, support: Vec<u8>, pixel_max: u16) -> ChannelProfile {
         ChannelProfile {
             id: String::from("c0"),
@@ -1243,7 +1245,11 @@ mod tests {
     }
 
     fn acquisition_hits(channel: i32, count: usize) -> Vec<TileHit> {
-        (0..count)
+        acquisition_hits_from(channel, 0, count)
+    }
+
+    fn acquisition_hits_from(channel: i32, start: usize, count: usize) -> Vec<TileHit> {
+        (start..start + count)
             .map(|index| TileHit {
                 tile_id: TileId(
                     usize::try_from(channel).expect("non-negative channel") * 1_000 + index,
@@ -1324,7 +1330,7 @@ mod tests {
             channels: vec![ChannelSamplePlan {
                 spec,
                 pixel_max: 255,
-                candidates: vec![candidate(TileId(0)); MIN_SAMPLES_PER_CHANNEL],
+                candidates: vec![candidate(TileId(0)); TEST_SAMPLES],
             }],
             verified_scales: HashMap::new(),
         };
@@ -1403,12 +1409,13 @@ mod tests {
 
     #[test]
     fn aligned_selection_uses_every_position_without_subsampling() {
+        let specs = channel_specs(3);
         let channels = (0..3)
             .map(|channel| acquisition_hits(channel, 300))
             .collect::<Vec<_>>();
-        let selected = aligned_channel_hits(
+        let selected = select_whole_czi_hits(
+            &specs,
             &channels.iter().map(Vec::as_slice).collect::<Vec<_>>(),
-            true,
             &AtomicBool::new(false),
         )
         .expect("aligned positions");
@@ -1443,6 +1450,56 @@ mod tests {
         assert!(byte_error.contains("sample bytes 39321600"));
         assert!(byte_error.contains(&MAX_INPUT_BYTES.to_string()));
         assert!(byte_error.contains("offline/cluster profile generation"));
+        assert_eq!(
+            validate_whole_czi_limits(&specs, &[1, 1, 1]).expect("no sampling minimum"),
+            98_304
+        );
+    }
+
+    #[test]
+    fn whole_czi_rejects_raw_count_and_identity_mismatches_without_intersection() {
+        let specs = channel_specs(2);
+        let raw_over_limit = [acquisition_hits(0, 600), acquisition_hits(1, 300)];
+        let error = select_whole_czi_hits(
+            &specs,
+            &raw_over_limit.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            &AtomicBool::new(false),
+        )
+        .expect_err("600 raw positions must not be reduced to 300 shared positions");
+        assert!(error.contains("Channel 0 (C=0): 600"));
+        assert!(error.contains("total tile reads 900"));
+        assert!(error.contains("sample bytes 29491200"));
+        assert!(error.contains("at most 512"));
+
+        let phase_identity_mismatch = [acquisition_hits(0, 300), acquisition_hits_from(1, 1, 300)];
+        let error = select_whole_czi_hits(
+            &specs,
+            &phase_identity_mismatch
+                .iter()
+                .map(Vec::as_slice)
+                .collect::<Vec<_>>(),
+            &AtomicBool::new(false),
+        )
+        .expect_err("equal counts with unequal identity sets must fail");
+        assert!(error.contains("Phase acquisition identity mismatch"));
+        assert!(error.contains("each have 300 positions"));
+        assert!(error.contains("never intersects or drops"));
+
+        let mut no_phase_specs = specs;
+        for spec in &mut no_phase_specs {
+            spec.is_phase = false;
+        }
+        let unequal = [acquisition_hits(0, 300), acquisition_hits(1, 299)];
+        let error = select_whole_czi_hits(
+            &no_phase_specs,
+            &unequal.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            &AtomicBool::new(false),
+        )
+        .expect_err("no-Phase unequal counts must fail");
+        assert!(error.contains("requires equal raw native positions"));
+        assert!(error.contains("Channel 0 (C=0): 300"));
+        assert!(error.contains("Channel 1 (C=1): 299"));
+        assert!(error.contains("No positions were intersected, dropped, or subsampled"));
     }
 
     #[test]
@@ -1547,12 +1604,12 @@ mod tests {
                     is_phase: false,
                 },
                 pixel_max: u16::MAX,
-                candidates: vec![candidate(TileId(0)); MIN_SAMPLES_PER_CHANNEL],
+                candidates: vec![candidate(TileId(0)); TEST_SAMPLES],
             }],
             verified_scales: HashMap::new(),
         };
         let request = TempRequest::create(&plan).expect("request");
-        for sample in 0..MIN_SAMPLES_PER_CHANNEL {
+        for sample in 0..TEST_SAMPLES {
             let mut pixels = vec![0_u16; grid_pixels()];
             for (index, pixel) in pixels.iter_mut().enumerate() {
                 *pixel = 1_000 + u16::try_from((index + sample) % 1_000).expect("bounded value");
