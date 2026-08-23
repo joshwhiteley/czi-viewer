@@ -5532,8 +5532,12 @@ fn authentication_terminal(
         egui::Color32::from_rgb(214, 221, 230),
         text_rect.width(),
     );
-    painter.galley(
-        text_rect.min,
+    let text_position = egui::pos2(
+        text_rect.min.x,
+        terminal_galley_y(text_rect, galley.size().y),
+    );
+    painter.with_clip_rect(text_rect).galley(
+        text_position,
         galley,
         egui::Color32::from_rgb(214, 221, 230),
     );
@@ -5554,6 +5558,14 @@ fn authentication_terminal(
         Vec::new()
     };
     (focused, inputs)
+}
+
+fn terminal_galley_y(text_rect: egui::Rect, galley_height: f32) -> f32 {
+    if galley_height > text_rect.height() {
+        text_rect.max.y - galley_height
+    } else {
+        text_rect.min.y
+    }
 }
 
 fn terminal_display_text(transcript: &str) -> String {
@@ -7043,6 +7055,21 @@ mod tests {
                 .generation,
             2
         );
+    }
+
+    #[test]
+    fn authentication_terminal_top_aligns_short_output_and_bottom_aligns_tall_output() {
+        let text_rect = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(210.0, 100.0));
+        assert!((terminal_galley_y(text_rect, 32.0) - 20.0).abs() < f32::EPSILON);
+        assert!((terminal_galley_y(text_rect, 80.0) - 20.0).abs() < f32::EPSILON);
+        assert!((terminal_galley_y(text_rect, 140.0) + 40.0).abs() < f32::EPSILON);
+
+        let short = "Password: ";
+        assert_eq!(terminal_display_text(short), short);
+        let tall = format!("{}Password: ", "old OpenConnect output\n".repeat(300));
+        let visible_tail = terminal_display_text(&tall);
+        assert!(visible_tail.starts_with('…'));
+        assert!(visible_tail.ends_with("Password: "));
     }
 
     #[test]
