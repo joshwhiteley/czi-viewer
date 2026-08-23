@@ -1084,9 +1084,9 @@ struct BasicFitHandle {
     join: JoinHandle<()>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct BasicCancellationSlot {
-    current: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    current: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl BasicCancellationSlot {
@@ -1204,7 +1204,6 @@ impl DatasetWorker {
         let vpn_cancellation = VpnCancellationSlot::default();
         let worker_vpn_cancellation = vpn_cancellation.clone();
         let basic_cancellation = BasicCancellationSlot::default();
-        let worker_basic_cancellation = basic_cancellation.clone();
         let join = thread::Builder::new()
             .name(String::from("czi-dataset-worker"))
             .spawn(move || {
@@ -1213,7 +1212,6 @@ impl DatasetWorker {
                     &event_tx,
                     &worker_embedded_cancellation,
                     &worker_vpn_cancellation,
-                    &worker_basic_cancellation,
                 );
             })
             .expect("start CZI dataset worker");
@@ -1317,7 +1315,6 @@ fn worker_loop(
     events: &SyncSender<WorkerEvent>,
     embedded_cancellation: &EmbeddedCancellationSlot,
     vpn_cancellation: &VpnCancellationSlot,
-    basic_cancellation: &BasicCancellationSlot,
 ) {
     let mut dataset = None;
     let mut browse_session = None;
@@ -1486,7 +1483,6 @@ fn worker_loop(
                 } else if let Some(opened) = dataset.as_ref() {
                     match start_basic_sampling(opened, request.clone()) {
                         Ok(job) => {
-                            basic_cancellation.replace(&job.cancelled);
                             basic_sampling = Some(job);
                         }
                         Err(message) => {
@@ -7111,17 +7107,69 @@ mod tests {
     }
 
     #[test]
-    fn registering_a_started_basic_request_keeps_its_token_live() {
+    fn cancelled_old_basic_start_cannot_cancel_new_prepare_token() {
         let slot = BasicCancellationSlot::default();
-        let started = Arc::new(AtomicBool::new(false));
-        slot.replace(&started);
-        slot.replace(&started);
-        assert!(!started.load(Ordering::Acquire));
+        let old = Arc::new(AtomicBool::new(false));
+        let new = Arc::new(AtomicBool::new(false));
+        let (commands, command_rx) = mpsc::sync_channel(8);
+        let (event_tx, events) = mpsc::sync_channel(8);
 
-        let replacement = Arc::new(AtomicBool::new(false));
-        slot.replace(&replacement);
-        assert!(started.load(Ordering::Acquire));
-        assert!(!replacement.load(Ordering::Acquire));
+        slot.replace(&old);
+        commands
+            .send(WorkerCommand::BasicStart(BasicRequest {
+                helper: PathBuf::from("/old-helper"),
+                channels: Vec::new(),
+                source_generation: 0,
+                fit_generation: 1,
+                cancelled: Arc::clone(&old),
+            }))
+            .expect("old prepare");
+        slot.cancel_active();
+        commands
+            .send(WorkerCommand::BasicCancel)
+            .expect("cancel command");
+        slot.replace(&new);
+        commands
+            .send(WorkerCommand::BasicStart(BasicRequest {
+                helper: PathBuf::from("/new-helper"),
+                channels: Vec::new(),
+                source_generation: 0,
+                fit_generation: 2,
+                cancelled: Arc::clone(&new),
+            }))
+            .expect("new prepare");
+        commands
+            .send(WorkerCommand::Shutdown)
+            .expect("shutdown command");
+
+        let embedded_cancellation = EmbeddedCancellationSlot::default();
+        let vpn_cancellation = VpnCancellationSlot::default();
+        let join = thread::spawn(move || {
+            worker_loop(
+                &command_rx,
+                &event_tx,
+                &embedded_cancellation,
+                &vpn_cancellation,
+            );
+        });
+        let terminal = events
+            .recv_timeout(Duration::from_secs(1))
+            .expect("new prepare terminal event");
+        join.join().expect("worker join");
+
+        let old_terminal_is_inferred_from_ui_cancellation = old.load(Ordering::Acquire);
+        let new_terminal_was_received = matches!(
+            terminal,
+            WorkerEvent::BasicFailed {
+                source_generation: 0,
+                fit_generation: 2,
+                ..
+            }
+        );
+        assert!(old_terminal_is_inferred_from_ui_cancellation);
+        assert!(!new.load(Ordering::Acquire));
+        assert!(new_terminal_was_received);
+        assert!(events.try_recv().is_err());
     }
 
     #[test]
@@ -8453,14 +8501,12 @@ mod tests {
         let vpn_cancellation = VpnCancellationSlot::default();
         let worker_vpn_cancellation = vpn_cancellation.clone();
         let basic_cancellation = BasicCancellationSlot::default();
-        let worker_basic_cancellation = basic_cancellation.clone();
         let join = thread::spawn(move || {
             worker_loop(
                 &command_rx,
                 &event_tx,
                 &worker_cancellation,
                 &worker_vpn_cancellation,
-                &worker_basic_cancellation,
             );
         });
         commands

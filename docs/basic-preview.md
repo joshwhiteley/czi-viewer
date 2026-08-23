@@ -73,7 +73,7 @@ For sample decoding, a pyramid tile is used only when its logical rectangle and 
 
 Local and Shared SFTP sources use the same read-only dataset worker. Sampling performs one tile step only when no viewer command is waiting. Visible viewport work therefore preempts sampling between tile reads. A single source read or decode cannot be interrupted with the current random-access abstraction; cancellation takes effect after that bounded tile operation. Helper fitting runs on a separate worker and cancellation terminates the helper process.
 
-Detector/pyramid mapping verification is deferred until **Prepare BaSiC Preview**, so opening a dataset has no unconditional BaSiC planning cost. Planning polls the same cancellation token between planes and scales. Source and fit generations reject late progress and results after cancel, refit, or source replacement.
+Detector/pyramid mapping verification is deferred until **Prepare BaSiC Preview**, so opening a dataset has no unconditional BaSiC planning cost. Planning polls the same cancellation token between planes and scales. A single in-memory geometry query or sort is not preemptible and can briefly delay queued viewport work before tile sampling begins. Source and fit generations reject late progress and results after cancel, refit, or source replacement.
 
 ## Preview correction
 
