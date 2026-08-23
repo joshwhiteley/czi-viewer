@@ -34,6 +34,7 @@ const VIEWPORT_PREFETCH_PERCENT: u64 = 12;
 const MAX_PREFETCH_TILES: usize = 128;
 const MAX_COMPOSITE_LEGEND_CHARS: usize = 96;
 const MAX_CANVAS_TITLE_CHARS: usize = 180;
+const MAX_TITLE_FILENAME_CHARS: usize = 64;
 const S_IFMT: u32 = 0o170_000;
 const S_IFDIR: u32 = 0o040_000;
 const S_IFREG: u32 = 0o100_000;
@@ -1776,6 +1777,10 @@ enum DisplayMode {
 
 enum ActivePlaneState {
     Active(Vec<PlaneSelector>),
+    Partial {
+        active: Vec<PlaneSelector>,
+        missing_channels: Vec<i32>,
+    },
     NoActiveChannels,
     NoMatchingPlanes,
 }
@@ -1783,7 +1788,7 @@ enum ActivePlaneState {
 impl ActivePlaneState {
     const fn canvas_message(&self) -> Option<&'static str> {
         match self {
-            Self::Active(_) => None,
+            Self::Active(_) | Self::Partial { .. } => None,
             Self::NoActiveChannels => Some("No active composite channels. Assign one in Display."),
             Self::NoMatchingPlanes => {
                 Some("No assigned channels match this scene, Z, and T plane.")
@@ -1794,6 +1799,9 @@ impl ActivePlaneState {
     const fn export_message(&self) -> Option<&'static str> {
         match self {
             Self::Active(_) => None,
+            Self::Partial { .. } => {
+                Some("Some assigned channels are missing from this scene, Z, or T plane.")
+            }
             Self::NoActiveChannels => {
                 Some("Assign at least one composite channel before exporting PNG.")
             }
@@ -1802,6 +1810,12 @@ impl ActivePlaneState {
             }
         }
     }
+}
+
+fn export_blocker(active: &ActivePlaneState, pyramid: &PyramidDisplay) -> Option<&'static str> {
+    active
+        .export_message()
+        .or_else(|| (!pyramid.is_ready()).then_some("Composite channels are still loading."))
 }
 
 #[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -2318,11 +2332,12 @@ struct PendingTile {
     view_generation: u64,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Debug, Default)]
 struct PyramidDisplay {
-    requested: Option<PyramidScale>,
-    displayed: Option<PyramidScale>,
     view_generation: Option<u64>,
+    expected: HashMap<PlaneKey, PyramidScale>,
+    completed: HashMap<PlaneKey, PyramidScale>,
+    displayed: HashMap<PlaneKey, PyramidScale>,
 }
 
 impl PyramidDisplay {
@@ -2330,17 +2345,57 @@ impl PyramidDisplay {
         *self = Self::default();
     }
 
-    fn request(&mut self, view_generation: u64, scale: PyramidScale) {
-        self.requested = Some(scale);
+    fn request(&mut self, view_generation: u64, requested: HashMap<PlaneKey, PyramidScale>) {
         self.view_generation = Some(view_generation);
+        self.displayed
+            .retain(|plane, _| requested.contains_key(plane));
+        self.expected = requested;
+        self.completed.clear();
     }
 
-    fn finish(&mut self, view_generation: u64, scale: PyramidScale) -> bool {
-        if self.view_generation != Some(view_generation) || self.requested != Some(scale) {
+    fn finish(&mut self, view_generation: u64, plane: PlaneKey, scale: PyramidScale) -> bool {
+        if self.view_generation != Some(view_generation) || !self.expected.contains_key(&plane) {
             return false;
         }
-        self.displayed = Some(scale);
+        self.completed.insert(plane, scale);
+        self.displayed.insert(plane, scale);
         true
+    }
+
+    fn is_ready(&self) -> bool {
+        !self.expected.is_empty() && self.completed.len() == self.expected.len()
+    }
+
+    fn completion_counts(&self) -> (usize, usize) {
+        (self.completed.len(), self.expected.len())
+    }
+
+    fn requested_summary(&self) -> ScaleSummary {
+        ScaleSummary::from_scales(self.expected.values().copied())
+    }
+
+    fn displayed_summary(&self) -> ScaleSummary {
+        ScaleSummary::from_scales(self.displayed.values().copied())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScaleSummary {
+    None,
+    Uniform(PyramidScale),
+    Mixed,
+}
+
+impl ScaleSummary {
+    fn from_scales(mut scales: impl Iterator<Item = PyramidScale>) -> Self {
+        let Some(first) = scales.next() else {
+            return Self::None;
+        };
+        if scales.all(|scale| scale == first) {
+            Self::Uniform(first)
+        } else {
+            Self::Mixed
+        }
     }
 }
 
@@ -2352,12 +2407,16 @@ fn record_finished_plane(
     scale: PyramidScale,
     visible_tile_ids: Vec<TileId>,
 ) {
-    let _ = pyramid.finish(view_generation, scale);
+    let _ = pyramid.finish(view_generation, plane, scale);
     visible.insert(plane, visible_tile_ids);
 }
 
-fn optional_scale(scale: Option<PyramidScale>) -> String {
-    scale.map_or_else(|| String::from("—"), format_scale)
+fn format_scale_summary(summary: ScaleSummary) -> String {
+    match summary {
+        ScaleSummary::None => String::from("—"),
+        ScaleSummary::Uniform(scale) => format_scale(scale),
+        ScaleSummary::Mixed => String::from("Mixed"),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2383,11 +2442,17 @@ fn apply_view_finished(
     cache.finish_view(source_generation, plane, &visible_tiles[&plane]);
     let (visible, resident, bytes) =
         cache.current_counts_for_planes(source_generation, active_planes);
+    let (completed, expected) = pyramid.completion_counts();
+    let progress = if pyramid.is_ready() {
+        String::from("Ready")
+    } else {
+        format!("Loading channels {completed}/{expected}")
+    };
     Status::normal(format!(
-        "Requested {}× · Displayed {}× · {visible} visible · {resident} resident · {} cache",
-        optional_scale(pyramid.requested),
-        optional_scale(pyramid.displayed),
-        format_bytes(bytes)
+        "{progress} · Requested {}× · Displayed {}× · {visible} visible · {resident} resident · {} cache",
+        format_scale_summary(pyramid.requested_summary()),
+        format_scale_summary(pyramid.displayed_summary()),
+        format_bytes(bytes),
     ))
 }
 
@@ -2871,34 +2936,58 @@ impl ViewerApp {
         if assigned.is_empty() {
             return ActivePlaneState::NoActiveChannels;
         }
-        let planes = assigned
-            .iter()
-            .filter_map(|channel| {
-                let plane = PlaneSelector::new(
-                    *channel,
-                    self.selection.scene,
-                    self.selection.z,
-                    self.selection.t,
-                );
-                dataset.plane(plane).is_some().then_some(plane)
-            })
-            .collect::<Vec<_>>();
+        let mut planes = Vec::new();
+        let mut missing_channels = Vec::new();
+        for channel in assigned {
+            let plane = PlaneSelector::new(
+                channel,
+                self.selection.scene,
+                self.selection.z,
+                self.selection.t,
+            );
+            if dataset.plane(plane).is_some() {
+                planes.push(plane);
+            } else {
+                missing_channels.push(channel);
+            }
+        }
         if planes.is_empty() {
             ActivePlaneState::NoMatchingPlanes
-        } else {
+        } else if missing_channels.is_empty() {
             ActivePlaneState::Active(planes)
+        } else {
+            ActivePlaneState::Partial {
+                active: planes,
+                missing_channels,
+            }
         }
     }
 
     fn active_planes(&self) -> Vec<PlaneSelector> {
         match self.active_plane_state() {
-            ActivePlaneState::Active(planes) => planes,
+            ActivePlaneState::Active(planes) | ActivePlaneState::Partial { active: planes, .. } => {
+                planes
+            }
             ActivePlaneState::NoActiveChannels | ActivePlaneState::NoMatchingPlanes => Vec::new(),
         }
     }
 
     fn export_unavailable_message(&self) -> Option<&'static str> {
-        self.active_plane_state().export_message()
+        export_blocker(&self.active_plane_state(), &self.pyramid_display)
+    }
+
+    fn missing_assignment_label(&self) -> Option<String> {
+        let ActivePlaneState::Partial {
+            missing_channels, ..
+        } = self.active_plane_state()
+        else {
+            return None;
+        };
+        let summary = &self.dataset.as_ref()?.metadata_summary;
+        Some(format!(
+            "Missing at selected scene/Z/T: {}",
+            channel_name_list(summary, &missing_channels, MAX_COMPOSITE_LEGEND_CHARS)
+        ))
     }
 
     fn role_for_plane(&self, plane: PlaneKey) -> ChannelRole {
@@ -2930,10 +3019,10 @@ impl ViewerApp {
     }
 
     fn request_view(&mut self, viewport: SpatialRect) {
-        let Some((scales, bounds)) = self.dataset.as_ref().and_then(|dataset| {
+        let Some(bounds) = self.dataset.as_ref().and_then(|dataset| {
             dataset
                 .plane(self.selection)
-                .map(|plane| (plane.scales.clone(), plane.world_bounds))
+                .map(|plane| plane.world_bounds)
         }) else {
             return;
         };
@@ -2948,10 +3037,18 @@ impl ViewerApp {
             return;
         }
         let view_generation = self.generations.begin_view();
-        let requested_scale = select_requested_scale(&scales, target_downsample)
-            .expect("indexed plane has at least one pyramid scale");
+        let requested_scales = planes
+            .iter()
+            .filter_map(|plane| {
+                self.dataset
+                    .as_ref()
+                    .and_then(|dataset| dataset.plane(*plane))
+                    .and_then(|info| select_requested_scale(&info.scales, target_downsample))
+                    .map(|scale| (plane.key(), scale))
+            })
+            .collect::<HashMap<_, _>>();
         self.pyramid_display
-            .request(view_generation, requested_scale);
+            .request(view_generation, requested_scales);
         let resident_tile_ids = self.cache.begin_view(self.generations.source, &plane_keys);
         let request = ViewRequest {
             source_generation: self.generations.source,
@@ -3199,6 +3296,10 @@ impl ViewerApp {
             }
         }
 
+        if let Some(missing) = self.missing_assignment_label() {
+            ui.colored_label(egui::Color32::YELLOW, missing);
+        }
+
         ui.separator();
         ui.heading("Display range");
         let pixel_type = self
@@ -3209,12 +3310,7 @@ impl ViewerApp {
             self.cache.clear();
             self.invalidate_view();
         }
-        if let Some(scale) = self.pyramid_display.requested {
-            ui.label(format!("Requested pyramid scale: {}×", format_scale(scale)));
-        }
-        if let Some(scale) = self.pyramid_display.displayed {
-            ui.label(format!("Displayed pyramid scale: {}×", format_scale(scale)));
-        }
+        show_pyramid_summary(ui, &self.pyramid_display);
         if let Some(dataset) = self.dataset.as_ref() {
             let (visible, resident, bytes) = self.active_cache_counts(self.generations.source);
             ui.label(format!(
@@ -3967,17 +4063,29 @@ impl ViewerApp {
             }
             ui.weak("Wheel: zoom at cursor · Drag: pan · logical world coordinates");
         });
-        let (title_response, title_painter) =
-            ui.allocate_painter(egui::vec2(ui.available_width(), 26.0), egui::Sense::hover());
-        draw_canvas_title(
-            &title_painter,
-            title_response.rect,
+        let title_height = if self.display_mode == DisplayMode::Composite {
+            44.0
+        } else {
+            26.0
+        };
+        let (title_response, title_painter) = ui.allocate_painter(
+            egui::vec2(ui.available_width(), title_height),
+            egui::Sense::hover(),
+        );
+        let title_planes = self
+            .active_planes()
+            .iter()
+            .map(|plane| plane.key())
+            .collect::<Vec<_>>();
+        let title = format_canvas_title(
             self.dataset.as_ref(),
             self.selection,
             self.display_mode,
             &self.channel_roles,
-            self.pyramid_display,
+            &title_planes,
+            &self.pyramid_display,
         );
+        draw_canvas_title(&title_painter, title_response.rect, title);
         let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::drag());
         let snapshot_region = SnapshotRegion {
             rect: title_response.rect.union(response.rect),
@@ -4163,80 +4271,188 @@ fn format_scale(scale: PyramidScale) -> String {
     }
 }
 
-fn draw_canvas_title(
-    painter: &egui::Painter,
-    rect: egui::Rect,
+fn show_pyramid_summary(ui: &mut egui::Ui, pyramid: &PyramidDisplay) {
+    ui.label(format!(
+        "Requested pyramid scale: {}×",
+        format_scale_summary(pyramid.requested_summary())
+    ));
+    ui.label(format!(
+        "Displayed pyramid scale: {}×",
+        format_scale_summary(pyramid.displayed_summary())
+    ));
+}
+
+fn draw_canvas_title(painter: &egui::Painter, rect: egui::Rect, title: CanvasTitle) {
+    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(20, 24, 29));
+    let first_position = if title.legend.is_some() {
+        egui::pos2(rect.left() + 8.0, rect.top() + 13.0)
+    } else {
+        rect.left_center() + egui::vec2(8.0, 0.0)
+    };
+    painter.text(
+        first_position,
+        egui::Align2::LEFT_CENTER,
+        title.primary,
+        egui::FontId::proportional(13.0),
+        egui::Color32::from_rgb(232, 236, 241),
+    );
+    if let Some(legend) = title.legend {
+        painter.text(
+            egui::pos2(rect.left() + 8.0, rect.top() + 31.0),
+            egui::Align2::LEFT_CENTER,
+            legend,
+            egui::FontId::proportional(12.0),
+            egui::Color32::from_rgb(190, 205, 220),
+        );
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CanvasTitle {
+    primary: String,
+    legend: Option<String>,
+}
+
+fn format_canvas_title(
     dataset: Option<&DatasetInfo>,
     selection: PlaneSelection,
     display_mode: DisplayMode,
     channel_roles: &HashMap<i32, ChannelRole>,
-    pyramid: PyramidDisplay,
-) {
-    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(20, 24, 29));
-    let text = dataset.map_or_else(
-        || String::from("No CZI loaded"),
-        |dataset| {
-            let requested = pyramid
-                .requested
-                .map_or_else(|| String::from("—"), format_scale);
-            let displayed = pyramid
-                .displayed
-                .map_or_else(|| String::from("—"), format_scale);
-            let channel = if display_mode == DisplayMode::Composite {
-                format!(
-                    "Composite [{}]",
-                    composite_legend(
-                        &dataset.c,
-                        &dataset.metadata_summary,
-                        channel_roles,
-                        MAX_COMPOSITE_LEGEND_CHARS,
-                    )
-                )
-            } else {
-                channel_label(&dataset.metadata_summary, selection.c)
-            };
+    active_planes: &[PlaneKey],
+    pyramid: &PyramidDisplay,
+) -> CanvasTitle {
+    let Some(dataset) = dataset else {
+        return CanvasTitle {
+            primary: String::from("No CZI loaded"),
+            legend: None,
+        };
+    };
+    format_loaded_canvas_title(
+        &dataset.source_label,
+        &dataset.metadata_summary,
+        selection,
+        display_mode,
+        channel_roles,
+        active_planes,
+        pyramid,
+    )
+}
+
+fn format_loaded_canvas_title(
+    source_label: &str,
+    summary: &MetadataSummary,
+    selection: PlaneSelection,
+    display_mode: DisplayMode,
+    channel_roles: &HashMap<i32, ChannelRole>,
+    active_planes: &[PlaneKey],
+    pyramid: &PyramidDisplay,
+) -> CanvasTitle {
+    let filename = truncate_chars(source_filename_ref(source_label), MAX_TITLE_FILENAME_CHARS);
+    let requested = format_scale_summary(pyramid.requested_summary());
+    let displayed = format_scale_summary(pyramid.displayed_summary());
+    let channel = if display_mode == DisplayMode::Single {
+        format!(
+            "{} · ",
             truncate_chars(
-                &format!(
-                    "{}  ·  Scene {}  ·  {}  ·  Z {}  ·  T {}  ·  Requested {}×  ·  Displayed {}×",
-                    source_filename(&dataset.source_label),
-                    scene_label(selection.scene),
-                    channel,
-                    selection.z,
-                    selection.t,
-                    requested,
-                    displayed,
-                ),
-                MAX_CANVAS_TITLE_CHARS,
+                &channel_label(summary, selection.c),
+                MAX_TITLE_FILENAME_CHARS,
             )
-        },
+        )
+    } else {
+        String::new()
+    };
+    let primary = truncate_chars(
+        &format!(
+            "{} · Scene {} · {}Z {} · T {} · Requested {}× · Displayed {}×",
+            filename,
+            scene_label(selection.scene),
+            channel,
+            selection.z,
+            selection.t,
+            requested,
+            displayed,
+        ),
+        MAX_CANVAS_TITLE_CHARS,
     );
-    painter.text(
-        rect.left_center() + egui::vec2(8.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        text,
-        egui::FontId::proportional(13.0),
-        egui::Color32::from_rgb(232, 236, 241),
-    );
+    let legend = (display_mode == DisplayMode::Composite).then(|| {
+        format!(
+            "Channels: {}",
+            composite_legend(
+                summary,
+                channel_roles,
+                active_planes,
+                MAX_COMPOSITE_LEGEND_CHARS,
+            )
+        )
+    });
+    CanvasTitle { primary, legend }
 }
 
 fn composite_legend(
-    choices: &DimensionChoices,
     summary: &MetadataSummary,
     roles: &HashMap<i32, ChannelRole>,
+    active_planes: &[PlaneKey],
     maximum_chars: usize,
 ) -> String {
-    let parts = choices.values.iter().filter_map(|channel| {
-        let role = roles.get(channel).copied().unwrap_or_default();
-        (role != ChannelRole::Off).then(|| {
-            let label = summary
-                .channels
-                .iter()
-                .find(|metadata| metadata.index == *channel)
-                .map_or_else(|| format!("C {channel}"), |metadata| metadata.label.clone());
-            format!("{label}={}", role.legend_label())
-        })
-    });
-    truncate_chars(&parts.collect::<Vec<_>>().join(", "), maximum_chars)
+    let mut output = String::with_capacity(maximum_chars.min(256));
+    let mut remaining = maximum_chars;
+    for (index, plane) in active_planes.iter().enumerate() {
+        let role = roles.get(&plane.c).copied().unwrap_or_default();
+        let fallback = format!("C {}", plane.c);
+        let label = summary
+            .channels
+            .iter()
+            .find(|metadata| metadata.index == plane.c)
+            .map_or(fallback.as_str(), |metadata| metadata.label.as_str());
+        for part in [
+            if index > 0 { ", " } else { "" },
+            label,
+            "=",
+            role.legend_label(),
+        ] {
+            if !push_bounded(&mut output, part, &mut remaining) {
+                if output.pop().is_some() {
+                    output.push('…');
+                }
+                return output;
+            }
+        }
+    }
+    output
+}
+
+fn channel_name_list(summary: &MetadataSummary, channels: &[i32], maximum_chars: usize) -> String {
+    let mut output = String::with_capacity(maximum_chars.min(256));
+    let mut remaining = maximum_chars;
+    for (index, channel) in channels.iter().enumerate() {
+        let fallback = format!("C {channel}");
+        let label = summary
+            .channels
+            .iter()
+            .find(|metadata| metadata.index == *channel)
+            .map_or(fallback.as_str(), |metadata| metadata.label.as_str());
+        for part in [if index > 0 { ", " } else { "" }, label] {
+            if !push_bounded(&mut output, part, &mut remaining) {
+                if output.pop().is_some() {
+                    output.push('…');
+                }
+                return output;
+            }
+        }
+    }
+    output
+}
+
+fn push_bounded(output: &mut String, text: &str, remaining: &mut usize) -> bool {
+    let mut characters = text.chars();
+    for _ in 0..*remaining {
+        let Some(character) = characters.next() else {
+            return true;
+        };
+        output.push(character);
+        *remaining -= 1;
+    }
+    characters.next().is_none()
 }
 
 fn truncate_chars(text: &str, maximum_chars: usize) -> String {
@@ -4253,14 +4469,15 @@ fn truncate_chars(text: &str, maximum_chars: usize) -> String {
 }
 
 fn source_filename(source: &str) -> String {
+    source_filename_ref(source).to_owned()
+}
+
+fn source_filename_ref(source: &str) -> &str {
     Path::new(source)
         .file_name()
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
-        .map_or_else(
-            || source.rsplit('/').next().unwrap_or(source).to_owned(),
-            str::to_owned,
-        )
+        .unwrap_or_else(|| source.rsplit('/').next().unwrap_or(source))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -5363,10 +5580,11 @@ mod tests {
 
     #[test]
     fn composite_legend_uses_metadata_roles_and_char_safe_bounds() {
-        let choices = DimensionChoices {
-            present: true,
-            values: vec![0, 4, 9],
-        };
+        let active = [
+            PlaneKey::new(0, SceneId::Implicit, 0, 0),
+            PlaneKey::new(4, SceneId::Implicit, 0, 0),
+            PlaneKey::new(9, SceneId::Implicit, 0, 0),
+        ];
         let summary = MetadataSummary {
             channels: vec![
                 ChannelMetadata {
@@ -5393,12 +5611,70 @@ mod tests {
             (9, ChannelRole::Green),
         ]);
         assert_eq!(
-            composite_legend(&choices, &summary, &roles, 96),
+            composite_legend(&summary, &roles, &active, 96),
             "Phase PH3=Gray, AF405=Blue, Bod493=Green"
         );
-        let bounded = composite_legend(&choices, &summary, &roles, 18);
+        let bounded = composite_legend(&summary, &roles, &active, 18);
         assert_eq!(bounded.chars().count(), 18);
         assert!(bounded.ends_with('…'));
+    }
+
+    #[test]
+    fn composite_legend_stops_at_bound_for_many_oversized_labels() {
+        let channels = (0..200)
+            .map(|index| ChannelMetadata {
+                index,
+                id: None,
+                label: "蛍".repeat(10_000),
+            })
+            .collect();
+        let summary = MetadataSummary {
+            channels,
+            pixel_size: None,
+        };
+        let active = (0..200)
+            .map(|channel| PlaneKey::new(channel, SceneId::Implicit, 0, 0))
+            .collect::<Vec<_>>();
+        let roles = (0..200)
+            .map(|channel| (channel, ChannelRole::Blue))
+            .collect::<HashMap<_, _>>();
+
+        let legend = composite_legend(&summary, &roles, &active, 96);
+
+        assert_eq!(legend.chars().count(), 96);
+        assert!(legend.ends_with('…'));
+    }
+
+    #[test]
+    fn composite_title_bounds_filename_and_keeps_dedicated_legend_line() {
+        let plane = PlaneKey::new(4, SceneId::Implicit, 0, 0);
+        let summary = MetadataSummary {
+            channels: vec![ChannelMetadata {
+                index: 4,
+                id: None,
+                label: String::from("AF405"),
+            }],
+            pixel_size: None,
+        };
+        let roles = HashMap::from([(4, ChannelRole::Blue)]);
+        let scale = PyramidScale::new(2, 1).expect("scale");
+        let mut pyramid = PyramidDisplay::default();
+        pyramid.request(1, HashMap::from([(plane, scale)]));
+        assert!(pyramid.finish(1, plane, scale));
+
+        let title = format_loaded_canvas_title(
+            &format!("/data/{}.czi", "very-long-file-name".repeat(20)),
+            &summary,
+            PlaneSelector::new(4, SceneId::Implicit, 0, 0),
+            DisplayMode::Composite,
+            &roles,
+            &[plane],
+            &pyramid,
+        );
+
+        assert!(title.primary.chars().count() <= MAX_CANVAS_TITLE_CHARS);
+        assert!(!title.primary.contains("AF405=Blue"));
+        assert_eq!(title.legend.as_deref(), Some("Channels: AF405=Blue"));
     }
 
     #[test]
@@ -5422,6 +5698,16 @@ mod tests {
             ActivePlaneState::NoMatchingPlanes
                 .export_message()
                 .is_some_and(|message| message.contains("selected scene"))
+        );
+        let partial = ActivePlaneState::Partial {
+            active: vec![PlaneSelector::new(0, SceneId::Implicit, 0, 0)],
+            missing_channels: vec![4],
+        };
+        assert!(partial.canvas_message().is_none());
+        assert!(
+            partial
+                .export_message()
+                .is_some_and(|message| message.contains("missing"))
         );
     }
 
@@ -5782,18 +6068,19 @@ mod tests {
         assert_eq!(select_requested_scale(&scales, 2.0), Some(two));
         assert_eq!(select_requested_scale(&scales, 0.01), Some(one));
 
+        let plane = PlaneKey::new(0, SceneId::Implicit, 0, 0);
         let mut display = PyramidDisplay::default();
-        display.request(4, four);
-        assert!(display.finish(4, four));
-        display.request(5, two);
-        assert_eq!(display.requested, Some(two));
-        assert_eq!(display.displayed, Some(four));
-        assert!(!display.finish(4, four));
-        assert!(display.finish(5, two));
-        display.request(6, one);
-        assert_eq!(display.displayed, Some(two));
-        assert!(display.finish(6, one));
-        assert_eq!(display.displayed, Some(one));
+        display.request(4, HashMap::from([(plane, four)]));
+        assert!(display.finish(4, plane, four));
+        display.request(5, HashMap::from([(plane, two)]));
+        assert_eq!(display.requested_summary(), ScaleSummary::Uniform(two));
+        assert_eq!(display.displayed_summary(), ScaleSummary::Uniform(four));
+        assert!(!display.finish(4, plane, four));
+        assert!(display.finish(5, plane, two));
+        display.request(6, HashMap::from([(plane, one)]));
+        assert_eq!(display.displayed_summary(), ScaleSummary::Uniform(two));
+        assert!(display.finish(6, plane, one));
+        assert_eq!(display.displayed_summary(), ScaleSummary::Uniform(one));
     }
 
     #[test]
@@ -5802,7 +6089,7 @@ mod tests {
         let two = PyramidScale::new(2, 1).expect("two scale");
         let plane = PlaneKey::new(7, SceneId::Implicit, 0, 0);
         let mut display = PyramidDisplay::default();
-        display.request(9, one);
+        display.request(9, HashMap::from([(plane, one)]));
         let mut visible = HashMap::new();
 
         record_finished_plane(
@@ -5815,8 +6102,8 @@ mod tests {
         );
 
         assert_eq!(visible[&plane], vec![TileId(3), TileId(8)]);
-        assert_eq!(display.requested, Some(one));
-        assert_eq!(display.displayed, None);
+        assert_eq!(display.requested_summary(), ScaleSummary::Uniform(one));
+        assert_eq!(display.displayed_summary(), ScaleSummary::Uniform(two));
     }
 
     #[test]
@@ -5824,8 +6111,12 @@ mod tests {
         let requested = PyramidScale::new(1, 1).expect("requested scale");
         let completed = PyramidScale::new(2, 1).expect("completed scale");
         let plane = PlaneKey::new(7, SceneId::Implicit, 0, 0);
+        let second_plane = PlaneKey::new(11, SceneId::Implicit, 0, 0);
         let mut display = PyramidDisplay::default();
-        display.request(12, requested);
+        display.request(
+            12,
+            HashMap::from([(plane, requested), (second_plane, completed)]),
+        );
         let mut visible = HashMap::new();
         let mut cache = TextureCache::new(1024);
 
@@ -5833,7 +6124,7 @@ mod tests {
             &mut visible,
             &mut display,
             &mut cache,
-            &[plane],
+            &[plane, second_plane],
             3,
             12,
             plane,
@@ -5842,10 +6133,50 @@ mod tests {
         );
 
         assert_eq!(visible[&plane], vec![TileId(5)]);
-        assert_eq!(display.displayed, None);
+        assert_eq!(
+            display.displayed_summary(),
+            ScaleSummary::Uniform(completed)
+        );
         assert!(!status.is_error);
-        assert!(status.message.contains("Requested 1×"));
-        assert!(status.message.contains("Displayed —×"));
+        assert!(status.message.contains("Loading channels 1/2"));
+        assert!(status.message.contains("Requested Mixed×"));
+        assert!(status.message.contains("Displayed 2×"));
+        assert!(
+            export_blocker(
+                &ActivePlaneState::Active(vec![
+                    PlaneSelector::new(7, SceneId::Implicit, 0, 0),
+                    PlaneSelector::new(11, SceneId::Implicit, 0, 0),
+                ]),
+                &display,
+            )
+            .is_some()
+        );
+
+        let final_status = apply_view_finished(
+            &mut visible,
+            &mut display,
+            &mut cache,
+            &[plane, second_plane],
+            3,
+            12,
+            second_plane,
+            requested,
+            vec![TileId(9)],
+        );
+        assert!(display.is_ready());
+        assert_eq!(display.displayed_summary(), ScaleSummary::Mixed);
+        assert!(final_status.message.contains("Ready"));
+        assert!(final_status.message.contains("Displayed Mixed×"));
+        assert!(
+            export_blocker(
+                &ActivePlaneState::Active(vec![
+                    PlaneSelector::new(7, SceneId::Implicit, 0, 0),
+                    PlaneSelector::new(11, SceneId::Implicit, 0, 0),
+                ]),
+                &display,
+            )
+            .is_none()
+        );
     }
 
     #[test]
