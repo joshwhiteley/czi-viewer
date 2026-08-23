@@ -368,6 +368,7 @@ fn command_builders_keep_paths_out_of_argv_and_preserve_host_checks() {
         .map(str::to_owned)
         .collect::<Vec<_>>()
     );
+    assert_eq!(interactive, embedded, "direct interactive argv stays exact");
 
     let bridge = config
         .terminal_bridge_command(
@@ -395,7 +396,7 @@ fn command_builders_keep_paths_out_of_argv_and_preserve_host_checks() {
 }
 
 #[test]
-fn loopback_endpoint_is_validated_and_embedded_argv_is_exact() {
+fn loopback_endpoint_is_validated_and_interactive_argv_is_strict_and_exact() {
     for invalid in [
         "",
         "-login.example",
@@ -433,7 +434,7 @@ fn loopback_endpoint_is_validated_and_embedded_argv_is_exact() {
     );
     let config = OpenSshConfig::new().with_loopback_endpoint(endpoint);
     let argv = config
-        .embedded_sftp_argv(&profile("login-prod.pax.tufts.edu"))
+        .interactive_sftp_argv(&profile("login-prod.pax.tufts.edu"))
         .into_iter()
         .map(|argument| argument.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
@@ -466,7 +467,7 @@ fn loopback_endpoint_is_validated_and_embedded_argv_is_exact() {
             "-o",
             "ProxyJump=none",
             "-o",
-            "StrictHostKeyChecking=ask",
+            "StrictHostKeyChecking=yes",
             "-T",
             "-s",
             "login-prod.pax.tufts.edu",
@@ -476,6 +477,12 @@ fn loopback_endpoint_is_validated_and_embedded_argv_is_exact() {
         .map(str::to_owned)
         .collect::<Vec<_>>()
     );
+    let embedded = config
+        .embedded_sftp_argv(&profile("login-prod.pax.tufts.edu"))
+        .into_iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(argv, embedded, "loopback embedded argv stays strict");
 }
 
 #[cfg(unix)]

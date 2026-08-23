@@ -24,13 +24,36 @@ Host login-prod.pax.tufts.edu
     User your-ssh-username
 ```
 
-Normal OpenSSH options for that host still apply. The viewer overrides only the local tunnel endpoint and proxy routing.
+Normal OpenSSH options for that host still apply. The viewer overrides only the local tunnel endpoint, proxy routing, and strict host-key policy.
+
+## Verify the SSH host key before first use
+
+Tufts VPN mode requires an existing verified `known_hosts` entry for `login-prod.pax.tufts.edu`. It sets `StrictHostKeyChecking=yes`, so a missing or changed key fails without a trust prompt and before SSH accepts a password.
+
+1. Obtain the current SSH host-key fingerprint from Tufts IT or the server administrator through a trusted, independent channel.
+2. From a trusted Tufts network path or an independently trusted VPN client, run:
+
+   ```sh
+   /usr/bin/ssh login-prod.pax.tufts.edu
+   ```
+
+3. Compare the complete fingerprint shown by OpenSSH with the independently obtained fingerprint.
+4. Accept it only when the fingerprints match exactly. Do not enter an SSH password before completing this check.
+5. Exit the connection. The verified entry is now available to the viewer.
+
+You can check that OpenSSH finds an entry without contacting the server:
+
+```sh
+/usr/bin/ssh-keygen -F login-prod.pax.tufts.edu
+```
+
+Never use automatic `ssh-keyscan` output as proof of identity. A key received over the same untrusted network path is not independently verified.
 
 ## Connect
 
 1. Start the viewer.
 2. Select **SSH**.
-3. Select **Tufts VPN**.
+3. Confirm that the verified host-key prerequisite above is complete, then select **Tufts VPN**.
 4. Enter your Tufts VPN username. The viewer keeps it only in memory for the current app process.
 5. Select **Connect**.
 6. Complete **Phase 1/2 · Tufts VPN authentication** in the in-app terminal. Enter passwords, Duo choices, and one-time responses only when OpenConnect requests them.
@@ -64,9 +87,10 @@ Port=<ephemeral-port>
 HostKeyAlias=login-prod.pax.tufts.edu
 ProxyCommand=none
 ProxyJump=none
+StrictHostKeyChecking=yes
 ```
 
-`HostKeyAlias` keeps host-key checks bound to `login-prod.pax.tufts.edu`, not the loopback address. The same authenticated SFTP session is reused for browsing, opening, and range reads.
+`HostKeyAlias` keeps host-key checks bound to `login-prod.pax.tufts.edu`, not the loopback address. Strict checking requires that key to exist already and match exactly; the viewer never permits TOFU for a loopback endpoint. Therefore, another local process can occupy the ephemeral port or supply an SSH banner only to deny the connection. It cannot reach a password prompt with an unverified host key. The same authenticated SFTP session is reused for browsing, opening, and range reads.
 
 ## Cancellation and cleanup
 
@@ -92,7 +116,9 @@ Select **Try again** and complete the OpenConnect prompts in the phase-one termi
 
 ### SSH host-key or authentication fails
 
-Check the `login-prod.pax.tufts.edu` entry in `~/.ssh/config` and its known-host record. The SSH destination and host-key alias stay fixed even though the TCP connection uses loopback.
+If the verified `login-prod.pax.tufts.edu` key is absent, OpenSSH fails closed without prompting. Follow **Verify the SSH host key before first use** above. If a stored key changed, stop and verify the new fingerprint independently with Tufts IT or the server administrator. Never bypass the failure with `StrictHostKeyChecking=no`, `accept-new`, or automatic `ssh-keyscan` output.
+
+Also check the `login-prod.pax.tufts.edu` entry in `~/.ssh/config`. The SSH destination and host-key alias stay fixed even though the TCP connection uses loopback.
 
 ### Readiness times out
 

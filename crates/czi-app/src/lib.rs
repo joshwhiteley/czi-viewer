@@ -4319,6 +4319,13 @@ impl ViewerApp {
                             );
                         });
                         ui.weak(format!("Fixed SSH target: {}", tufts_vpn::TARGET_HOST));
+                        ui.colored_label(
+                            egui::Color32::GOLD,
+                            "Requires a pre-verified known_hosts entry; first-use trust is disabled.",
+                        );
+                        ui.weak(
+                            "Verify the fingerprint through a trusted Tufts source before connecting. Never auto-keyscan.",
+                        );
                     }
                 }
                 ui.horizontal(|ui| {
@@ -7259,6 +7266,15 @@ mod tests {
                 .any(|pair| pair == ["-o", "ProxyCommand=none"])
         );
         assert!(argv.windows(2).any(|pair| pair == ["-o", "ProxyJump=none"]));
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["-o", "StrictHostKeyChecking=yes"])
+        );
+        assert!(
+            !argv
+                .windows(2)
+                .any(|pair| pair == ["-o", "StrictHostKeyChecking=ask"])
+        );
         assert_eq!(argv[argv.len() - 2], tufts_vpn::TARGET_HOST);
     }
 

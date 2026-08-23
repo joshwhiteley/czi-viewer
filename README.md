@@ -43,7 +43,7 @@ The remote viewer uses your normal macOS OpenSSH configuration and profiles from
 
 ### Optional Tufts VPN mode
 
-On macOS, **Tufts VPN** mode can connect to the fixed `login-prod.pax.tufts.edu` SSH target without changing system routes. It requires separately installed Homebrew OpenConnect and ocproxy tools. Enter only your VPN username in the app. Complete the VPN and SSH authentication phases in their terminals. Passwords and Duo responses are never fields and are not stored. See [Tufts VPN setup and security](docs/tufts-vpn.md).
+On macOS, **Tufts VPN** mode can connect to the fixed `login-prod.pax.tufts.edu` SSH target without changing system routes. It requires separately installed Homebrew OpenConnect and ocproxy tools and a pre-existing, independently verified `known_hosts` entry for that SSH host. First-use trust is disabled. Enter only your VPN username in the app. Complete the VPN and SSH authentication phases in their terminals. Passwords and Duo responses are never fields and are not stored. See [Tufts VPN setup and security](docs/tufts-vpn.md).
 
 Remote browsing, opening, and range reads use one authenticated, read-only SFTP session. Directory actions and opening a selected CZI do not prompt again. Change the profile or click **Reconnect** to create a new session. The browser remains available while a dataset is open; use **Hide remote browser** in the open bar to give the canvas more room.
 

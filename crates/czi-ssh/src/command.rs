@@ -293,7 +293,8 @@ impl OpenSshConfig {
     /// `/dev/tty`. The `-T` option disables only a *remote* terminal; it does not affect that local
     /// PTY. This never configures `ControlMaster` or a control path. A configured loopback
     /// endpoint overrides only network routing while preserving the destination profile's user
-    /// and other normal OpenSSH settings.
+    /// and other normal OpenSSH settings. Loopback endpoints force strict pre-existing host-key
+    /// verification and never offer a first-use trust prompt.
     #[must_use]
     pub fn embedded_sftp_argv(&self, profile: &SshProfile) -> Vec<OsString> {
         let mut argv = common_argv(false, self.loopback_endpoint.as_ref());
@@ -373,7 +374,7 @@ fn common_argv(batch_mode: bool, loopback_endpoint: Option<&LoopbackEndpoint>) -
     }
     push_option(
         &mut argv,
-        if batch_mode {
+        if batch_mode || loopback_endpoint.is_some() {
             "StrictHostKeyChecking=yes"
         } else {
             "StrictHostKeyChecking=ask"
