@@ -380,6 +380,7 @@ version = "0.1.0"
 dependencies = [
  "czi-core",
  "czi-ssh",
+ "czi-ssh-darwin",
  "eframe",
  "png",
  "wgpu",

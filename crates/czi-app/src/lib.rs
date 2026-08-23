@@ -4,6 +4,8 @@
     clippy::cast_precision_loss
 )]
 
+mod tufts_vpn;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
@@ -18,8 +20,8 @@ use czi_core::{
     TileQueryIndex, ViewQuery, summarize_metadata,
 };
 use czi_ssh::{
-    EmbeddedSshCancellation, OpenSshConfig, RemoteDirEntry, SftpLocation, SftpSession, SftpSource,
-    SharedSftpSession, SshConsole, SshProfile,
+    EmbeddedSshCancellation, HostKeyAlias, LoopbackEndpoint, OpenSshConfig, RemoteDirEntry,
+    SftpLocation, SftpSession, SftpSource, SharedSftpSession, SshConsole, SshProfile,
 };
 use eframe::egui;
 
@@ -63,13 +65,34 @@ impl SceneChoices {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum RemoteConnectionMode {
+    #[default]
+    DirectSsh,
+    TuftsVpn,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RemoteConnectionIdentity {
+    DirectSsh { profile: String },
+    TuftsVpn { username: String },
+}
+
+impl RemoteConnectionIdentity {
+    fn profile(&self) -> &str {
+        match self {
+            Self::DirectSsh { profile } => profile,
+            Self::TuftsVpn { .. } => tufts_vpn::TARGET_HOST,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum DatasetLocator {
     Local(PathBuf),
     Remote {
-        profile: String,
+        connection: RemoteConnectionIdentity,
         path: String,
-        config: OpenSshConfig,
     },
 }
 
@@ -77,25 +100,25 @@ impl DatasetLocator {
     fn display_label(&self) -> String {
         match self {
             Self::Local(path) => path.display().to_string(),
-            Self::Remote { profile, path, .. } => format!("SSH {profile}:{path}"),
+            Self::Remote {
+                connection, path, ..
+            } => format!("SSH {}:{path}", connection.profile()),
         }
     }
 
-    fn remote_parts(&self) -> Result<(SshProfile, SftpLocation, &OpenSshConfig), String> {
-        let Self::Remote {
-            profile,
-            path,
-            config,
-        } = self
-        else {
+    fn remote_parts(
+        &self,
+    ) -> Result<(SshProfile, SftpLocation, &RemoteConnectionIdentity), String> {
+        let Self::Remote { connection, path } = self else {
             return Err(String::from("local source is not an SSH locator"));
         };
-        let profile = SshProfile::new(profile.clone()).map_err(|error| error.to_string())?;
+        let profile =
+            SshProfile::new(connection.profile().to_owned()).map_err(|error| error.to_string())?;
         let location = SftpLocation::new(path.clone()).map_err(|error| error.to_string())?;
         if !location.as_str().starts_with('/') {
             return Err(String::from("remote CZI path must be absolute"));
         }
-        Ok((profile, location, config))
+        Ok((profile, location, connection))
     }
 
     fn open_failure(error: impl std::fmt::Display) -> OpenFailure {
@@ -189,6 +212,88 @@ impl Default for EmbeddedCancellationSlot {
     fn default() -> Self {
         Self {
             inner: Arc::new(Mutex::new(EmbeddedCancellationState {
+                current: None,
+                cancelled_through: None,
+            })),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct VpnCancellationSlot {
+    inner: Arc<Mutex<VpnCancellationState>>,
+}
+
+struct VpnCancellationState {
+    current: Option<(u64, czi_ssh_darwin::Cancellation)>,
+    cancelled_through: Option<u64>,
+}
+
+impl VpnCancellationSlot {
+    fn replace(&self, generation: u64, cancellation: &czi_ssh_darwin::Cancellation) {
+        let cancel = if let Ok(mut state) = self.inner.lock() {
+            state.current = Some((generation, cancellation.clone()));
+            state
+                .cancelled_through
+                .is_some_and(|cancelled_through| generation <= cancelled_through)
+        } else {
+            false
+        };
+        if cancel {
+            let _ = cancellation.cancel();
+        }
+    }
+
+    fn clear(&self, generation: u64) {
+        if let Ok(mut state) = self.inner.lock()
+            && state
+                .current
+                .as_ref()
+                .is_some_and(|(current_generation, _)| *current_generation == generation)
+        {
+            state.current = None;
+        }
+    }
+
+    fn cancel(&self, generation: u64) {
+        let cancellation = self
+            .inner
+            .lock()
+            .map(|mut state| {
+                state.cancelled_through = Some(
+                    state
+                        .cancelled_through
+                        .map_or(generation, |cancelled| cancelled.max(generation)),
+                );
+                state
+                    .current
+                    .as_ref()
+                    .filter(|(current_generation, _)| *current_generation == generation)
+                    .map(|(_, cancellation)| cancellation.clone())
+            })
+            .ok()
+            .flatten();
+        if let Some(cancellation) = cancellation {
+            let _ = cancellation.cancel();
+        }
+    }
+
+    fn cancel_active(&self) {
+        let generation = self
+            .inner
+            .lock()
+            .ok()
+            .and_then(|state| state.current.as_ref().map(|(generation, _)| *generation));
+        if let Some(generation) = generation {
+            self.cancel(generation);
+        }
+    }
+}
+
+impl Default for VpnCancellationSlot {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(VpnCancellationState {
                 current: None,
                 cancelled_through: None,
             })),
@@ -626,10 +731,9 @@ enum WorkerCommand {
         connection_generation: u64,
     },
     Browse {
-        profile: String,
+        connection: RemoteConnectionIdentity,
         path: String,
         home: bool,
-        config: OpenSshConfig,
         browse_generation: u64,
         connection_generation: u64,
     },
@@ -650,13 +754,41 @@ enum ConsolePumpCommand {
     Stop,
 }
 
+enum AuthenticationConsole {
+    Ssh(SshConsole),
+    Vpn(tufts_vpn::VpnConsole),
+}
+
+impl AuthenticationConsole {
+    fn drain_output(&mut self) -> Result<(), String> {
+        match self {
+            Self::Ssh(console) => console.drain_output().map(|_| ()).map_err(sanitize_error),
+            Self::Vpn(console) => console.drain_output().map(|_| ()).map_err(sanitize_error),
+        }
+    }
+
+    fn transcript(&self) -> &str {
+        match self {
+            Self::Ssh(console) => console.transcript(),
+            Self::Vpn(console) => console.transcript(),
+        }
+    }
+
+    fn write_input(&mut self, input: &[u8]) -> Result<(), String> {
+        match self {
+            Self::Ssh(console) => console.write_input(input).map_err(sanitize_error),
+            Self::Vpn(console) => console.write_input(input).map_err(sanitize_error),
+        }
+    }
+}
+
 struct ConsolePump {
     commands: SyncSender<ConsolePumpCommand>,
     snapshot: Arc<Mutex<ConsolePumpSnapshot>>,
 }
 
 impl ConsolePump {
-    fn spawn(console: SshConsole) -> Result<Self, czi_ssh::SftpError> {
+    fn spawn(console: AuthenticationConsole) -> Result<Self, czi_ssh::SftpError> {
         let (commands, command_rx) = mpsc::sync_channel(CONSOLE_PUMP_INPUT_CAPACITY);
         let snapshot = Arc::new(Mutex::new(ConsolePumpSnapshot::default()));
         let worker_snapshot = Arc::clone(&snapshot);
@@ -676,16 +808,16 @@ impl ConsolePump {
 
     fn try_send_input(&self, input: Vec<u8>) -> Result<(), String> {
         if input.len() > MAX_CONSOLE_INPUT_BYTES {
-            return Err(String::from("SSH console input is too large."));
+            return Err(String::from("Authentication console input is too large."));
         }
         self.commands
             .try_send(ConsolePumpCommand::Input(input))
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => {
-                    String::from("SSH console input is busy; try again.")
+                    String::from("Authentication console input is busy; try again.")
                 }
                 mpsc::TrySendError::Disconnected(_) => {
-                    String::from("SSH console is no longer available.")
+                    String::from("Authentication console is no longer available.")
                 }
             })
     }
@@ -698,7 +830,7 @@ impl Drop for ConsolePump {
 }
 
 fn pump_console(
-    mut console: SshConsole,
+    mut console: AuthenticationConsole,
     commands: &Receiver<ConsolePumpCommand>,
     snapshot: &Mutex<ConsolePumpSnapshot>,
 ) {
@@ -707,7 +839,7 @@ fn pump_console(
             match commands.try_recv() {
                 Ok(ConsolePumpCommand::Input(input)) => {
                     if let Err(error) = console.write_input(&input) {
-                        set_console_pump_error(snapshot, sanitize_error(error));
+                        set_console_pump_error(snapshot, error);
                     }
                 }
                 Ok(ConsolePumpCommand::Stop) | Err(TryRecvError::Disconnected) => return,
@@ -715,7 +847,7 @@ fn pump_console(
             }
         }
         if let Err(error) = console.drain_output() {
-            set_console_pump_error(snapshot, sanitize_error(error));
+            set_console_pump_error(snapshot, error);
         }
         if let Ok(mut snapshot) = snapshot.lock() {
             console.transcript().clone_into(&mut snapshot.transcript);
@@ -723,7 +855,7 @@ fn pump_console(
         match commands.recv_timeout(Duration::from_millis(16)) {
             Ok(ConsolePumpCommand::Input(input)) => {
                 if let Err(error) = console.write_input(&input) {
-                    set_console_pump_error(snapshot, sanitize_error(error));
+                    set_console_pump_error(snapshot, error);
                 }
             }
             Ok(ConsolePumpCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -752,8 +884,21 @@ enum WorkerEvent {
         connection_generation: u64,
         remote: bool,
     },
+    VpnAuthenticationStarted {
+        connection: RemoteConnectionIdentity,
+        console: ConsolePump,
+        cancellation: czi_ssh_darwin::Cancellation,
+        connection_generation: u64,
+    },
+    VpnReady {
+        connection_generation: u64,
+    },
+    VpnFailed {
+        message: String,
+        connection_generation: u64,
+    },
     AuthenticationStarted {
-        profile: String,
+        connection: RemoteConnectionIdentity,
         console: ConsolePump,
         cancellation: EmbeddedSshCancellation,
         connection_generation: u64,
@@ -842,6 +987,7 @@ enum VisiblePlanesOutcome {
 }
 
 struct WorkerBrowseSession {
+    connection: RemoteConnectionIdentity,
     profile: String,
     config: OpenSshConfig,
     connection_generation: u64,
@@ -850,6 +996,7 @@ struct WorkerBrowseSession {
 
 #[derive(Clone, Copy)]
 struct RemoteSessionKey<'a> {
+    connection: &'a RemoteConnectionIdentity,
     profile: &'a str,
     config: &'a OpenSshConfig,
     generation: u64,
@@ -859,7 +1006,8 @@ fn matches_worker_remote_session(
     existing: RemoteSessionKey<'_>,
     requested: RemoteSessionKey<'_>,
 ) -> bool {
-    existing.profile == requested.profile
+    existing.connection == requested.connection
+        && existing.profile == requested.profile
         && existing.config == requested.config
         && existing.generation == requested.generation
 }
@@ -869,8 +1017,15 @@ struct ConnectedSftpSession {
     embedded_cancellation: Option<EmbeddedSshCancellation>,
 }
 
+struct WorkerVpnSession {
+    connection: RemoteConnectionIdentity,
+    generation: u64,
+    process: tufts_vpn::VpnProcess,
+}
+
 struct EmbeddedConnectionContext<'a> {
     cancellation: &'a EmbeddedCancellationSlot,
+    vpn_cancellation: &'a VpnCancellationSlot,
     events: &'a SyncSender<WorkerEvent>,
     generation: u64,
 }
@@ -879,6 +1034,7 @@ struct DatasetWorker {
     commands: Option<SyncSender<WorkerCommand>>,
     events: Option<Receiver<WorkerEvent>>,
     embedded_cancellation: EmbeddedCancellationSlot,
+    vpn_cancellation: VpnCancellationSlot,
     join: Option<JoinHandle<()>>,
 }
 
@@ -888,16 +1044,24 @@ impl DatasetWorker {
         let (event_tx, events) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let embedded_cancellation = EmbeddedCancellationSlot::default();
         let worker_embedded_cancellation = embedded_cancellation.clone();
+        let vpn_cancellation = VpnCancellationSlot::default();
+        let worker_vpn_cancellation = vpn_cancellation.clone();
         let join = thread::Builder::new()
             .name(String::from("czi-dataset-worker"))
             .spawn(move || {
-                worker_loop(&command_rx, &event_tx, &worker_embedded_cancellation);
+                worker_loop(
+                    &command_rx,
+                    &event_tx,
+                    &worker_embedded_cancellation,
+                    &worker_vpn_cancellation,
+                );
             })
             .expect("start CZI dataset worker");
         Self {
             commands: Some(commands),
             events: Some(events),
             embedded_cancellation,
+            vpn_cancellation,
             join: Some(join),
         }
     }
@@ -922,6 +1086,7 @@ impl DatasetWorker {
             return;
         }
         self.embedded_cancellation.cancel_active();
+        self.vpn_cancellation.cancel_active();
         self.events.take();
         let commands = self.commands.take();
         if let Some(commands) = &commands {
@@ -989,9 +1154,11 @@ fn worker_loop(
     commands: &Receiver<WorkerCommand>,
     events: &SyncSender<WorkerEvent>,
     embedded_cancellation: &EmbeddedCancellationSlot,
+    vpn_cancellation: &VpnCancellationSlot,
 ) {
     let mut dataset = None;
     let mut browse_session = None;
+    let mut vpn_session = None;
     let mut active_source_generation = 0;
     let mut pending_commands = VecDeque::new();
     loop {
@@ -1012,12 +1179,24 @@ fn worker_loop(
                 let remote = matches!(&locator, DatasetLocator::Remote { .. });
                 let connection = EmbeddedConnectionContext {
                     cancellation: embedded_cancellation,
+                    vpn_cancellation,
                     events,
                     generation: connection_generation,
                 };
+                let result =
+                    open_dataset(locator, &mut browse_session, &mut vpn_session, &connection);
+                if remote
+                    && result
+                        .as_ref()
+                        .is_err_and(|failure| !failure.session_usable)
+                {
+                    browse_session = None;
+                    vpn_session = None;
+                    vpn_cancellation.clear(connection_generation);
+                }
                 let (next_dataset, sent) = send_open_result(
                     events,
-                    open_dataset(locator, &mut browse_session, &connection),
+                    result,
                     source_generation,
                     connection_generation,
                     remote,
@@ -1028,26 +1207,34 @@ fn worker_loop(
                 dataset = next_dataset;
             }
             WorkerCommand::Browse {
-                profile,
+                connection: remote_connection,
                 path,
                 home,
-                config,
                 browse_generation,
                 connection_generation,
             } => {
                 let connection = EmbeddedConnectionContext {
                     cancellation: embedded_cancellation,
+                    vpn_cancellation,
                     events,
                     generation: connection_generation,
                 };
                 let result = browse_remote_paths(
-                    &profile,
+                    &remote_connection,
                     &path,
                     home,
-                    &config,
                     &mut browse_session,
+                    &mut vpn_session,
                     &connection,
                 );
+                if result
+                    .as_ref()
+                    .is_err_and(|failure| !failure.session_usable)
+                {
+                    browse_session = None;
+                    vpn_session = None;
+                    vpn_cancellation.clear(connection_generation);
+                }
                 if !send_remote_browse_result(
                     events,
                     result,
@@ -1057,7 +1244,10 @@ fn worker_loop(
                     break;
                 }
             }
-            WorkerCommand::ClearBrowse => browse_session = None,
+            WorkerCommand::ClearBrowse => {
+                browse_session = None;
+                vpn_session = None;
+            }
             WorkerCommand::ClearDataset => {
                 dataset = None;
                 active_source_generation = 0;
@@ -1170,15 +1360,37 @@ fn send_remote_browse_result(
     }
 }
 
+fn retire_mismatched_worker_session(
+    requested: &RemoteConnectionIdentity,
+    generation: u64,
+    browse_session: &mut Option<WorkerBrowseSession>,
+) {
+    let mismatch = browse_session.as_ref().is_some_and(|existing| {
+        existing.connection != *requested || existing.connection_generation != generation
+    });
+    if mismatch {
+        if let Some(existing) = browse_session.as_ref() {
+            let _ = existing
+                .session
+                .cancel_embedded_connection(existing.connection_generation);
+        }
+        *browse_session = None;
+    }
+}
+
 fn browse_remote_paths(
-    profile: &str,
+    remote_connection: &RemoteConnectionIdentity,
     path: &str,
     home: bool,
-    config: &OpenSshConfig,
     browse_session: &mut Option<WorkerBrowseSession>,
+    vpn_session: &mut Option<WorkerVpnSession>,
     connection: &EmbeddedConnectionContext<'_>,
 ) -> Result<RemoteBrowseResult, OpenFailure> {
-    let profile = SshProfile::new(profile.to_owned()).map_err(validation_failure)?;
+    let profile =
+        SshProfile::new(remote_connection.profile().to_owned()).map_err(validation_failure)?;
+    retire_mismatched_worker_session(remote_connection, connection.generation, browse_session);
+    let config = ensure_remote_connection(remote_connection, vpn_session, connection)
+        .map_err(remote_failure)?;
     let target = remote_browse_target(path, home).map_err(validation_failure)?;
     let target = match target {
         RemoteBrowseTarget::Home => None,
@@ -1189,13 +1401,15 @@ fn browse_remote_paths(
     let matches_existing = browse_session.as_ref().is_some_and(|existing| {
         matches_worker_remote_session(
             RemoteSessionKey {
+                connection: &existing.connection,
                 profile: &existing.profile,
                 config: &existing.config,
                 generation: existing.connection_generation,
             },
             RemoteSessionKey {
+                connection: remote_connection,
                 profile: profile.as_str(),
-                config,
+                config: &config,
                 generation: connection.generation,
             },
         )
@@ -1208,12 +1422,14 @@ fn browse_remote_paths(
         }
         *browse_session = None;
         let session = shared_session(
-            connect_embedded(&profile, config, connection).map_err(remote_failure)?,
+            connect_embedded(&profile, &config, remote_connection, connection)
+                .map_err(remote_failure)?,
             connection.generation,
         );
         *browse_session = Some(WorkerBrowseSession {
+            connection: remote_connection.clone(),
             profile: profile.as_str().to_owned(),
-            config: config.clone(),
+            config,
             connection_generation: connection.generation,
             session,
         });
@@ -1263,11 +1479,13 @@ fn browse_with_session(
 fn open_dataset(
     locator: DatasetLocator,
     browse_session: &mut Option<WorkerBrowseSession>,
+    vpn_session: &mut Option<WorkerVpnSession>,
     connection: &EmbeddedConnectionContext<'_>,
 ) -> Result<(CziDataset, TileQueryIndex, DatasetInfo), OpenFailure> {
     match locator {
         DatasetLocator::Local(path) => {
             *browse_session = None;
+            *vpn_session = None;
             let source_label = path.display().to_string();
             let opened = LocalFileSource::open(&path)
                 .map_err(czi_core::CziError::from)
@@ -1283,19 +1501,28 @@ fn open_dataset(
         }
         remote @ DatasetLocator::Remote { .. } => {
             let source_label = remote.display_label();
-            let (profile, location, config) = remote
+            let (profile, location, remote_connection) = remote
                 .remote_parts()
                 .map_err(DatasetLocator::open_failure)?;
+            retire_mismatched_worker_session(
+                remote_connection,
+                connection.generation,
+                browse_session,
+            );
+            let config = ensure_remote_connection(remote_connection, vpn_session, connection)
+                .map_err(remote_failure)?;
             let source = if browse_session.as_ref().is_some_and(|existing| {
                 matches_worker_remote_session(
                     RemoteSessionKey {
+                        connection: &existing.connection,
                         profile: &existing.profile,
                         config: &existing.config,
                         generation: existing.connection_generation,
                     },
                     RemoteSessionKey {
+                        connection: remote_connection,
                         profile: profile.as_str(),
-                        config,
+                        config: &config,
                         generation: connection.generation,
                     },
                 )
@@ -1316,12 +1543,14 @@ fn open_dataset(
                 }
                 *browse_session = None;
                 let session = shared_session(
-                    connect_embedded(&profile, config, connection).map_err(remote_failure)?,
+                    connect_embedded(&profile, &config, remote_connection, connection)
+                        .map_err(remote_failure)?,
                     connection.generation,
                 );
                 *browse_session = Some(WorkerBrowseSession {
+                    connection: remote_connection.clone(),
                     profile: profile.as_str().to_owned(),
-                    config: config.clone(),
+                    config,
                     connection_generation: connection.generation,
                     session: session.clone(),
                 });
@@ -1345,9 +1574,82 @@ fn open_dataset(
     }
 }
 
+fn ensure_remote_connection(
+    requested: &RemoteConnectionIdentity,
+    vpn_session: &mut Option<WorkerVpnSession>,
+    connection: &EmbeddedConnectionContext<'_>,
+) -> Result<OpenSshConfig, String> {
+    let RemoteConnectionIdentity::TuftsVpn { username } = requested else {
+        *vpn_session = None;
+        connection.vpn_cancellation.clear(connection.generation);
+        return Ok(OpenSshConfig::new());
+    };
+    if let Some(existing) = vpn_session.as_ref()
+        && existing.connection == *requested
+        && existing.generation == connection.generation
+    {
+        return vpn_open_ssh_config(existing.process.port()).map_err(sanitize_error);
+    }
+
+    *vpn_session = None;
+    let username = tufts_vpn::VpnUsername::new(username.clone()).map_err(sanitize_error)?;
+    let executor = std::env::current_exe().map_err(sanitize_error)?;
+    let (mut process, console) = tufts_vpn::start(&username, &executor).map_err(sanitize_error)?;
+    let cancellation = process.cancellation();
+    connection
+        .vpn_cancellation
+        .replace(connection.generation, &cancellation);
+    let console =
+        ConsolePump::spawn(AuthenticationConsole::Vpn(console)).map_err(sanitize_error)?;
+    if connection
+        .events
+        .send(WorkerEvent::VpnAuthenticationStarted {
+            connection: requested.clone(),
+            console,
+            cancellation,
+            connection_generation: connection.generation,
+        })
+        .is_err()
+    {
+        return Err(String::from("viewer event receiver closed"));
+    }
+    if let Err(error) = process.wait_until_ready(tufts_vpn::READY_TIMEOUT) {
+        connection.vpn_cancellation.clear(connection.generation);
+        let message = sanitize_error(error);
+        let _ = connection.events.send(WorkerEvent::VpnFailed {
+            message: message.clone(),
+            connection_generation: connection.generation,
+        });
+        return Err(message);
+    }
+    if connection
+        .events
+        .send(WorkerEvent::VpnReady {
+            connection_generation: connection.generation,
+        })
+        .is_err()
+    {
+        return Err(String::from("viewer event receiver closed"));
+    }
+    let config = vpn_open_ssh_config(process.port()).map_err(sanitize_error)?;
+    *vpn_session = Some(WorkerVpnSession {
+        connection: requested.clone(),
+        generation: connection.generation,
+        process,
+    });
+    Ok(config)
+}
+
+fn vpn_open_ssh_config(port: u16) -> Result<OpenSshConfig, czi_ssh::OpenSshConfigError> {
+    let alias = HostKeyAlias::new(tufts_vpn::TARGET_HOST)?;
+    let endpoint = LoopbackEndpoint::new(port, alias)?;
+    Ok(OpenSshConfig::new().with_loopback_endpoint(endpoint))
+}
+
 fn connect_embedded(
     profile: &SshProfile,
     config: &OpenSshConfig,
+    remote_connection: &RemoteConnectionIdentity,
     connection: &EmbeddedConnectionContext<'_>,
 ) -> Result<ConnectedSftpSession, czi_ssh::SftpError> {
     let deadline = std::time::Instant::now() + EMBEDDED_START_TIMEOUT;
@@ -1376,7 +1678,7 @@ fn connect_embedded(
     connection
         .cancellation
         .replace(connection.generation, &cancellation);
-    let console = match ConsolePump::spawn(console) {
+    let console = match ConsolePump::spawn(AuthenticationConsole::Ssh(console)) {
         Ok(console) => console,
         Err(error) => {
             connection.cancellation.clear(connection.generation);
@@ -1386,7 +1688,7 @@ fn connect_embedded(
     if connection
         .events
         .send(WorkerEvent::AuthenticationStarted {
-            profile: profile.as_str().to_owned(),
+            connection: remote_connection.clone(),
             console,
             cancellation: cancellation.clone(),
             connection_generation: connection.generation,
@@ -2528,24 +2830,49 @@ enum SnapshotWriteResult {
     Failed { generation: u64, message: String },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthenticationPhase {
+    TuftsVpn,
+    Ssh,
+}
+
+enum RemoteCancellation {
+    TuftsVpn(czi_ssh_darwin::Cancellation),
+    Ssh(EmbeddedSshCancellation),
+}
+
+impl RemoteCancellation {
+    fn cancel(&self) {
+        match self {
+            Self::TuftsVpn(cancellation) => {
+                let _ = cancellation.cancel();
+            }
+            Self::Ssh(cancellation) => {
+                let _ = cancellation.cancel();
+            }
+        }
+    }
+}
+
 struct EmbeddedAuthentication {
-    profile: String,
+    connection: RemoteConnectionIdentity,
+    phase: AuthenticationPhase,
     console: ConsolePump,
-    cancellation: EmbeddedSshCancellation,
+    cancellation: RemoteCancellation,
     generation: u64,
     status: AuthenticationStatus,
 }
 
 fn reuses_remote_connection(
-    profile: &str,
+    requested: &RemoteConnectionIdentity,
     connection_generation: u64,
-    authentication: Option<(&str, AuthenticationStatus)>,
-    session: Option<(&str, u64)>,
+    authentication: Option<(&RemoteConnectionIdentity, AuthenticationStatus)>,
+    session: Option<(&RemoteConnectionIdentity, u64)>,
 ) -> bool {
-    authentication.is_some_and(|(authenticated_profile, status)| {
-        authenticated_profile == profile && status != AuthenticationStatus::Failed
-    }) || session.is_some_and(|(session_profile, session_generation)| {
-        session_profile == profile && session_generation == connection_generation
+    authentication.is_some_and(|(authenticated, status)| {
+        authenticated == requested && status != AuthenticationStatus::Failed
+    }) || session.is_some_and(|(session_identity, session_generation)| {
+        session_identity == requested && session_generation == connection_generation
     })
 }
 
@@ -2554,7 +2881,9 @@ pub struct ViewerApp {
     worker: DatasetWorker,
     open_mode: OpenMode,
     path_input: String,
+    remote_connection_mode: RemoteConnectionMode,
     ssh_profile_input: String,
+    vpn_username_input: String,
     remote_path_input: String,
     remote_browser_path_input: String,
     remote_browse_directory: Option<String>,
@@ -2563,7 +2892,7 @@ pub struct ViewerApp {
     remote_filename_filter: String,
     remote_selected_path: Option<String>,
     remote_browser_visibility: RemoteBrowserVisibility,
-    remote_session: Option<(String, u64)>,
+    remote_session: Option<(RemoteConnectionIdentity, u64)>,
     profile_editing: bool,
     authentication_focus_request: Option<u64>,
     inspector_tab: InspectorTab,
@@ -2610,7 +2939,9 @@ impl ViewerApp {
             path_input: initial_path
                 .as_ref()
                 .map_or_else(String::new, |path| path.display().to_string()),
+            remote_connection_mode: RemoteConnectionMode::default(),
             ssh_profile_input: String::new(),
+            vpn_username_input: String::new(),
             remote_path_input: String::new(),
             remote_browser_path_input: String::new(),
             remote_browse_directory: None,
@@ -2672,6 +3003,26 @@ impl ViewerApp {
         self.pending_view = None;
     }
 
+    fn remote_connection_identity(&self) -> Result<RemoteConnectionIdentity, String> {
+        match self.remote_connection_mode {
+            RemoteConnectionMode::DirectSsh => {
+                let profile = self.ssh_profile_input.trim();
+                SshProfile::new(profile.to_owned()).map_err(|error| error.to_string())?;
+                Ok(RemoteConnectionIdentity::DirectSsh {
+                    profile: profile.to_owned(),
+                })
+            }
+            RemoteConnectionMode::TuftsVpn => {
+                let username = self.vpn_username_input.trim();
+                tufts_vpn::VpnUsername::new(username.to_owned())
+                    .map_err(|error| error.to_string())?;
+                Ok(RemoteConnectionIdentity::TuftsVpn {
+                    username: username.to_owned(),
+                })
+            }
+        }
+    }
+
     fn open_local_path(&mut self) {
         let path = PathBuf::from(self.path_input.trim());
         if self.path_input.trim().is_empty() {
@@ -2683,10 +3034,16 @@ impl ViewerApp {
     }
 
     fn open_remote_path(&mut self) {
+        let connection = match self.remote_connection_identity() {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.status = Status::error(error);
+                return;
+            }
+        };
         self.open_locator(DatasetLocator::Remote {
-            profile: self.ssh_profile_input.trim().to_owned(),
+            connection,
             path: self.remote_path_input.trim().to_owned(),
-            config: OpenSshConfig::new(),
         });
     }
 
@@ -2723,6 +3080,7 @@ impl ViewerApp {
         self.generations.begin_browse();
         self.generations.begin_connection();
         self.retire_embedded_authentication();
+        self.retired_consoles.clear();
         self.remote_session = None;
         self.remote_browse_pending = false;
         self.remote_browse_directory = None;
@@ -2733,6 +3091,13 @@ impl ViewerApp {
     }
 
     fn browse_remote_path(&mut self, home: bool) {
+        let remote_connection = match self.remote_connection_identity() {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.status = Status::error(error);
+                return;
+            }
+        };
         let browse_generation = self.generations.begin_browse();
         self.remote_browse_pending = true;
         self.status = Status::normal(if home {
@@ -2740,16 +3105,15 @@ impl ViewerApp {
         } else {
             String::from("Listing remote paths…")
         });
-        let connection_generation = self.prepare_remote_connection();
+        let connection_generation = self.prepare_remote_connection(&remote_connection);
         if let Err(error) = self.worker.send(WorkerCommand::Browse {
-            profile: self.ssh_profile_input.trim().to_owned(),
+            connection: remote_connection,
             path: if home {
                 String::new()
             } else {
                 directory_path(self.remote_browser_path_input.trim())
             },
             home,
-            config: OpenSshConfig::new(),
             browse_generation,
             connection_generation,
         }) {
@@ -2810,7 +3174,7 @@ impl ViewerApp {
             DatasetOrigin::Local
         };
         let connection_generation = match &locator {
-            DatasetLocator::Remote { .. } => self.prepare_remote_connection(),
+            DatasetLocator::Remote { connection, .. } => self.prepare_remote_connection(connection),
             DatasetLocator::Local(_) => self.generations.connection,
         };
         let source_label = locator.display_label();
@@ -2849,7 +3213,7 @@ impl ViewerApp {
             DatasetOrigin::Local
         };
         let connection_generation = match &locator {
-            DatasetLocator::Remote { .. } => self.prepare_remote_connection(),
+            DatasetLocator::Remote { connection, .. } => self.prepare_remote_connection(connection),
             DatasetLocator::Local(_) => self.generations.connection,
         };
         self.opening_origin = Some(origin);
@@ -2864,20 +3228,17 @@ impl ViewerApp {
         }
     }
 
-    fn prepare_remote_connection(&mut self) -> u64 {
-        let profile = self.ssh_profile_input.trim();
+    fn prepare_remote_connection(&mut self, requested: &RemoteConnectionIdentity) -> u64 {
         let authentication = self
             .embedded_authentication
             .as_ref()
-            .map(|authentication| (authentication.profile.as_str(), authentication.status));
+            .map(|authentication| (&authentication.connection, authentication.status));
         let session = self
             .remote_session
             .as_ref()
-            .map(|(session_profile, session_generation)| {
-                (session_profile.as_str(), *session_generation)
-            });
+            .map(|(identity, generation)| (identity, *generation));
         let reuse = reuses_remote_connection(
-            profile,
+            requested,
             self.generations.connection,
             authentication,
             session,
@@ -2885,6 +3246,7 @@ impl ViewerApp {
         if !reuse {
             self.cancel_active_remote_connection();
             self.retire_embedded_authentication();
+            self.retired_consoles.clear();
             self.remote_session = None;
             self.generations.begin_connection();
         }
@@ -2895,10 +3257,13 @@ impl ViewerApp {
         self.worker
             .embedded_cancellation
             .cancel(self.generations.connection);
+        self.worker
+            .vpn_cancellation
+            .cancel(self.generations.connection);
         if let Some(authentication) = &self.embedded_authentication
             && authentication.generation == self.generations.connection
         {
-            let _ = authentication.cancellation.cancel();
+            authentication.cancellation.cancel();
         }
     }
 
@@ -2907,15 +3272,17 @@ impl ViewerApp {
         self.generations.begin_browse();
         self.generations.begin_connection();
         self.retire_embedded_authentication();
+        self.retired_consoles.clear();
         self.remote_session = None;
         self.remote_browse_pending = false;
-        self.status = Status::normal("SSH authentication cancelled.");
+        self.status = Status::normal("Remote authentication cancelled.");
     }
 
     fn reconnect_remote(&mut self) {
         self.close_remote_dataset();
         self.cancel_active_remote_connection();
         self.retire_embedded_authentication();
+        self.retired_consoles.clear();
         self.remote_session = None;
         self.clear_remote_listing();
         self.refresh_remote_browser();
@@ -3438,24 +3805,83 @@ impl ViewerApp {
     #[allow(clippy::too_many_lines)]
     fn handle_worker_event(&mut self, event: WorkerEvent) {
         match event {
-            WorkerEvent::AuthenticationStarted {
-                profile,
+            WorkerEvent::VpnAuthenticationStarted {
+                connection,
                 console,
                 cancellation,
                 connection_generation,
             } if self.generations.accepts_connection(connection_generation) => {
+                self.retire_embedded_authentication();
                 self.retired_consoles.clear();
                 self.embedded_authentication = Some(EmbeddedAuthentication {
-                    profile,
+                    connection,
+                    phase: AuthenticationPhase::TuftsVpn,
                     console,
-                    cancellation,
+                    cancellation: RemoteCancellation::TuftsVpn(cancellation),
                     generation: connection_generation,
                     status: AuthenticationStatus::Connecting,
                 });
                 self.remote_browser_visibility = RemoteBrowserVisibility::Open;
                 self.profile_editing = false;
                 self.authentication_focus_request = Some(connection_generation);
-                self.status = Status::normal("SSH authentication is waiting for terminal input.");
+                self.status = Status::normal("Phase 1/2 · Tufts VPN authentication.");
+            }
+            WorkerEvent::VpnReady {
+                connection_generation,
+            } if self.generations.accepts_connection(connection_generation) => {
+                if let Some(authentication) = self.embedded_authentication.as_mut()
+                    && authentication.generation == connection_generation
+                    && authentication.phase == AuthenticationPhase::TuftsVpn
+                {
+                    authentication.status = AuthenticationStatus::Authenticated;
+                }
+                self.authentication_focus_request = None;
+                self.status = Status::normal("Phase 1/2 complete · Checking SSH authentication.");
+            }
+            WorkerEvent::VpnFailed {
+                message,
+                connection_generation,
+            } if self.generations.accepts_connection(connection_generation) => {
+                if let Some(authentication) = self.embedded_authentication.as_mut()
+                    && authentication.generation == connection_generation
+                    && authentication.phase == AuthenticationPhase::TuftsVpn
+                {
+                    authentication.status = AuthenticationStatus::Failed;
+                }
+                self.remote_session = None;
+                self.authentication_focus_request = None;
+                self.status = Status::error(message);
+            }
+            WorkerEvent::AuthenticationStarted {
+                connection,
+                console,
+                cancellation,
+                connection_generation,
+            } if self.generations.accepts_connection(connection_generation) => {
+                self.retire_embedded_authentication();
+                self.embedded_authentication = Some(EmbeddedAuthentication {
+                    connection,
+                    phase: AuthenticationPhase::Ssh,
+                    console,
+                    cancellation: RemoteCancellation::Ssh(cancellation),
+                    generation: connection_generation,
+                    status: AuthenticationStatus::Connecting,
+                });
+                self.remote_browser_visibility = RemoteBrowserVisibility::Open;
+                self.profile_editing = false;
+                self.authentication_focus_request = Some(connection_generation);
+                self.status = Status::normal(
+                    if matches!(
+                        self.embedded_authentication
+                            .as_ref()
+                            .map(|authentication| &authentication.connection),
+                        Some(RemoteConnectionIdentity::TuftsVpn { .. })
+                    ) {
+                        "Phase 2/2 · SSH authentication."
+                    } else {
+                        "SSH authentication is waiting for terminal input."
+                    },
+                );
             }
             WorkerEvent::AuthenticationSucceeded {
                 connection_generation,
@@ -3465,10 +3891,11 @@ impl ViewerApp {
                 {
                     authentication.status = AuthenticationStatus::Authenticated;
                     self.remote_session =
-                        Some((authentication.profile.clone(), connection_generation));
+                        Some((authentication.connection.clone(), connection_generation));
                     self.authentication_focus_request = None;
-                    self.status =
-                        Status::normal("SSH authentication succeeded; opening SFTP session.");
+                    self.status = Status::normal(
+                        "SSH authentication succeeded; opening persistent SFTP session.",
+                    );
                 }
             }
             WorkerEvent::AuthenticationFailed {
@@ -3518,6 +3945,7 @@ impl ViewerApp {
                     self.remote_session = None;
                     self.cancel_active_remote_connection();
                     self.retire_embedded_authentication();
+                    self.retired_consoles.clear();
                     self.generations.begin_connection();
                 }
                 self.status = Status::error(message);
@@ -3616,7 +4044,10 @@ impl ViewerApp {
             {
                 self.status = Status::error(message);
             }
-            WorkerEvent::AuthenticationStarted { .. }
+            WorkerEvent::VpnAuthenticationStarted { .. }
+            | WorkerEvent::VpnReady { .. }
+            | WorkerEvent::VpnFailed { .. }
+            | WorkerEvent::AuthenticationStarted { .. }
             | WorkerEvent::AuthenticationSucceeded { .. }
             | WorkerEvent::AuthenticationFailed { .. }
             | WorkerEvent::Opened { .. }
@@ -3671,10 +4102,9 @@ impl ViewerApp {
         self.remote_suggestions = suggestions;
         self.remote_selected_path = None;
         self.remote_browse_pending = false;
-        self.remote_session = Some((
-            self.ssh_profile_input.trim().to_owned(),
-            self.generations.connection,
-        ));
+        if let Ok(connection) = self.remote_connection_identity() {
+            self.remote_session = Some((connection, self.generations.connection));
+        }
     }
 
     fn handle_remote_paths_failed(
@@ -3692,6 +4122,7 @@ impl ViewerApp {
             self.remote_session = None;
             self.cancel_active_remote_connection();
             self.retire_embedded_authentication();
+            self.retired_consoles.clear();
             self.generations.begin_connection();
         }
         self.remote_browse_pending = false;
@@ -3809,15 +4240,20 @@ impl ViewerApp {
 
     #[allow(clippy::too_many_lines)]
     fn show_remote_browser(&mut self, ui: &mut egui::Ui) {
-        let authentication_status = self
+        let authentication = self
             .embedded_authentication
             .as_ref()
-            .map(|authentication| authentication.status);
-        let connected =
-            remote_browser_connected(authentication_status, self.remote_session.is_some());
-        let connecting = authentication_status == Some(AuthenticationStatus::Connecting);
+            .map(|authentication| (authentication.phase, authentication.status));
+        let authentication_status = authentication.map(|(_, status)| status);
+        let connected = remote_browser_connected(authentication, self.remote_session.is_some());
+        let connecting = authentication_status == Some(AuthenticationStatus::Connecting)
+            || authentication
+                == Some((
+                    AuthenticationPhase::TuftsVpn,
+                    AuthenticationStatus::Authenticated,
+                ));
         let failed = authentication_status == Some(AuthenticationStatus::Failed);
-        let profile_ready = !self.ssh_profile_input.trim().is_empty();
+        let profile_ready = self.remote_connection_identity().is_ok();
         let profile_locked = !profile_is_editable(
             self.profile_editing,
             authentication_status,
@@ -3841,19 +4277,50 @@ impl ViewerApp {
             }
         });
 
+        let mode_before = self.remote_connection_mode;
         egui::Frame::group(ui.style())
             .fill(egui::Color32::from_gray(30))
             .show(ui, |ui| {
                 ui.label("Connection");
                 ui.horizontal(|ui| {
-                    ui.label("Profile");
-                    ui.add_enabled(
-                        !profile_locked,
-                        egui::TextEdit::singleline(&mut self.ssh_profile_input)
-                            .hint_text("my-ssh-profile")
-                            .desired_width(f32::INFINITY),
-                    );
+                    ui.add_enabled_ui(!profile_locked, |ui| {
+                        ui.selectable_value(
+                            &mut self.remote_connection_mode,
+                            RemoteConnectionMode::DirectSsh,
+                            "Direct SSH",
+                        );
+                        ui.selectable_value(
+                            &mut self.remote_connection_mode,
+                            RemoteConnectionMode::TuftsVpn,
+                            "Tufts VPN",
+                        );
+                    });
                 });
+                match self.remote_connection_mode {
+                    RemoteConnectionMode::DirectSsh => {
+                        ui.horizontal(|ui| {
+                            ui.label("Profile");
+                            ui.add_enabled(
+                                !profile_locked,
+                                egui::TextEdit::singleline(&mut self.ssh_profile_input)
+                                    .hint_text("my-ssh-profile")
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                    }
+                    RemoteConnectionMode::TuftsVpn => {
+                        ui.horizontal(|ui| {
+                            ui.label("VPN username");
+                            ui.add_enabled(
+                                !profile_locked,
+                                egui::TextEdit::singleline(&mut self.vpn_username_input)
+                                    .hint_text("Tufts username")
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                        ui.weak(format!("Fixed SSH target: {}", tufts_vpn::TARGET_HOST));
+                    }
+                }
                 ui.horizontal(|ui| {
                     if profile_locked {
                         if ui.button("Change").clicked() {
@@ -3882,16 +4349,25 @@ impl ViewerApp {
                     if connecting {
                         ui.spinner();
                     }
-                    ui.weak("Read-only SFTP. SSH input stays in the terminal below.");
+                    ui.weak("Read-only SFTP. Authentication input stays in the terminal below.");
                 });
             });
+        if self.remote_connection_mode != mode_before {
+            self.begin_profile_change();
+        }
 
         if connecting || failed {
             ui.add_space(4.0);
             egui::Frame::group(ui.style())
                 .fill(egui::Color32::from_gray(24))
                 .show(ui, |ui| {
-                    ui.strong("Authentication");
+                    let phase = self.embedded_authentication.as_ref().map(|authentication| {
+                        match authentication.phase {
+                            AuthenticationPhase::TuftsVpn => "Phase 1/2 · Tufts VPN authentication",
+                            AuthenticationPhase::Ssh => "SSH authentication",
+                        }
+                    });
+                    ui.strong(phase.unwrap_or("Authentication"));
                     self.show_embedded_authentication(ui);
                     ui.horizontal(|ui| {
                         if connecting {
@@ -3912,7 +4388,14 @@ impl ViewerApp {
 
         if !connected {
             ui.add_space(8.0);
-            ui.weak("Enter an SSH profile, then select Connect to browse remote CZI files.");
+            ui.weak(match self.remote_connection_mode {
+                RemoteConnectionMode::DirectSsh => {
+                    "Enter an SSH profile, then select Connect to browse remote CZI files."
+                }
+                RemoteConnectionMode::TuftsVpn => {
+                    "Enter your Tufts VPN username, then select Connect."
+                }
+            });
             return;
         }
 
@@ -5019,10 +5502,15 @@ fn take_authentication_focus_request(request: &mut Option<u64>, generation: u64)
 }
 
 fn remote_browser_connected(
-    authentication_status: Option<AuthenticationStatus>,
+    authentication: Option<(AuthenticationPhase, AuthenticationStatus)>,
     has_remote_session: bool,
 ) -> bool {
-    authentication_status == Some(AuthenticationStatus::Authenticated) || has_remote_session
+    authentication
+        == Some((
+            AuthenticationPhase::Ssh,
+            AuthenticationStatus::Authenticated,
+        ))
+        || has_remote_session
 }
 
 fn remote_profile_is_locked(
@@ -5083,16 +5571,8 @@ impl eframe::App for ViewerApp {
                     let local_mode =
                         ui.selectable_value(&mut self.open_mode, OpenMode::Local, "Local");
                     let ssh_mode = ui.selectable_value(&mut self.open_mode, OpenMode::Ssh, "SSH");
-                    if local_mode.changed()
-                        && self.open_mode == OpenMode::Local
-                        && self
-                            .embedded_authentication
-                            .as_ref()
-                            .is_some_and(|authentication| {
-                                authentication.status == AuthenticationStatus::Connecting
-                            })
-                    {
-                        self.cancel_embedded_authentication();
+                    if local_mode.changed() && self.open_mode == OpenMode::Local {
+                        self.disconnect_remote_for_local_source();
                     }
                     if ssh_mode.changed() && self.open_mode == OpenMode::Ssh {
                         self.remote_browser_visibility = RemoteBrowserVisibility::Open;
@@ -5471,6 +5951,8 @@ fn level_selector(ui: &mut egui::Ui, pixel_type: PixelType, levels: &mut Levels)
     }
     *levels != before
 }
+
+pub use tufts_vpn::run_executor_if_requested as run_tufts_vpn_executor_if_requested;
 
 /// Run the macOS-native local viewer.
 ///
@@ -5911,12 +6393,22 @@ mod tests {
             false
         ));
         assert!(remote_browser_connected(
-            Some(AuthenticationStatus::Authenticated),
+            Some((
+                AuthenticationPhase::Ssh,
+                AuthenticationStatus::Authenticated,
+            )),
             false
         ));
         assert!(remote_browser_connected(None, true));
         assert!(!remote_browser_connected(
-            Some(AuthenticationStatus::Connecting),
+            Some((
+                AuthenticationPhase::TuftsVpn,
+                AuthenticationStatus::Authenticated,
+            )),
+            false
+        ));
+        assert!(!remote_browser_connected(
+            Some((AuthenticationPhase::Ssh, AuthenticationStatus::Connecting,)),
             false
         ));
         assert!(!remote_browser_connected(None, false));
@@ -5976,6 +6468,21 @@ mod tests {
                 .cancelled_through
                 .is_none_or(|cancelled_through| 5 > cancelled_through)
         );
+
+        let vpn_slot = VpnCancellationSlot::default();
+        vpn_slot.cancel(4);
+        vpn_slot.clear(4);
+        let vpn_state = vpn_slot.inner.lock().expect("VPN cancellation state");
+        assert_eq!(vpn_state.cancelled_through, Some(4));
+    }
+
+    #[test]
+    fn stale_vpn_ready_and_failure_events_are_rejected_by_connection_generation() {
+        let mut generations = Generations::default();
+        let vpn_generation = generations.begin_connection();
+        generations.begin_connection();
+        assert!(!generations.accepts_connection(vpn_generation));
+        assert!(generations.accepts_connection(generations.connection));
     }
 
     fn test_view_request(view_generation: u64) -> ViewRequest {
@@ -6571,48 +7078,66 @@ mod tests {
 
     #[test]
     fn authenticated_remote_browse_reuses_only_the_matching_session() {
+        let direct = RemoteConnectionIdentity::DirectSsh {
+            profile: String::from("lab-czi"),
+        };
+        let other = RemoteConnectionIdentity::DirectSsh {
+            profile: String::from("other-host"),
+        };
+        let vpn = RemoteConnectionIdentity::TuftsVpn {
+            username: String::from("jdoe"),
+        };
         assert!(reuses_remote_connection(
-            "lab-czi",
+            &direct,
             7,
-            Some(("lab-czi", AuthenticationStatus::Authenticated)),
+            Some((&direct, AuthenticationStatus::Authenticated)),
             None,
         ));
         assert!(reuses_remote_connection(
-            "lab-czi",
+            &direct,
             7,
             None,
-            Some(("lab-czi", 7)),
+            Some((&direct, 7)),
         ));
         assert!(!reuses_remote_connection(
-            "lab-czi",
+            &direct,
             8,
             None,
-            Some(("lab-czi", 7)),
+            Some((&direct, 7)),
         ));
         assert!(!reuses_remote_connection(
-            "lab-czi",
+            &direct,
             7,
-            Some(("other-host", AuthenticationStatus::Authenticated)),
-            Some(("other-host", 7)),
+            Some((&other, AuthenticationStatus::Authenticated)),
+            Some((&other, 7)),
         ));
         assert!(!reuses_remote_connection(
-            "lab-czi",
+            &direct,
             7,
-            Some(("lab-czi", AuthenticationStatus::Failed)),
+            Some((&direct, AuthenticationStatus::Failed)),
             None,
         ));
+        assert!(!reuses_remote_connection(&vpn, 7, None, Some((&direct, 7))));
     }
 
     #[test]
     fn worker_session_reuse_requires_matching_profile_config_and_generation() {
         let config = OpenSshConfig::new();
+        let direct = RemoteConnectionIdentity::DirectSsh {
+            profile: String::from("lab-czi"),
+        };
+        let vpn = RemoteConnectionIdentity::TuftsVpn {
+            username: String::from("jdoe"),
+        };
         assert!(matches_worker_remote_session(
             RemoteSessionKey {
+                connection: &direct,
                 profile: "lab-czi",
                 config: &config,
                 generation: 7,
             },
             RemoteSessionKey {
+                connection: &direct,
                 profile: "lab-czi",
                 config: &config,
                 generation: 7,
@@ -6620,14 +7145,30 @@ mod tests {
         ));
         assert!(!matches_worker_remote_session(
             RemoteSessionKey {
+                connection: &direct,
                 profile: "lab-czi",
                 config: &config,
                 generation: 7,
             },
             RemoteSessionKey {
+                connection: &direct,
                 profile: "lab-czi",
                 config: &config,
                 generation: 8,
+            },
+        ));
+        assert!(!matches_worker_remote_session(
+            RemoteSessionKey {
+                connection: &direct,
+                profile: "lab-czi",
+                config: &config,
+                generation: 7,
+            },
+            RemoteSessionKey {
+                connection: &vpn,
+                profile: tufts_vpn::TARGET_HOST,
+                config: &config,
+                generation: 7,
             },
         ));
     }
@@ -6703,6 +7244,25 @@ mod tests {
     }
 
     #[test]
+    fn fixed_tufts_config_uses_loopback_without_changing_ssh_identity() {
+        let config = vpn_open_ssh_config(41_337).expect("fixed Tufts SSH config");
+        let endpoint = config.loopback_endpoint().expect("loopback endpoint");
+        assert_eq!(endpoint.port(), 41_337);
+        assert_eq!(endpoint.host_key_alias().as_str(), tufts_vpn::TARGET_HOST);
+        let argv = config
+            .embedded_sftp_argv(&SshProfile::new(tufts_vpn::TARGET_HOST).unwrap())
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["-o", "ProxyCommand=none"])
+        );
+        assert!(argv.windows(2).any(|pair| pair == ["-o", "ProxyJump=none"]));
+        assert_eq!(argv[argv.len() - 2], tufts_vpn::TARGET_HOST);
+    }
+
+    #[test]
     fn remote_browse_paths_never_enter_openssh_argv() {
         let remote_path = "/data/; never-an-ssh-argument.czi";
         let profile = SshProfile::new("research-cluster").expect("profile");
@@ -6734,8 +7294,15 @@ mod tests {
             .expect("fill bounded event channel");
         let embedded_cancellation = EmbeddedCancellationSlot::default();
         let worker_cancellation = embedded_cancellation.clone();
+        let vpn_cancellation = VpnCancellationSlot::default();
+        let worker_vpn_cancellation = vpn_cancellation.clone();
         let join = thread::spawn(move || {
-            worker_loop(&command_rx, &event_tx, &worker_cancellation);
+            worker_loop(
+                &command_rx,
+                &event_tx,
+                &worker_cancellation,
+                &worker_vpn_cancellation,
+            );
         });
         commands
             .send(WorkerCommand::Open {
@@ -6748,6 +7315,7 @@ mod tests {
             commands: Some(commands),
             events: Some(events),
             embedded_cancellation,
+            vpn_cancellation,
             join: Some(join),
         };
         worker.shutdown();
@@ -6756,18 +7324,18 @@ mod tests {
 
     #[test]
     fn remote_locator_validates_profile_location_and_absolute_path() {
-        let config = OpenSshConfig::new();
+        let direct = |profile: &str| RemoteConnectionIdentity::DirectSsh {
+            profile: profile.to_owned(),
+        };
         let valid = DatasetLocator::Remote {
-            profile: String::from("research-cluster"),
+            connection: direct("research-cluster"),
             path: String::from("/data/image.czi"),
-            config: config.clone(),
         };
         assert!(valid.remote_parts().is_ok());
 
         let invalid_profile = DatasetLocator::Remote {
-            profile: String::from("-oProxyCommand=bad"),
+            connection: direct("-oProxyCommand=bad"),
             path: String::from("/data/image.czi"),
-            config: config.clone(),
         };
         assert!(
             invalid_profile
@@ -6776,9 +7344,8 @@ mod tests {
         );
 
         let invalid_location = DatasetLocator::Remote {
-            profile: String::from("research-cluster"),
+            connection: direct("research-cluster"),
             path: String::from("/data\0image.czi"),
-            config: config.clone(),
         };
         assert!(
             invalid_location
@@ -6787,9 +7354,8 @@ mod tests {
         );
 
         let relative_location = DatasetLocator::Remote {
-            profile: String::from("research-cluster"),
+            connection: direct("research-cluster"),
             path: String::from("data/image.czi"),
-            config,
         };
         assert_eq!(
             relative_location

@@ -12,5 +12,8 @@ eframe = { version = "=0.32.3", default-features = false, features = ["wgpu", "d
 png = { version = "0.18", default-features = false }
 wgpu = { version = "=25.0.2", default-features = false, features = ["metal", "wgsl"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+czi-ssh-darwin = { path = "../czi-ssh-darwin" }
+
 [lints]
 workspace = true
