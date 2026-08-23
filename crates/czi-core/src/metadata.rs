@@ -362,24 +362,85 @@ fn retain_general_reference(
         return false;
     }
     counts.text_bytes = counts.text_bytes.saturating_add(bytes);
-    if let Some(decoded) = predefined_reference(reference) {
-        node.text.push_str(decoded);
+    if let Some(decoded) = decode_xml_reference(reference) {
+        decoded.push_to(&mut node.text);
     } else {
         node.text.push('&');
         node.text.push_str(&String::from_utf8_lossy(reference));
         node.text.push(';');
+        invalid_reference_diagnostic(diagnostics, reference, false);
     }
     true
 }
 
-fn predefined_reference(reference: &[u8]) -> Option<&'static str> {
-    match reference {
+enum XmlReference {
+    Named(&'static str),
+    Character(char),
+}
+
+impl XmlReference {
+    fn push_to(self, output: &mut String) {
+        match self {
+            Self::Named(value) => output.push_str(value),
+            Self::Character(value) => output.push(value),
+        }
+    }
+}
+
+fn decode_xml_reference(reference: &[u8]) -> Option<XmlReference> {
+    let named = match reference {
         b"amp" => Some("&"),
         b"apos" => Some("'"),
         b"gt" => Some(">"),
         b"lt" => Some("<"),
         b"quot" => Some("\""),
         _ => None,
+    };
+    if let Some(named) = named {
+        return Some(XmlReference::Named(named));
+    }
+    let (digits, radix) = if let Some(digits) = reference
+        .strip_prefix(b"#x")
+        .or_else(|| reference.strip_prefix(b"#X"))
+    {
+        (digits, 16)
+    } else {
+        (reference.strip_prefix(b"#")?, 10)
+    };
+    let digits = std::str::from_utf8(digits).ok()?;
+    let value = u32::from_str_radix(digits, radix).ok()?;
+    char::from_u32(value)
+        .filter(|character| is_xml_character(*character))
+        .map(XmlReference::Character)
+}
+
+fn is_xml_character(character: char) -> bool {
+    matches!(character, '\u{9}' | '\u{A}' | '\u{D}')
+        || ('\u{20}'..='\u{D7FF}').contains(&character)
+        || ('\u{E000}'..='\u{FFFD}').contains(&character)
+        || ('\u{10000}'..='\u{10FFFF}').contains(&character)
+}
+
+fn invalid_reference_diagnostic(
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+    reference: &[u8],
+    summary: bool,
+) {
+    let prefix = if summary {
+        "Invalid metadata summary XML reference"
+    } else {
+        "Invalid metadata XML reference"
+    };
+    let preview = String::from_utf8_lossy(&reference[..reference.len().min(64)]);
+    let suffix = if reference.len() > 64 { "…" } else { "" };
+    let message = format!("{prefix} '&{preview}{suffix};' was preserved literally.");
+    if summary {
+        summary_diagnostic_once(diagnostics, message);
+    } else if !diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.message.starts_with(prefix))
+    {
+        diagnostics.push(MetadataDiagnostic { message });
     }
 }
 
@@ -640,10 +701,16 @@ fn extract_summary(
                 );
             }
             Event::GeneralRef(reference) => {
-                let value = predefined_reference(reference.as_ref()).map_or_else(
-                    || format!("&{};", String::from_utf8_lossy(reference.as_ref())),
-                    str::to_owned,
-                );
+                let reference = reference.as_ref();
+                let mut value = String::new();
+                if let Some(decoded) = decode_xml_reference(reference) {
+                    decoded.push_to(&mut value);
+                } else {
+                    value.push('&');
+                    value.push_str(&String::from_utf8_lossy(reference));
+                    value.push(';');
+                    invalid_reference_diagnostic(&mut state.diagnostics, reference, true);
+                }
                 append_summary_fragment(
                     state.captures.last_mut().and_then(Option::as_mut),
                     &value,
@@ -685,14 +752,32 @@ fn extract_summary(
             _ => {}
         }
     }
-    state.summary.pixel_size = match (state.x_meters, state.y_meters) {
-        (Some(x), Some(y)) => Some(PhysicalPixelSize {
-            x_um: x * 1_000_000.0,
-            y_um: y * 1_000_000.0,
-        }),
-        _ => None,
-    };
+    state.summary.pixel_size =
+        physical_pixel_size(state.x_meters, state.y_meters, &mut state.diagnostics);
     (state.summary, state.diagnostics)
+}
+
+fn physical_pixel_size(
+    x_meters: Option<f64>,
+    y_meters: Option<f64>,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Option<PhysicalPixelSize> {
+    let (Some(x_meters), Some(y_meters)) = (x_meters, y_meters) else {
+        return None;
+    };
+    let x_um = x_meters * 1_000_000.0;
+    let y_um = y_meters * 1_000_000.0;
+    if x_um.is_finite() && x_um > 0.0 && y_um.is_finite() && y_um > 0.0 {
+        Some(PhysicalPixelSize { x_um, y_um })
+    } else {
+        summary_diagnostic_once(
+            diagnostics,
+            String::from(
+                "Metadata summary X/Y calibration was invalid after conversion to micrometers; pixel size is unavailable.",
+            ),
+        );
+        None
+    }
 }
 
 fn push_summary_name(path: &mut Vec<String>, bytes: &[u8]) {
@@ -1255,6 +1340,54 @@ mod tests {
                 y_um: 0.5
             })
         );
+    }
+
+    #[test]
+    fn numeric_xml_references_decode_in_tree_and_summary_fields() {
+        let document = parse(
+            r#"<ImageDocument><Metadata><Information><Document><Name>H&#38;E / H&#x26;E</Name></Document></Information><Scaling><Distance Id="X">2.5&#101;-7</Distance><Distance Id="Y">5&#x65;-7</Distance></Scaling></Metadata></ImageDocument>"#,
+        );
+        let root = document.root.as_ref().expect("tree root");
+        let name = &root.children[0].children[0].children[0].children[0];
+        assert_eq!(name.text, "H&E / H&E");
+        assert_eq!(document.summary.name.as_deref(), Some("H&E / H&E"));
+        assert_eq!(
+            document.summary.pixel_size,
+            Some(PhysicalPixelSize {
+                x_um: 0.25,
+                y_um: 0.5
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_xml_references_are_preserved_and_diagnosed() {
+        let document = parse(
+            r"<ImageDocument><Metadata><Information><Document><Name>H&#0;E</Name></Document></Information></Metadata></ImageDocument>",
+        );
+        assert_eq!(document.summary.name.as_deref(), Some("H&#0;E"));
+        assert!(document.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Invalid metadata XML reference")
+        }));
+        assert!(document.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Invalid metadata summary XML reference")
+        }));
+    }
+
+    #[test]
+    fn overflowing_micrometer_conversion_is_unavailable_and_diagnostic() {
+        let document = parse(
+            r#"<ImageDocument><Metadata><Scaling><Distance Id="X" Value="1e308"/><Distance Id="Y" Value="1e308"/></Scaling></Metadata></ImageDocument>"#,
+        );
+        assert_eq!(document.summary.pixel_size, None);
+        assert!(has_summary_diagnostic(
+            &document,
+            "after conversion to micrometers"
+        ));
     }
 
     #[test]

@@ -4479,33 +4479,57 @@ fn metadata_tree(ui: &mut egui::Ui, node: &czi_core::MetadataNode, filter: &str,
         |text| format!("{}{}", node.name, text),
     );
     ui.push_id((depth, &node.name), |ui| {
-        egui::CollapsingHeader::new(label)
-            .default_open(depth < 2 || !filter.is_empty())
-            .show(ui, |ui| {
-                if !node.text.is_empty() {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.weak("Value");
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(&node.text).monospace()).wrap(),
-                        );
-                    });
-                }
-                if !node.attributes.is_empty() {
-                    for attribute in &node.attributes {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.weak(&attribute.name);
-                            ui.add(
-                                egui::Label::new(egui::RichText::new(&attribute.value).monospace())
-                                    .wrap(),
-                            );
-                        });
-                    }
-                }
-                for (index, child) in node.children.iter().enumerate() {
-                    ui.push_id(index, |ui| metadata_tree(ui, child, filter, depth + 1));
-                }
-            });
+        match metadata_node_presentation(filter) {
+            MetadataNodePresentation::LazyCollapse => {
+                egui::CollapsingHeader::new(label)
+                    .default_open(depth < 2)
+                    .show(ui, |ui| metadata_node_contents(ui, node, filter, depth));
+            }
+            MetadataNodePresentation::ExpandedSearch => {
+                ui.strong(label);
+                ui.indent("matching-metadata", |ui| {
+                    metadata_node_contents(ui, node, filter, depth);
+                });
+            }
+        }
     });
+}
+
+fn metadata_node_contents(
+    ui: &mut egui::Ui,
+    node: &czi_core::MetadataNode,
+    filter: &str,
+    depth: usize,
+) {
+    if !node.text.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui.weak("Value");
+            ui.add(egui::Label::new(egui::RichText::new(&node.text).monospace()).wrap());
+        });
+    }
+    for attribute in &node.attributes {
+        ui.horizontal_wrapped(|ui| {
+            ui.weak(&attribute.name);
+            ui.add(egui::Label::new(egui::RichText::new(&attribute.value).monospace()).wrap());
+        });
+    }
+    for (index, child) in node.children.iter().enumerate() {
+        ui.push_id(index, |ui| metadata_tree(ui, child, filter, depth + 1));
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetadataNodePresentation {
+    LazyCollapse,
+    ExpandedSearch,
+}
+
+fn metadata_node_presentation(filter: &str) -> MetadataNodePresentation {
+    if filter.is_empty() {
+        MetadataNodePresentation::LazyCollapse
+    } else {
+        MetadataNodePresentation::ExpandedSearch
+    }
 }
 
 fn metadata_sections(ui: &mut egui::Ui, root: &czi_core::MetadataNode, filter: &str) {
@@ -4715,6 +4739,18 @@ mod tests {
         };
         assert!(metadata_matches(&node, "fluor"));
         assert!(!metadata_matches(&node, "hardware"));
+    }
+
+    #[test]
+    fn metadata_nodes_render_expanded_for_searches_and_lazy_without_one() {
+        assert_eq!(
+            metadata_node_presentation(""),
+            MetadataNodePresentation::LazyCollapse
+        );
+        assert_eq!(
+            metadata_node_presentation("fluor"),
+            MetadataNodePresentation::ExpandedSearch
+        );
     }
 
     #[test]
