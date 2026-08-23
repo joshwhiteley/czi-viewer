@@ -1871,15 +1871,30 @@ fn default_channel_roles(
     choices: &DimensionChoices,
     summary: &MetadataSummary,
 ) -> HashMap<i32, ChannelRole> {
+    const MAX_ROLE_METADATA_CHARS: usize = 256;
+
     let mut roles = HashMap::new();
     for channel in &choices.values {
-        let label = channel_label(summary, *channel).to_ascii_lowercase();
-        let role = if ["phase", "brightfield", "bright field", "transmitted"]
+        let metadata = summary
+            .channels
             .iter()
-            .any(|needle| label.contains(needle))
-        {
+            .find(|entry| entry.index == *channel);
+        let label = metadata.map_or_else(
+            || bounded_lowercase(&channel_label(summary, *channel), MAX_ROLE_METADATA_CHARS),
+            |entry| bounded_lowercase(&entry.label, MAX_ROLE_METADATA_CHARS),
+        );
+        let fluor = metadata
+            .and_then(|entry| entry.fluor.as_deref())
+            .map(|fluor| bounded_lowercase(fluor, MAX_ROLE_METADATA_CHARS));
+        let matches = |needles: &[&str]| {
+            needles.iter().any(|needle| {
+                label.contains(needle)
+                    || fluor.as_deref().is_some_and(|fluor| fluor.contains(needle))
+            })
+        };
+        let role = if matches(&["phase", "brightfield", "bright field", "transmitted"]) {
             ChannelRole::Gray
-        } else if [
+        } else if matches(&[
             "hada",
             "dapi",
             "hoechst",
@@ -1887,15 +1902,9 @@ fn default_channel_roles(
             "af 405",
             "alexa fluor 405",
             "alexa 405",
-        ]
-        .iter()
-        .any(|needle| label.contains(needle))
-        {
+        ]) {
             ChannelRole::Blue
-        } else if ["bodipy", "bod493", "fitc", "gfp"]
-            .iter()
-            .any(|needle| label.contains(needle))
-        {
+        } else if matches(&["bodipy", "bod493", "fitc", "gfp"]) {
             ChannelRole::Green
         } else {
             ChannelRole::Off
@@ -1908,6 +1917,14 @@ fn default_channel_roles(
         roles.insert(*first, ChannelRole::Gray);
     }
     roles
+}
+
+fn bounded_lowercase(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .take(max_chars)
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 impl Status {
@@ -5589,7 +5606,7 @@ mod tests {
     fn channel_role_defaults_use_labels_and_sparse_channel_values() {
         let choices = DimensionChoices {
             present: true,
-            values: vec![2, 7, 11, 19, 23, 29],
+            values: vec![2, 7, 11, 19, 23, 29, 31, 37],
         };
         let summary = MetadataSummary {
             channels: vec![
@@ -5597,29 +5614,46 @@ mod tests {
                     index: 2,
                     id: None,
                     label: String::from("Phase Contrast"),
+                    fluor: None,
                 },
                 ChannelMetadata {
                     index: 7,
                     id: None,
                     label: String::from("HADA"),
+                    fluor: None,
                 },
                 ChannelMetadata {
                     index: 11,
                     id: None,
                     label: String::from("BODIPY 493/503"),
+                    fluor: None,
                 },
                 ChannelMetadata {
                     index: 23,
                     id: None,
-                    label: String::from("AF405 (fluor Alexa Fluor 405)"),
+                    label: String::from("AF405"),
+                    fluor: Some(String::from("Alexa Fluor 405")),
                 },
                 ChannelMetadata {
                     index: 29,
                     id: None,
-                    label: String::from("Bod493 (fluor BODIPY FL)"),
+                    label: String::from("Bod493"),
+                    fluor: Some(String::from("BODIPY FL")),
+                },
+                ChannelMetadata {
+                    index: 31,
+                    id: None,
+                    label: String::from("neutral blue channel"),
+                    fluor: Some(String::from("Alexa Fluor 405")),
+                },
+                ChannelMetadata {
+                    index: 37,
+                    id: None,
+                    label: String::from("neutral green channel"),
+                    fluor: Some(String::from("BODIPY FL")),
                 },
             ],
-            pixel_size: None,
+            ..MetadataSummary::default()
         };
         let roles = default_channel_roles(&choices, &summary);
         assert_eq!(roles[&2], ChannelRole::Gray);
@@ -5628,6 +5662,8 @@ mod tests {
         assert_eq!(roles[&19], ChannelRole::Off);
         assert_eq!(roles[&23], ChannelRole::Blue);
         assert_eq!(roles[&29], ChannelRole::Green);
+        assert_eq!(roles[&31], ChannelRole::Blue);
+        assert_eq!(roles[&37], ChannelRole::Green);
 
         let fallback = default_channel_roles(&choices, &MetadataSummary::default());
         assert_eq!(fallback[&2], ChannelRole::Gray);
@@ -5663,19 +5699,22 @@ mod tests {
                     index: 0,
                     id: None,
                     label: String::from("Phase PH3"),
+                    fluor: None,
                 },
                 ChannelMetadata {
                     index: 4,
                     id: None,
                     label: String::from("AF405"),
+                    fluor: None,
                 },
                 ChannelMetadata {
                     index: 9,
                     id: None,
                     label: String::from("Bod493"),
+                    fluor: None,
                 },
             ],
-            pixel_size: None,
+            ..MetadataSummary::default()
         };
         let roles = HashMap::from([
             (0, ChannelRole::Gray),
@@ -5698,11 +5737,12 @@ mod tests {
                 index,
                 id: None,
                 label: "蛍".repeat(10_000),
+                fluor: None,
             })
             .collect();
         let summary = MetadataSummary {
             channels,
-            pixel_size: None,
+            ..MetadataSummary::default()
         };
         let active = (0..200)
             .map(|channel| PlaneKey::new(channel, SceneId::Implicit, 0, 0))
@@ -5725,8 +5765,9 @@ mod tests {
                 index: 4,
                 id: None,
                 label: String::from("AF405"),
+                fluor: None,
             }],
-            pixel_size: None,
+            ..MetadataSummary::default()
         };
         let roles = HashMap::from([(4, ChannelRole::Blue)]);
         let scale = PyramidScale::new(2, 1).expect("scale");
