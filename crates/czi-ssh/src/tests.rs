@@ -13,9 +13,9 @@ use crate::{
     connect_bridge_socket,
 };
 use crate::{
-    ControlPath, OPENSSH_PATH, OpenSshConfig, OpenSshConfigError, SftpError, SftpLocation,
-    SftpLocationError, SftpProtocolError, SftpSession, SftpSource, SharedSftpSession, SshProfile,
-    SshProfileError,
+    ControlPath, HostKeyAlias, LoopbackEndpoint, OPENSSH_PATH, OpenSshConfig, OpenSshConfigError,
+    SftpError, SftpLocation, SftpLocationError, SftpProtocolError, SftpSession, SftpSource,
+    SharedSftpSession, SshProfile, SshProfileError,
 };
 
 use super::{
@@ -308,7 +308,8 @@ fn command_builders_keep_paths_out_of_argv_and_preserve_host_checks() {
             .any(|pair| pair == ["-o", "ControlPath=none"])
     );
 
-    let interactive = OpenSshConfig::interactive_sftp_argv(&destination)
+    let interactive = OpenSshConfig::new()
+        .interactive_sftp_argv(&destination)
         .iter()
         .map(|argument| argument.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
@@ -333,7 +334,8 @@ fn command_builders_keep_paths_out_of_argv_and_preserve_host_checks() {
             .windows(2)
             .any(|pair| pair == ["-o", "ControlPath=none"])
     );
-    let embedded = OpenSshConfig::embedded_sftp_argv(&destination)
+    let embedded = OpenSshConfig::new()
+        .embedded_sftp_argv(&destination)
         .iter()
         .map(|argument| argument.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
@@ -390,6 +392,90 @@ fn command_builders_keep_paths_out_of_argv_and_preserve_host_checks() {
         );
     }
     std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn loopback_endpoint_is_validated_and_embedded_argv_is_exact() {
+    for invalid in [
+        "",
+        "-login.example",
+        "login-.example",
+        "login..example",
+        "login example",
+        "login=example",
+        "login/example",
+        "login_underscore.example",
+        "login\n.example",
+    ] {
+        assert!(
+            HostKeyAlias::new(invalid).is_err(),
+            "accepted invalid host-key alias {invalid:?}"
+        );
+    }
+    assert!(matches!(
+        HostKeyAlias::new(format!("{}.example", "a".repeat(64))),
+        Err(OpenSshConfigError::HostKeyAliasInvalidDnsName)
+    ));
+    assert!(matches!(
+        HostKeyAlias::new("a".repeat(254)),
+        Err(OpenSshConfigError::HostKeyAliasTooLong { length: 254 })
+    ));
+    let alias = HostKeyAlias::new("login-prod.pax.tufts.edu").expect("valid host-key alias");
+    assert_eq!(
+        LoopbackEndpoint::new(0, alias.clone()),
+        Err(OpenSshConfigError::LoopbackPortZero)
+    );
+    let endpoint = LoopbackEndpoint::new(41_337, alias).expect("valid loopback endpoint");
+    assert_eq!(endpoint.port(), 41_337);
+    assert_eq!(
+        endpoint.host_key_alias().as_str(),
+        "login-prod.pax.tufts.edu"
+    );
+    let config = OpenSshConfig::new().with_loopback_endpoint(endpoint);
+    let argv = config
+        .embedded_sftp_argv(&profile("login-prod.pax.tufts.edu"))
+        .into_iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        argv,
+        [
+            OPENSSH_PATH,
+            "-o",
+            "BatchMode=no",
+            "-o",
+            "ForwardAgent=no",
+            "-o",
+            "ForwardX11=no",
+            "-o",
+            "ClearAllForwardings=yes",
+            "-o",
+            "PermitLocalCommand=no",
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ControlPath=none",
+            "-o",
+            "HostName=127.0.0.1",
+            "-o",
+            "Port=41337",
+            "-o",
+            "HostKeyAlias=login-prod.pax.tufts.edu",
+            "-o",
+            "ProxyCommand=none",
+            "-o",
+            "ProxyJump=none",
+            "-o",
+            "StrictHostKeyChecking=ask",
+            "-T",
+            "-s",
+            "login-prod.pax.tufts.edu",
+            "sftp",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+    );
 }
 
 #[cfg(unix)]

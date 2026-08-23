@@ -370,8 +370,7 @@ impl SftpSession {
         config: &OpenSshConfig,
         executor: &std::path::Path,
     ) -> Result<(PendingEmbeddedSftpSession, SshConsole), SftpError> {
-        let _ = config;
-        let ssh_argv = OpenSshConfig::embedded_sftp_argv(profile);
+        let ssh_argv = config.embedded_sftp_argv(profile);
         #[cfg(target_os = "macos")]
         {
             let mut argv = Vec::with_capacity(ssh_argv.len() + 2);

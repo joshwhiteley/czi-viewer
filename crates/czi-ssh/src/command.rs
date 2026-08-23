@@ -149,10 +149,92 @@ fn set_private_permissions(_directory: &Path) -> Result<(), SftpError> {
     Ok(())
 }
 
+/// A bounded ASCII DNS name used only for OpenSSH host-key lookup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostKeyAlias(String);
+
+impl HostKeyAlias {
+    /// Validate an ASCII DNS name for `HostKeyAlias`.
+    ///
+    /// Names are limited to 253 bytes. Labels must be 1 to 63 bytes, contain only ASCII letters,
+    /// digits, or hyphens, and begin and end with a letter or digit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty, oversized, malformed, or non-ASCII DNS name.
+    pub fn new(value: impl Into<String>) -> Result<Self, OpenSshConfigError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(OpenSshConfigError::HostKeyAliasEmpty);
+        }
+        if value.len() > 253 {
+            return Err(OpenSshConfigError::HostKeyAliasTooLong {
+                length: value.len(),
+            });
+        }
+        if value.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        }) {
+            return Err(OpenSshConfigError::HostKeyAliasInvalidDnsName);
+        }
+        Ok(Self(value))
+    }
+
+    /// Return the validated DNS name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A validated loopback TCP endpoint for an SSH server reached through a local tunnel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoopbackEndpoint {
+    port: u16,
+    host_key_alias: HostKeyAlias,
+}
+
+impl LoopbackEndpoint {
+    /// Create a loopback endpoint while retaining host-key identity for the real SSH server.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `port` is zero. `host_key_alias` has already passed the same
+    /// DNS-name validation.
+    pub fn new(port: u16, host_key_alias: HostKeyAlias) -> Result<Self, OpenSshConfigError> {
+        if port == 0 {
+            return Err(OpenSshConfigError::LoopbackPortZero);
+        }
+        Ok(Self {
+            port,
+            host_key_alias,
+        })
+    }
+
+    /// Return the local TCP port.
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Return the host identity used for known-host verification.
+    #[must_use]
+    pub fn host_key_alias(&self) -> &HostKeyAlias {
+        &self.host_key_alias
+    }
+}
+
 /// OpenSSH settings used by SFTP and interactive bridge commands.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OpenSshConfig {
     control_path: Option<ControlPath>,
+    loopback_endpoint: Option<LoopbackEndpoint>,
 }
 
 impl OpenSshConfig {
@@ -169,10 +251,23 @@ impl OpenSshConfig {
         self
     }
 
+    /// Route SSH through a validated local TCP endpoint.
+    #[must_use]
+    pub fn with_loopback_endpoint(mut self, endpoint: LoopbackEndpoint) -> Self {
+        self.loopback_endpoint = Some(endpoint);
+        self
+    }
+
     /// Return the configured private bridge socket, if any.
     #[must_use]
     pub fn control_path(&self) -> Option<&ControlPath> {
         self.control_path.as_ref()
+    }
+
+    /// Return the configured loopback endpoint, if any.
+    #[must_use]
+    pub fn loopback_endpoint(&self) -> Option<&LoopbackEndpoint> {
+        self.loopback_endpoint.as_ref()
     }
 
     /// Build the production `/usr/bin/ssh` argument vector for an SFTP subsystem child.
@@ -183,7 +278,7 @@ impl OpenSshConfig {
     /// `ControlMaster`; remote paths belong in SFTP packets and cannot enter this vector.
     #[must_use]
     pub fn sftp_argv(&self, profile: &SshProfile) -> Vec<OsString> {
-        let mut argv = common_argv(true);
+        let mut argv = common_argv(true, self.loopback_endpoint.as_ref());
         argv.push(OsString::from("-T"));
         argv.push(OsString::from("-s"));
         argv.push(OsString::from(profile.as_str()));
@@ -196,10 +291,12 @@ impl OpenSshConfig {
     /// SSH stdin and stdout remain reserved for binary SFTP packets. Host-key, password, and 2FA
     /// interaction uses the child process's local controlling terminal through stderr and
     /// `/dev/tty`. The `-T` option disables only a *remote* terminal; it does not affect that local
-    /// PTY. This never configures `ControlMaster` or a control path.
+    /// PTY. This never configures `ControlMaster` or a control path. A configured loopback
+    /// endpoint overrides only network routing while preserving the destination profile's user
+    /// and other normal OpenSSH settings.
     #[must_use]
-    pub fn embedded_sftp_argv(profile: &SshProfile) -> Vec<OsString> {
-        let mut argv = common_argv(false);
+    pub fn embedded_sftp_argv(&self, profile: &SshProfile) -> Vec<OsString> {
+        let mut argv = common_argv(false, self.loopback_endpoint.as_ref());
         argv.push(OsString::from("-T"));
         argv.push(OsString::from("-s"));
         argv.push(OsString::from(profile.as_str()));
@@ -212,8 +309,8 @@ impl OpenSshConfig {
     /// This remains the visible-Terminal fallback and uses the same security arguments as the
     /// embedded PTY transport.
     #[must_use]
-    pub fn interactive_sftp_argv(profile: &SshProfile) -> Vec<OsString> {
-        Self::embedded_sftp_argv(profile)
+    pub fn interactive_sftp_argv(&self, profile: &SshProfile) -> Vec<OsString> {
+        self.embedded_sftp_argv(profile)
     }
 
     /// Build a safely shell-quoted command that starts the same executable's interactive SFTP
@@ -248,7 +345,7 @@ impl OpenSshConfig {
     }
 }
 
-fn common_argv(batch_mode: bool) -> Vec<OsString> {
+fn common_argv(batch_mode: bool, loopback_endpoint: Option<&LoopbackEndpoint>) -> Vec<OsString> {
     let mut argv = vec![OsString::from(OPENSSH_PATH)];
     push_option(
         &mut argv,
@@ -264,6 +361,16 @@ fn common_argv(batch_mode: bool) -> Vec<OsString> {
     push_option(&mut argv, "PermitLocalCommand=no");
     push_option(&mut argv, "ControlMaster=no");
     push_option(&mut argv, "ControlPath=none");
+    if let Some(endpoint) = loopback_endpoint {
+        push_option(&mut argv, "HostName=127.0.0.1");
+        push_option(&mut argv, &format!("Port={}", endpoint.port()));
+        push_option(
+            &mut argv,
+            &format!("HostKeyAlias={}", endpoint.host_key_alias().as_str()),
+        );
+        push_option(&mut argv, "ProxyCommand=none");
+        push_option(&mut argv, "ProxyJump=none");
+    }
     push_option(
         &mut argv,
         if batch_mode {

@@ -69,6 +69,17 @@ impl Error for SftpLocationError {}
 /// Why an OpenSSH control socket configuration was rejected.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OpenSshConfigError {
+    /// A host-key alias was empty.
+    HostKeyAliasEmpty,
+    /// A host-key alias exceeded the DNS-name limit.
+    HostKeyAliasTooLong {
+        /// Number of ASCII or UTF-8 bytes supplied.
+        length: usize,
+    },
+    /// A host-key alias was not a bounded ASCII DNS name.
+    HostKeyAliasInvalidDnsName,
+    /// A loopback TCP endpoint cannot use port zero.
+    LoopbackPortZero,
     /// An interactive bridge command needs a private socket.
     MissingControlPath,
     /// A control socket path cannot be copied safely into a terminal command.
@@ -93,6 +104,18 @@ pub enum OpenSshConfigError {
 impl fmt::Display for OpenSshConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::HostKeyAliasEmpty => formatter.write_str("host-key alias must not be empty"),
+            Self::HostKeyAliasTooLong { length } => {
+                write!(
+                    formatter,
+                    "host-key alias has {length} bytes; the limit is 253"
+                )
+            }
+            Self::HostKeyAliasInvalidDnsName => formatter
+                .write_str("host-key alias must be an ASCII DNS name with bounded nonempty labels"),
+            Self::LoopbackPortZero => {
+                formatter.write_str("loopback SSH endpoint port must not be zero")
+            }
             Self::MissingControlPath => formatter.write_str("a private bridge socket is required"),
             Self::NonUtf8ControlPath => {
                 formatter.write_str("control path must be UTF-8 for a copyable terminal command")

@@ -16,7 +16,7 @@ pub use bridge::BridgeCancellation;
 pub use bridge::{
     BridgeListener, authenticate_bridge_client, authenticate_bridge_server, connect_bridge_socket,
 };
-pub use command::{ControlPath, OPENSSH_PATH, OpenSshConfig};
+pub use command::{ControlPath, HostKeyAlias, LoopbackEndpoint, OPENSSH_PATH, OpenSshConfig};
 pub use error::{
     OpenSshConfigError, SftpError, SftpLocationError, SftpProtocolError, SshProfileError,
 };
