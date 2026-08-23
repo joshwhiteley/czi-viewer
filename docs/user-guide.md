@@ -4,7 +4,7 @@ CZI Viewer is a macOS-first desktop previewer for local and read-only remote CZI
 
 ## Start the viewer
 
-The source build needs stable Rust 1.85 or later:
+The source build needs stable Rust 1.88 or later:
 
 ```sh
 cargo run --release -p czi-viewer

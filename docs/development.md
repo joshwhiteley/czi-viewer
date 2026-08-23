@@ -1,6 +1,6 @@
 # Development
 
-CZI Viewer is a Rust workspace that requires stable Rust 1.85 or later.
+CZI Viewer is a Rust workspace that requires stable Rust 1.88 or later.
 
 ## Check a change
 
