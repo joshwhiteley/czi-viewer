@@ -230,16 +230,10 @@ mod macos {
             ));
         }
         validate_helper_path(&helper_path)?;
-        if std::env::var_os("reason").as_deref() != Some(OsStr::new("connect")) {
-            return Err(invalid_input("Tufts VPN script requires reason=connect"));
-        }
-        let vpn_fd =
-            std::env::var("VPNFD").map_err(|_| invalid_input("Tufts VPN script requires VPNFD"))?;
-        vpn_fd
-            .parse::<i32>()
-            .ok()
-            .filter(|descriptor| *descriptor >= 0)
-            .ok_or_else(|| invalid_input("Tufts VPN script VPNFD is invalid"))?;
+        validate_ocproxy_environment(
+            std::env::var_os("reason").as_deref(),
+            std::env::var_os("VPNFD").as_deref(),
+        )?;
         let pair = pair_from_environment()?;
         let port = port_from_environment()?;
         let forwarding = ocproxy_forwarding(port);
@@ -250,6 +244,21 @@ mod macos {
             .env_remove("SSH_ASKPASS_REQUIRE")
             .exec();
         Err(error)
+    }
+
+    fn validate_ocproxy_environment(
+        reason: Option<&OsStr>,
+        vpn_fd: Option<&OsStr>,
+    ) -> io::Result<()> {
+        if reason != Some(OsStr::new("pre-init")) {
+            return Err(invalid_input("Tufts VPN script requires reason=pre-init"));
+        }
+        vpn_fd
+            .and_then(OsStr::to_str)
+            .and_then(|descriptor| descriptor.parse::<i32>().ok())
+            .filter(|descriptor| *descriptor >= 0)
+            .ok_or_else(|| invalid_input("Tufts VPN script requires a valid VPNFD"))?;
+        Ok(())
     }
 
     fn validate_openconnect_exec_argv(pair: ToolPair, actual: &[OsString]) -> io::Result<()> {
@@ -561,6 +570,29 @@ mod macos {
             assert_eq!(intel, Some(TOOL_PAIRS[1]));
             assert!(find_tools_with(|path| path.ends_with("openconnect")).is_none());
             assert!(find_tools_with(|_| false).is_none());
+        }
+
+        #[test]
+        fn ocproxy_helper_accepts_only_pre_init_with_a_valid_vpnfd() {
+            assert!(
+                validate_ocproxy_environment(Some(OsStr::new("pre-init")), Some(OsStr::new("7")),)
+                    .is_ok()
+            );
+            for reason in [Some("connect"), Some("disconnect"), None] {
+                assert!(
+                    validate_ocproxy_environment(reason.map(OsStr::new), Some(OsStr::new("7")),)
+                        .is_err()
+                );
+            }
+            for vpn_fd in [None, Some(""), Some("-1"), Some("not-a-descriptor")] {
+                assert!(
+                    validate_ocproxy_environment(
+                        Some(OsStr::new("pre-init")),
+                        vpn_fd.map(OsStr::new),
+                    )
+                    .is_err()
+                );
+            }
         }
 
         #[test]
