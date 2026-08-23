@@ -28,6 +28,6 @@ mod macos;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    Cancellation, Child, PtyMaster, SpawnedPty, claim_controlling_terminal,
-    claim_controlling_terminal_and_exec, spawn,
+    Cancellation, Child, PtyMaster, SpawnedPty, SpawnedTerminal, claim_controlling_terminal,
+    claim_controlling_terminal_and_exec, spawn, spawn_terminal,
 };

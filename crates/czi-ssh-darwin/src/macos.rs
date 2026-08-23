@@ -19,7 +19,8 @@ const SSH_ASKPASS: &str = "SSH_ASKPASS";
 const SSH_ASKPASS_REQUIRE: &str = "SSH_ASKPASS_REQUIRE";
 const CHILD_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
-static EMBEDDED_CHILD_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SSH_CHILD_ACTIVE: AtomicBool = AtomicBool::new(false);
+static TERMINAL_CHILD_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn spawn_lock() -> &'static Mutex<()> {
     static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
@@ -73,6 +74,16 @@ pub struct SpawnedPty {
     /// Parent master side of the child's controlling terminal.
     pub pty_master: PtyMaster,
     /// Process lifecycle handle. Dropping it terminates and reaps the child.
+    pub child: Child,
+    /// Cloneable, non-reaping cancellation handle.
+    pub cancellation: Cancellation,
+}
+
+/// A spawned terminal child whose fd 0, fd 1, and fd 2 all refer to one echo-disabled PTY.
+pub struct SpawnedTerminal {
+    /// Parent master side of the child's terminal.
+    pub pty_master: PtyMaster,
+    /// Process lifecycle handle. Dropping it terminates and reaps the child group.
     pub child: Child,
     /// Cloneable, non-reaping cancellation handle.
     pub cancellation: Cancellation,
@@ -209,7 +220,7 @@ impl PtyMaster {
 /// A child process started by [`spawn`].
 pub struct Child {
     state: Arc<ProcessState>,
-    lease: Option<EmbeddedChildLease>,
+    lease: Option<ChildRoleLease>,
 }
 
 /// A cloneable cancellation handle that never reaps the process itself.
@@ -230,25 +241,32 @@ struct ProcessLifecycle {
     process_group_terminated: bool,
 }
 
-struct EmbeddedChildLease;
+#[derive(Clone, Copy)]
+enum ChildRole {
+    Ssh,
+    Terminal,
+}
 
-impl EmbeddedChildLease {
-    fn acquire() -> io::Result<Self> {
-        EMBEDDED_CHILD_ACTIVE
+struct ChildRoleLease {
+    active: &'static AtomicBool,
+}
+
+impl ChildRoleLease {
+    fn acquire(role: ChildRole) -> io::Result<Self> {
+        let (active, message) = match role {
+            ChildRole::Ssh => (&SSH_CHILD_ACTIVE, "an embedded SSH child is already active"),
+            ChildRole::Terminal => (&TERMINAL_CHILD_ACTIVE, "a terminal child is already active"),
+        };
+        active
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .map(|_| Self)
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "an embedded SSH child is already active",
-                )
-            })
+            .map(|_| Self { active })
+            .map_err(|_| io::Error::new(io::ErrorKind::AlreadyExists, message))
     }
 }
 
-impl Drop for EmbeddedChildLease {
+impl Drop for ChildRoleLease {
     fn drop(&mut self) {
-        EMBEDDED_CHILD_ACTIVE.store(false, Ordering::Release);
+        self.active.store(false, Ordering::Release);
     }
 }
 
@@ -536,7 +554,7 @@ fn try_reap_terminated_child(
     Err(error)
 }
 
-fn reap_child_in_background(state: Arc<ProcessState>, lease: EmbeddedChildLease) {
+fn reap_child_in_background(state: Arc<ProcessState>, lease: ChildRoleLease) {
     let lease = Arc::new(lease);
     let reaper_lease = Arc::clone(&lease);
     let spawned = std::thread::Builder::new()
@@ -673,7 +691,7 @@ pub fn spawn(
         ));
     }
     ensure_child_reaping_is_available()?;
-    let lease = EmbeddedChildLease::acquire()?;
+    let lease = ChildRoleLease::acquire(ChildRole::Ssh)?;
     let _spawn_guard = spawn_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -734,6 +752,98 @@ pub fn spawn(
     Ok(SpawnedPty {
         stdin: stdin_write,
         stdout: stdout_read,
+        pty_master: PtyMaster { file: pty_master },
+        child: Child {
+            state: Arc::clone(&state),
+            lease: Some(lease),
+        },
+        cancellation: Cancellation { state },
+    })
+}
+
+/// Spawn an absolute-path program with fd 0, fd 1, and fd 2 on one echo-disabled PTY.
+///
+/// One terminal child may run concurrently with one child from [`spawn`]. A second terminal child
+/// is rejected until the first is reaped. The child receives no ASKPASS environment variables and
+/// is a private session/process-group leader. Because Darwin applies file actions before
+/// `POSIX_SPAWN_SETSID`, a same-executable helper must call [`claim_controlling_terminal`] before
+/// replacing itself with a program that requires `/dev/tty`.
+///
+/// # Errors
+///
+/// Returns an error for a non-absolute executable, mismatched argv, unavailable exclusive reaping,
+/// a duplicate terminal role, invalid arguments or environment, PTY setup, or spawn failure.
+pub fn spawn_terminal(
+    executable: &Path,
+    argv: &[OsString],
+    extra_environment: &[(OsString, OsString)],
+) -> io::Result<SpawnedTerminal> {
+    if !executable.is_absolute() {
+        return Err(invalid_input("terminal executable must be absolute"));
+    }
+    if argv
+        .first()
+        .is_none_or(|argument| argument.as_os_str() != executable.as_os_str())
+    {
+        return Err(invalid_input("terminal argv[0] must equal its executable"));
+    }
+    ensure_child_reaping_is_available()?;
+    let lease = ChildRoleLease::acquire(ChildRole::Terminal)?;
+    let _spawn_guard = spawn_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let executable = c_string(executable.as_os_str(), "terminal executable")?;
+    let arguments = argv
+        .iter()
+        .map(|argument| c_string(argument, "terminal argument"))
+        .collect::<io::Result<Vec<_>>>()?;
+    let environment = child_environment(extra_environment)?;
+    let (pty_master, pty_slave) = open_pty()?;
+
+    let mut actions = FileActions::new()?;
+    actions.add_dup2(pty_slave.as_raw_fd(), libc::STDIN_FILENO)?;
+    actions.add_dup2(pty_slave.as_raw_fd(), libc::STDOUT_FILENO)?;
+    actions.add_dup2(pty_slave.as_raw_fd(), libc::STDERR_FILENO)?;
+
+    let mut attributes = SpawnAttributes::new()?;
+    attributes.set_flags(POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT)?;
+
+    let mut argv_pointers = arguments
+        .iter()
+        .map(|argument| argument.as_ptr().cast_mut())
+        .collect::<Vec<_>>();
+    argv_pointers.push(ptr::null_mut());
+    let mut env_pointers = environment
+        .iter()
+        .map(|entry| entry.as_ptr().cast_mut())
+        .collect::<Vec<_>>();
+    env_pointers.push(ptr::null_mut());
+
+    let mut pid = 0;
+    // SAFETY: all C strings and pointer vectors remain alive for this synchronous call. The file
+    // action and attribute handles were initialized by Darwin and are destroyed after this call.
+    let result = unsafe {
+        libc::posix_spawn(
+            &mut pid,
+            executable.as_ptr(),
+            &actions.raw,
+            &attributes.raw,
+            argv_pointers.as_ptr(),
+            env_pointers.as_ptr(),
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result));
+    }
+    let state = Arc::new(ProcessState {
+        pid,
+        lifecycle: Mutex::new(ProcessLifecycle {
+            leader_reaped: false,
+            process_group_terminated: false,
+        }),
+    });
+    Ok(SpawnedTerminal {
         pty_master: PtyMaster { file: pty_master },
         child: Child {
             state: Arc::clone(&state),
@@ -968,6 +1078,7 @@ mod tests {
     const AUTO_REAP_MODE: &str = "CZI_SSH_DARWIN_TEST_AUTO_REAP";
     const CLOSED_STANDARD_DESCRIPTORS_MODE: &str =
         "CZI_SSH_DARWIN_TEST_CLOSED_STANDARD_DESCRIPTORS";
+    const TERMINAL_LAYOUT_MODE: &str = "CZI_SSH_DARWIN_TEST_TERMINAL_LAYOUT";
 
     #[test]
     fn spawn_removes_askpass_environment() {
@@ -1024,6 +1135,100 @@ mod tests {
         drop(first);
         let second = spawn(&executable, &argv, &[]).expect("start child after first reaped");
         drop(second);
+    }
+
+    #[test]
+    fn one_ssh_and_one_terminal_child_can_run_concurrently_but_duplicate_roles_are_rejected() {
+        let _guard = embedded_child_test_lock()
+            .lock()
+            .expect("embedded child test lock");
+        let executable = Path::new("/bin/sleep");
+        let argv = vec![executable.as_os_str().to_os_string(), OsString::from("30")];
+        let ssh = spawn(executable, &argv, &[]).expect("start SSH-role child");
+        let terminal = spawn_terminal(executable, &argv, &[]).expect("start terminal-role child");
+
+        let ssh_error = spawn(executable, &argv, &[])
+            .err()
+            .expect("reject duplicate SSH child");
+        assert_eq!(ssh_error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(ssh_error.to_string().contains("SSH child"));
+        let terminal_error = spawn_terminal(executable, &argv, &[])
+            .err()
+            .expect("reject duplicate terminal child");
+        assert_eq!(terminal_error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(terminal_error.to_string().contains("terminal child"));
+
+        drop((ssh, terminal));
+        let replacement =
+            spawn_terminal(executable, &argv, &[]).expect("terminal role released after reap");
+        drop(replacement);
+    }
+
+    #[test]
+    fn terminal_layout_child_entry() {
+        if std::env::var_os(TERMINAL_LAYOUT_MODE).is_none() {
+            return;
+        }
+        for descriptor in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+            // SAFETY: the three fixed standard descriptors are valid for this dedicated child.
+            assert_eq!(unsafe { libc::isatty(descriptor) }, 1);
+            let mut settings = std::mem::MaybeUninit::<libc::termios>::uninit();
+            // SAFETY: settings is writable and the descriptor was confirmed as a terminal.
+            assert_eq!(
+                unsafe { libc::tcgetattr(descriptor, settings.as_mut_ptr()) },
+                0
+            );
+            // SAFETY: tcgetattr initialized settings on success.
+            let settings = unsafe { settings.assume_init() };
+            assert_eq!(settings.c_lflag & (libc::ECHO | libc::ECHONL), 0);
+        }
+        eprintln!("terminal-layout-ok");
+    }
+
+    #[test]
+    fn terminal_child_has_echo_disabled_pty_on_all_standard_descriptors() {
+        let _guard = embedded_child_test_lock()
+            .lock()
+            .expect("embedded child test lock");
+        let executable = std::env::current_exe().expect("current test executable");
+        let argv = vec![
+            executable.clone().into_os_string(),
+            "--exact".into(),
+            "macos::tests::terminal_layout_child_entry".into(),
+            "--nocapture".into(),
+        ];
+        let environment = vec![(OsString::from(TERMINAL_LAYOUT_MODE), OsString::from("1"))];
+        let SpawnedTerminal {
+            mut pty_master,
+            mut child,
+            cancellation: _,
+        } = spawn_terminal(&executable, &argv, &environment).expect("spawn terminal layout child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut output = Vec::new();
+        while !output
+            .windows(b"terminal-layout-ok".len())
+            .any(|window| window == b"terminal-layout-ok")
+        {
+            pty_master
+                .read_available(&mut output, 16 * 1024)
+                .expect("read terminal child output");
+            if child.try_wait().expect("inspect terminal child").is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "terminal child timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            output
+                .windows(b"terminal-layout-ok".len())
+                .any(|window| window == b"terminal-layout-ok"),
+            "terminal child did not verify its descriptors: {}",
+            String::from_utf8_lossy(&output)
+        );
+        let _ = child.wait();
     }
 
     #[test]
@@ -1150,6 +1355,42 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "descendant process group {process_group} survived leader reaping"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn terminal_reaping_terminates_its_descendant_group() {
+        let _guard = embedded_child_test_lock()
+            .lock()
+            .expect("embedded child test lock");
+        let executable = std::env::current_exe().expect("current czi-ssh-darwin test executable");
+        let argv = vec![
+            executable.clone().into_os_string(),
+            "--exact".into(),
+            "macos::tests::descendant_child_entry".into(),
+            "--nocapture".into(),
+        ];
+        let extra_environment = vec![(OsString::from(DESCENDANT_MODE), OsString::from("1"))];
+        let SpawnedTerminal {
+            pty_master,
+            mut child,
+            cancellation,
+        } = spawn_terminal(&executable, &argv, &extra_environment)
+            .expect("spawn terminal descendant test child");
+        let process_group = child.id();
+        drop(pty_master);
+        assert!(child.wait().expect("reap terminal leader").is_some());
+        cancellation
+            .cancel()
+            .expect("terminal cancellation after leader reap is group-safe");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !process_group_is_gone(process_group).expect("inspect terminal descendant group") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "terminal descendant process group {process_group} survived leader reaping"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
