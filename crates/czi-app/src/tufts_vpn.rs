@@ -230,10 +230,7 @@ mod macos {
             ));
         }
         validate_helper_path(&helper_path)?;
-        validate_ocproxy_environment(
-            std::env::var_os("reason").as_deref(),
-            std::env::var_os("VPNFD").as_deref(),
-        )?;
+        validate_vpnfd(std::env::var_os("VPNFD").as_deref())?;
         let pair = pair_from_environment()?;
         let port = port_from_environment()?;
         let forwarding = ocproxy_forwarding(port);
@@ -246,13 +243,7 @@ mod macos {
         Err(error)
     }
 
-    fn validate_ocproxy_environment(
-        reason: Option<&OsStr>,
-        vpn_fd: Option<&OsStr>,
-    ) -> io::Result<()> {
-        if reason != Some(OsStr::new("pre-init")) {
-            return Err(invalid_input("Tufts VPN script requires reason=pre-init"));
-        }
+    fn validate_vpnfd(vpn_fd: Option<&OsStr>) -> io::Result<()> {
         vpn_fd
             .and_then(OsStr::to_str)
             .and_then(|descriptor| descriptor.parse::<i32>().ok())
@@ -573,25 +564,19 @@ mod macos {
         }
 
         #[test]
-        fn ocproxy_helper_accepts_only_pre_init_with_a_valid_vpnfd() {
-            assert!(
-                validate_ocproxy_environment(Some(OsStr::new("pre-init")), Some(OsStr::new("7")),)
-                    .is_ok()
-            );
-            for reason in [Some("connect"), Some("disconnect"), None] {
+        fn ocproxy_helper_accepts_valid_vpnfd_regardless_of_reason() {
+            for reported_reason in [Some("pre-init"), Some("connect"), Some("disconnect"), None] {
                 assert!(
-                    validate_ocproxy_environment(reason.map(OsStr::new), Some(OsStr::new("7")),)
-                        .is_err()
+                    validate_vpnfd(Some(OsStr::new("7"))).is_ok(),
+                    "reason must be ignored: {reported_reason:?}"
                 );
             }
+        }
+
+        #[test]
+        fn ocproxy_helper_rejects_missing_or_invalid_vpnfd() {
             for vpn_fd in [None, Some(""), Some("-1"), Some("not-a-descriptor")] {
-                assert!(
-                    validate_ocproxy_environment(
-                        Some(OsStr::new("pre-init")),
-                        vpn_fd.map(OsStr::new),
-                    )
-                    .is_err()
-                );
+                assert!(validate_vpnfd(vpn_fd.map(OsStr::new)).is_err());
             }
         }
 

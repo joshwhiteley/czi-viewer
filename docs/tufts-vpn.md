@@ -86,7 +86,7 @@ The viewer starts OpenConnect with `--script-tun`. DTLS remains enabled for thro
 ocproxy -L <ephemeral-port>:login-prod.pax.tufts.edu:22
 ```
 
-OpenConnect may use its own shell to start the fixed script command. The helper accepts only OpenConnect's `reason=pre-init` script-tun launch with a valid `VPNFD`, then replaces itself with ocproxy. It rejects connect, disconnect, missing-reason, and invalid-descriptor invocations. No username, password, remote file path, prompt output, or other user-controlled text enters that command.
+OpenConnect may use its own shell to start the fixed script command. OpenConnect script-tun versions differ in whether they provide `reason`, so the helper intentionally ignores that variable. A valid nonnegative `VPNFD` is authoritative and required before the helper replaces itself with ocproxy. Missing or invalid descriptors are rejected. No username, password, remote file path, prompt output, or other user-controlled text enters that command.
 
 After a bounded SSH banner is received while OpenConnect is still live, the viewer starts system OpenSSH with these effective routing overrides:
 
