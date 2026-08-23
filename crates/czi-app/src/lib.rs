@@ -8,6 +8,7 @@ mod tufts_vpn;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -75,14 +76,13 @@ enum RemoteConnectionMode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RemoteConnectionIdentity {
     DirectSsh { profile: String },
-    TuftsVpn { username: String },
+    TuftsVpn { username: String, profile: String },
 }
 
 impl RemoteConnectionIdentity {
     fn profile(&self) -> &str {
         match self {
-            Self::DirectSsh { profile } => profile,
-            Self::TuftsVpn { .. } => tufts_vpn::TARGET_HOST,
+            Self::DirectSsh { profile } | Self::TuftsVpn { profile, .. } => profile,
         }
     }
 }
@@ -751,6 +751,7 @@ struct ConsolePumpSnapshot {
 
 enum ConsolePumpCommand {
     Input(Vec<u8>),
+    ClearTranscript,
     Stop,
 }
 
@@ -780,11 +781,18 @@ impl AuthenticationConsole {
             Self::Vpn(console) => console.write_input(input).map_err(sanitize_error),
         }
     }
+
+    fn clear_transcript(&mut self) {
+        if let Self::Vpn(console) = self {
+            console.clear_transcript();
+        }
+    }
 }
 
 struct ConsolePump {
     commands: SyncSender<ConsolePumpCommand>,
     snapshot: Arc<Mutex<ConsolePumpSnapshot>>,
+    clear_pending: Arc<AtomicBool>,
 }
 
 impl ConsolePump {
@@ -792,11 +800,24 @@ impl ConsolePump {
         let (commands, command_rx) = mpsc::sync_channel(CONSOLE_PUMP_INPUT_CAPACITY);
         let snapshot = Arc::new(Mutex::new(ConsolePumpSnapshot::default()));
         let worker_snapshot = Arc::clone(&snapshot);
+        let clear_pending = Arc::new(AtomicBool::new(false));
+        let worker_clear_pending = Arc::clone(&clear_pending);
         let _pump = thread::Builder::new()
             .name(String::from("czi-ssh-console-pump"))
-            .spawn(move || pump_console(console, &command_rx, &worker_snapshot))
+            .spawn(move || {
+                pump_console(
+                    console,
+                    &command_rx,
+                    &worker_snapshot,
+                    &worker_clear_pending,
+                );
+            })
             .map_err(|source| czi_ssh::SftpError::Spawn { source })?;
-        Ok(Self { commands, snapshot })
+        Ok(Self {
+            commands,
+            snapshot,
+            clear_pending,
+        })
     }
 
     fn snapshot(&self) -> ConsolePumpSnapshot {
@@ -804,6 +825,14 @@ impl ConsolePump {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    fn clear_transcript(&self) {
+        self.clear_pending.store(true, Ordering::Release);
+        if let Ok(mut snapshot) = self.snapshot.lock() {
+            snapshot.transcript.clear();
+        }
+        let _ = self.commands.try_send(ConsolePumpCommand::ClearTranscript);
     }
 
     fn try_send_input(&self, input: Vec<u8>) -> Result<(), String> {
@@ -833,14 +862,20 @@ fn pump_console(
     mut console: AuthenticationConsole,
     commands: &Receiver<ConsolePumpCommand>,
     snapshot: &Mutex<ConsolePumpSnapshot>,
+    clear_pending: &AtomicBool,
 ) {
     loop {
+        clear_console_transcript_if_requested(&mut console, snapshot, clear_pending);
         loop {
             match commands.try_recv() {
                 Ok(ConsolePumpCommand::Input(input)) => {
                     if let Err(error) = console.write_input(&input) {
                         set_console_pump_error(snapshot, error);
                     }
+                }
+                Ok(ConsolePumpCommand::ClearTranscript) => {
+                    clear_pending.store(true, Ordering::Release);
+                    clear_console_transcript_if_requested(&mut console, snapshot, clear_pending);
                 }
                 Ok(ConsolePumpCommand::Stop) | Err(TryRecvError::Disconnected) => return,
                 Err(TryRecvError::Empty) => break,
@@ -849,8 +884,13 @@ fn pump_console(
         if let Err(error) = console.drain_output() {
             set_console_pump_error(snapshot, error);
         }
+        clear_console_transcript_if_requested(&mut console, snapshot, clear_pending);
         if let Ok(mut snapshot) = snapshot.lock() {
-            console.transcript().clone_into(&mut snapshot.transcript);
+            if clear_pending.load(Ordering::Acquire) {
+                snapshot.transcript.clear();
+            } else {
+                console.transcript().clone_into(&mut snapshot.transcript);
+            }
         }
         match commands.recv_timeout(Duration::from_millis(16)) {
             Ok(ConsolePumpCommand::Input(input)) => {
@@ -858,9 +898,26 @@ fn pump_console(
                     set_console_pump_error(snapshot, error);
                 }
             }
+            Ok(ConsolePumpCommand::ClearTranscript) => {
+                clear_pending.store(true, Ordering::Release);
+            }
             Ok(ConsolePumpCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
+    }
+}
+
+fn clear_console_transcript_if_requested(
+    console: &mut AuthenticationConsole,
+    snapshot: &Mutex<ConsolePumpSnapshot>,
+    clear_pending: &AtomicBool,
+) {
+    if !clear_pending.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    console.clear_transcript();
+    if let Ok(mut snapshot) = snapshot.lock() {
+        snapshot.transcript.clear();
     }
 }
 
@@ -1579,7 +1636,7 @@ fn ensure_remote_connection(
     vpn_session: &mut Option<WorkerVpnSession>,
     connection: &EmbeddedConnectionContext<'_>,
 ) -> Result<OpenSshConfig, String> {
-    let RemoteConnectionIdentity::TuftsVpn { username } = requested else {
+    let RemoteConnectionIdentity::TuftsVpn { username, .. } = requested else {
         *vpn_session = None;
         connection.vpn_cancellation.clear(connection.generation);
         return Ok(OpenSshConfig::new());
@@ -3016,8 +3073,11 @@ impl ViewerApp {
                 let username = self.vpn_username_input.trim();
                 tufts_vpn::VpnUsername::new(username.to_owned())
                     .map_err(|error| error.to_string())?;
+                let profile = self.ssh_profile_input.trim();
+                SshProfile::new(profile.to_owned()).map_err(|error| error.to_string())?;
                 Ok(RemoteConnectionIdentity::TuftsVpn {
                     username: username.to_owned(),
+                    profile: profile.to_owned(),
                 })
             }
         }
@@ -3833,6 +3893,7 @@ impl ViewerApp {
                     && authentication.generation == connection_generation
                     && authentication.phase == AuthenticationPhase::TuftsVpn
                 {
+                    authentication.console.clear_transcript();
                     authentication.status = AuthenticationStatus::Authenticated;
                 }
                 self.authentication_focus_request = None;
@@ -4314,11 +4375,20 @@ impl ViewerApp {
                             ui.add_enabled(
                                 !profile_locked,
                                 egui::TextEdit::singleline(&mut self.vpn_username_input)
-                                    .hint_text("Tufts username")
+                                    .hint_text("Tufts VPN username")
                                     .desired_width(f32::INFINITY),
                             );
                         });
-                        ui.weak(format!("Fixed SSH target: {}", tufts_vpn::TARGET_HOST));
+                        ui.horizontal(|ui| {
+                            ui.label("SSH profile");
+                            ui.add_enabled(
+                                !profile_locked,
+                                egui::TextEdit::singleline(&mut self.ssh_profile_input)
+                                    .hint_text("jwhite22@login-prod.pax.tufts.edu")
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                        ui.weak(format!("Fixed SSH route: {}", tufts_vpn::TARGET_HOST));
                         ui.colored_label(
                             egui::Color32::GOLD,
                             "Requires a pre-verified known_hosts entry; first-use trust is disabled.",
@@ -4400,7 +4470,7 @@ impl ViewerApp {
                     "Enter an SSH profile, then select Connect to browse remote CZI files."
                 }
                 RemoteConnectionMode::TuftsVpn => {
-                    "Enter your Tufts VPN username, then select Connect."
+                    "Enter the VPN username and SSH profile, then select Connect."
                 }
             });
             return;
@@ -7093,6 +7163,15 @@ mod tests {
         };
         let vpn = RemoteConnectionIdentity::TuftsVpn {
             username: String::from("jdoe"),
+            profile: String::from("jwhite22@login-prod.pax.tufts.edu"),
+        };
+        let vpn_other_username = RemoteConnectionIdentity::TuftsVpn {
+            username: String::from("other-vpn-user"),
+            profile: String::from("jwhite22@login-prod.pax.tufts.edu"),
+        };
+        let vpn_other_profile = RemoteConnectionIdentity::TuftsVpn {
+            username: String::from("jdoe"),
+            profile: String::from("other-ssh-user@login-prod.pax.tufts.edu"),
         };
         assert!(reuses_remote_connection(
             &direct,
@@ -7125,6 +7204,20 @@ mod tests {
             None,
         ));
         assert!(!reuses_remote_connection(&vpn, 7, None, Some((&direct, 7))));
+        assert!(reuses_remote_connection(&vpn, 7, None, Some((&vpn, 7))));
+        assert!(!reuses_remote_connection(
+            &vpn,
+            7,
+            None,
+            Some((&vpn_other_username, 7)),
+        ));
+        assert!(!reuses_remote_connection(
+            &vpn,
+            7,
+            None,
+            Some((&vpn_other_profile, 7)),
+        ));
+        assert_eq!(vpn.profile(), "jwhite22@login-prod.pax.tufts.edu");
     }
 
     #[test]
@@ -7135,6 +7228,7 @@ mod tests {
         };
         let vpn = RemoteConnectionIdentity::TuftsVpn {
             username: String::from("jdoe"),
+            profile: String::from("jwhite22@login-prod.pax.tufts.edu"),
         };
         assert!(matches_worker_remote_session(
             RemoteSessionKey {
@@ -7173,7 +7267,7 @@ mod tests {
             },
             RemoteSessionKey {
                 connection: &vpn,
-                profile: tufts_vpn::TARGET_HOST,
+                profile: "jwhite22@login-prod.pax.tufts.edu",
                 config: &config,
                 generation: 7,
             },
@@ -7256,8 +7350,9 @@ mod tests {
         let endpoint = config.loopback_endpoint().expect("loopback endpoint");
         assert_eq!(endpoint.port(), 41_337);
         assert_eq!(endpoint.host_key_alias().as_str(), tufts_vpn::TARGET_HOST);
+        let ssh_profile = "jwhite22@login-prod.pax.tufts.edu";
         let argv = config
-            .embedded_sftp_argv(&SshProfile::new(tufts_vpn::TARGET_HOST).unwrap())
+            .embedded_sftp_argv(&SshProfile::new(ssh_profile).unwrap())
             .into_iter()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
@@ -7275,7 +7370,7 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == ["-o", "StrictHostKeyChecking=ask"])
         );
-        assert_eq!(argv[argv.len() - 2], tufts_vpn::TARGET_HOST);
+        assert_eq!(argv[argv.len() - 2], ssh_profile);
     }
 
     #[test]

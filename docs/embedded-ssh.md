@@ -13,7 +13,7 @@ Use the in-app browser to open a remote CZI through an existing OpenSSH profile.
 
 The viewer opens one read-only SFTP session after authentication. Browsing, opening, and reading the selected CZI use that session. They do not prompt again. Change the profile or select **Reconnect** when you need a new session.
 
-For the optional viewer-managed connection to `login-prod.pax.tufts.edu`, see [Tufts VPN mode](tufts-vpn.md). It establishes one local ocproxy endpoint, then reuses the same embedded SSH and persistent SFTP transport described here.
+For the optional viewer-managed connection to `login-prod.pax.tufts.edu`, see [Tufts VPN mode](tufts-vpn.md). It takes separate VPN username and SSH profile values, establishes one local ocproxy endpoint, then reuses the same embedded SSH and persistent SFTP transport described here.
 
 ## Authentication console
 

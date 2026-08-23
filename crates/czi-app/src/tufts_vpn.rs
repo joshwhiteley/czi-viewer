@@ -106,6 +106,11 @@ mod macos {
             &self.transcript
         }
 
+        pub fn clear_transcript(&mut self) {
+            self.transcript.clear();
+            self.latest_output.clear();
+        }
+
         pub fn write_input(&mut self, input: &[u8]) -> io::Result<()> {
             self.master.write_input(input)
         }
@@ -248,7 +253,7 @@ mod macos {
     }
 
     fn validate_openconnect_exec_argv(pair: ToolPair, actual: &[OsString]) -> io::Result<()> {
-        if actual.len() != 9
+        if actual.len() != 8
             || actual[0] != pair.openconnect().as_os_str()
             || actual[1] != "--user"
             || VpnUsername::new(actual[2].to_string_lossy().into_owned()).is_err()
@@ -256,8 +261,7 @@ mod macos {
             || actual[4] != "--script"
             || !safe_helper_argument(Path::new(&actual[5]))
             || actual[6] != "--protocol=anyconnect"
-            || actual[7] != "--no-dtls"
-            || actual[8] != GATEWAY
+            || actual[7] != GATEWAY
         {
             return Err(invalid_input(
                 "invalid fixed Tufts VPN OpenConnect arguments",
@@ -282,7 +286,6 @@ mod macos {
             "--script".into(),
             helper.as_os_str().to_os_string(),
             "--protocol=anyconnect".into(),
-            "--no-dtls".into(),
             GATEWAY.into(),
         ]
     }
@@ -578,7 +581,6 @@ mod macos {
                     OsStr::new("--script"),
                     helper.as_os_str(),
                     OsStr::new("--protocol=anyconnect"),
-                    OsStr::new("--no-dtls"),
                     OsStr::new(GATEWAY),
                 ]
             );
@@ -600,7 +602,7 @@ mod macos {
             actual[4] = "--script=/tmp/user-text".into();
             assert!(validate_openconnect_exec_argv(TOOL_PAIRS[0], &actual).is_err());
             let mut actual = argv[2..].to_vec();
-            actual[8] = "https://example.test/".into();
+            actual[7] = "https://example.test/".into();
             assert!(validate_openconnect_exec_argv(TOOL_PAIRS[0], &actual).is_err());
         }
 
@@ -636,6 +638,54 @@ mod macos {
             .unwrap_err();
             cancellation.join().unwrap();
             assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        }
+
+        #[test]
+        fn vpn_console_pump_clears_transcript_and_never_echoes_input() {
+            let executable = Path::new("/bin/sleep");
+            let argv = vec![executable.as_os_str().to_os_string(), OsString::from("30")];
+            let czi_ssh_darwin::SpawnedTerminal {
+                pty_master,
+                child,
+                cancellation,
+            } = czi_ssh_darwin::spawn_terminal(executable, &argv, &[])
+                .expect("spawn VPN console test child");
+            let console = VpnConsole {
+                master: pty_master,
+                transcript: String::from("retained-vpn-authentication"),
+                latest_output: String::from("retained-latest-output"),
+            };
+            let pump = crate::ConsolePump::spawn(crate::AuthenticationConsole::Vpn(console))
+                .expect("spawn VPN console pump");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !pump
+                .snapshot()
+                .transcript
+                .contains("retained-vpn-authentication")
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "VPN transcript was not published"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            pump.clear_transcript();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !pump.snapshot().transcript.is_empty() {
+                assert!(Instant::now() < deadline, "VPN transcript was not cleared");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            pump.try_send_input(b"opaque-vpn-input".to_vec())
+                .expect("send immediate terminal input");
+            std::thread::sleep(Duration::from_millis(30));
+            assert!(pump.snapshot().transcript.is_empty());
+
+            drop(pump);
+            cancellation
+                .cancel()
+                .expect("cancel VPN console test child");
+            drop(child);
         }
 
         #[test]
