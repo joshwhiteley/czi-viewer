@@ -5,14 +5,64 @@ use std::sync::{
 };
 
 use czi_core::{
-    CziDataset, LocalFileSource, PlaneSelector, RandomAccessSource, SourceError, SourceInfo,
-    TileQueryIndex, ViewQuery,
+    CziDataset, LocalFileSource, MetadataDocument, MetadataParseOptions, PlaneSelector,
+    RandomAccessSource, SourceError, SourceInfo, TileQueryIndex, ViewQuery, summarize_metadata,
 };
 
 #[derive(Clone)]
 struct CountingSource {
     inner: Arc<LocalFileSource>,
     reads: Arc<AtomicUsize>,
+}
+
+#[test]
+#[ignore = "requires the local HADA fixture and CZI_RUN_FIXTURES=1"]
+fn hada_metadata_summary_survives_bounded_tree_retention() {
+    if std::env::var_os("CZI_RUN_FIXTURES").is_none() {
+        return;
+    }
+    let path = hada_path();
+    assert!(path.is_file(), "missing HADA fixture: {}", path.display());
+    let dataset = CziDataset::open(LocalFileSource::open(path).expect("fixture source"))
+        .expect("fixture index");
+    let xml = &dataset
+        .index()
+        .metadata
+        .as_ref()
+        .expect("global metadata")
+        .xml;
+    let document = MetadataDocument::parse(
+        xml,
+        MetadataParseOptions {
+            retain_raw_xml: true,
+            ..MetadataParseOptions::default()
+        },
+    );
+    let summary = summarize_metadata(&document);
+
+    assert_eq!(xml.len(), 609_577);
+    assert!(document.root.is_some());
+    assert_eq!(summary.channels.len(), 3);
+    assert_eq!(summary.channels[0].label, "Phase PH3");
+    assert_eq!(summary.channels[0].fluor.as_deref(), Some("TL Phase"));
+    assert_eq!(summary.channels[1].label, "AF405");
+    assert_eq!(
+        summary.channels[1].fluor.as_deref(),
+        Some("Alexa Fluor 405")
+    );
+    assert_eq!(summary.channels[2].label, "Bod493");
+    assert_eq!(summary.channels[2].fluor.as_deref(), Some("BODIPY FL"));
+    let pixel_size = summary.pixel_size.expect("X/Y calibration");
+    assert!((pixel_size.x_um - 0.103_174_603_174_603_17).abs() < 1e-12);
+    assert!((pixel_size.y_um - 0.103_174_603_174_603_17).abs() < 1e-12);
+    assert_eq!(
+        summary.acquisition_date.as_deref(),
+        Some("2025-06-02T18:23:49.6167109Z")
+    );
+    assert_eq!(
+        summary.objective.as_deref(),
+        Some("Plan-Apochromat 63x/1.40 Oil Ph 3 M27")
+    );
 }
 
 impl RandomAccessSource for CountingSource {

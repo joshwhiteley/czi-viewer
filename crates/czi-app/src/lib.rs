@@ -457,6 +457,7 @@ impl DatasetInfo {
                     message: String::from("This CZI has no global metadata XML."),
                 }],
                 raw_xml: None,
+                summary: MetadataSummary::default(),
             },
             |metadata| {
                 MetadataDocument::parse(
@@ -2844,24 +2845,57 @@ impl ViewerApp {
             ui.label("Open a CZI to inspect metadata.");
             return;
         };
-        if dataset.metadata_summary.channels.is_empty() {
-            ui.weak("No named channels were found.");
+        let summary = &dataset.metadata_summary;
+        ui.heading("Overview");
+        metadata_overview_row(ui, "File", &dataset.source_label);
+        metadata_overview_row(
+            ui,
+            "Document name",
+            summary.name.as_deref().unwrap_or("Unavailable"),
+        );
+        metadata_overview_row(
+            ui,
+            "Acquired",
+            summary.acquisition_date.as_deref().unwrap_or("Unavailable"),
+        );
+        metadata_overview_row(
+            ui,
+            "Objective",
+            summary.objective.as_deref().unwrap_or("Unavailable"),
+        );
+        if let Some(pixel_size) = summary.pixel_size {
+            metadata_overview_row(
+                ui,
+                "Pixel size",
+                &format!("{:.6} × {:.6} µm", pixel_size.x_um, pixel_size.y_um),
+            );
         } else {
-            ui.label("Channels");
-            for channel in &dataset.metadata_summary.channels {
-                ui.weak(format!("C {} · {}", channel.index, channel.label));
+            metadata_overview_row(ui, "Pixel size", "Unavailable (X/Y calibration not found)");
+        }
+
+        ui.add_space(6.0);
+        ui.heading("Channels");
+        if summary.channels.is_empty() {
+            ui.weak("Unavailable (no named channels found)");
+        } else {
+            for channel in &summary.channels {
+                let fluor = channel
+                    .fluor
+                    .as_deref()
+                    .filter(|fluor| *fluor != channel.label)
+                    .map_or_else(String::new, |fluor| format!(" · {fluor}"));
+                ui.label(format!("C {} · {}{fluor}", channel.index, channel.label));
             }
         }
-        if let Some(pixel_size) = dataset.metadata_summary.pixel_size {
-            ui.label(format!(
-                "Pixel size: {:.4} × {:.4} µm",
-                pixel_size.x_um, pixel_size.y_um
-            ));
-        } else {
-            ui.weak("No physical X/Y pixel calibration was found.");
-        }
-        for diagnostic in &dataset.metadata.diagnostics {
-            ui.colored_label(egui::Color32::GOLD, &diagnostic.message);
+        if !dataset.metadata.diagnostics.is_empty() {
+            ui.add_space(4.0);
+            egui::CollapsingHeader::new("Some metadata details were unavailable")
+                .id_salt("czi-metadata-diagnostics")
+                .show(ui, |ui| {
+                    for diagnostic in &dataset.metadata.diagnostics {
+                        ui.weak(&diagnostic.message);
+                    }
+                });
         }
         ui.separator();
         ui.add(
@@ -2871,7 +2905,7 @@ impl ViewerApp {
         let filter = self.metadata_filter.trim().to_ascii_lowercase();
         egui::ScrollArea::vertical().show(ui, |ui| {
             if let Some(root) = dataset.metadata.root.as_ref() {
-                metadata_tree(ui, root, &filter, 0);
+                metadata_sections(ui, root, &filter);
             } else {
                 ui.weak("No structured metadata is available.");
             }
@@ -4439,7 +4473,7 @@ fn metadata_tree(ui: &mut egui::Ui, node: &czi_core::MetadataNode, filter: &str,
     if !metadata_matches(node, filter) {
         return;
     }
-    let text = (!node.text.is_empty()).then(|| format!(" = {}", node.text));
+    let text = (!node.text.is_empty()).then(|| format!(" = {}", value_preview(&node.text, 72)));
     let label = text.map_or_else(
         || node.name.clone(),
         |text| format!("{}{}", node.name, text),
@@ -4449,26 +4483,94 @@ fn metadata_tree(ui: &mut egui::Ui, node: &czi_core::MetadataNode, filter: &str,
             .default_open(depth < 2 || !filter.is_empty())
             .show(ui, |ui| {
                 if !node.text.is_empty() {
-                    egui::Grid::new("value").show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.weak("Value");
-                        ui.monospace(&node.text);
-                        ui.end_row();
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&node.text).monospace()).wrap(),
+                        );
                     });
                 }
                 if !node.attributes.is_empty() {
-                    egui::Grid::new("attributes").striped(true).show(ui, |ui| {
-                        for attribute in &node.attributes {
+                    for attribute in &node.attributes {
+                        ui.horizontal_wrapped(|ui| {
                             ui.weak(&attribute.name);
-                            ui.monospace(&attribute.value);
-                            ui.end_row();
-                        }
-                    });
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&attribute.value).monospace())
+                                    .wrap(),
+                            );
+                        });
+                    }
                 }
                 for (index, child) in node.children.iter().enumerate() {
                     ui.push_id(index, |ui| metadata_tree(ui, child, filter, depth + 1));
                 }
             });
     });
+}
+
+fn metadata_sections(ui: &mut egui::Ui, root: &czi_core::MetadataNode, filter: &str) {
+    let Some(metadata) = root
+        .children
+        .iter()
+        .find(|node| node.name.eq_ignore_ascii_case("metadata"))
+    else {
+        metadata_tree(ui, root, filter, 0);
+        return;
+    };
+    let useful = ["Information", "Scaling", "DisplaySetting"];
+    for name in useful {
+        for node in metadata
+            .children
+            .iter()
+            .filter(|node| node.name.eq_ignore_ascii_case(name))
+        {
+            if metadata_matches(node, filter) {
+                metadata_tree(ui, node, filter, 0);
+            }
+        }
+    }
+    let vendor_matches = metadata.children.iter().any(|node| {
+        !useful
+            .iter()
+            .any(|name| node.name.eq_ignore_ascii_case(name))
+            && metadata_matches(node, filter)
+    });
+    if vendor_matches {
+        egui::CollapsingHeader::new("Vendor details")
+            .id_salt("czi-vendor-metadata")
+            .default_open(vendor_details_default_open(filter))
+            .show(ui, |ui| {
+                for node in &metadata.children {
+                    if !useful
+                        .iter()
+                        .any(|name| node.name.eq_ignore_ascii_case(name))
+                    {
+                        metadata_tree(ui, node, filter, 1);
+                    }
+                }
+            });
+    }
+}
+
+fn vendor_details_default_open(filter: &str) -> bool {
+    !filter.is_empty()
+}
+
+fn metadata_overview_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.horizontal_wrapped(|ui| {
+        ui.weak(label);
+        ui.label(value);
+    });
+}
+
+fn value_preview(value: &str, maximum_chars: usize) -> String {
+    let mut characters = value.chars();
+    let preview = characters.by_ref().take(maximum_chars).collect::<String>();
+    if characters.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    }
 }
 
 fn metadata_matches(node: &czi_core::MetadataNode, filter: &str) -> bool {
@@ -4569,6 +4671,39 @@ mod tests {
                 dimensions,
             },
         }
+    }
+
+    #[test]
+    fn metadata_preview_is_width_bounded_and_unicode_safe() {
+        assert_eq!(value_preview("short", 8), "short");
+        assert_eq!(value_preview("αβγδε", 3), "αβγ…");
+    }
+
+    #[test]
+    fn metadata_search_matches_nested_values_and_attributes() {
+        let node = czi_core::MetadataNode {
+            name: String::from("Information"),
+            attributes: Vec::new(),
+            text: String::new(),
+            children: vec![czi_core::MetadataNode {
+                name: String::from("Channel"),
+                attributes: vec![czi_core::MetadataAttribute {
+                    name: String::from("Name"),
+                    value: String::from("Alexa Fluor 405"),
+                }],
+                text: String::new(),
+                children: Vec::new(),
+            }],
+        };
+        assert!(metadata_matches(&node, "fluor"));
+        assert!(!metadata_matches(&node, "hardware"));
+    }
+
+    #[test]
+    fn vendor_details_open_for_every_nonempty_search() {
+        assert!(!vendor_details_default_open(""));
+        assert!(vendor_details_default_open("channel"));
+        assert!(vendor_details_default_open("hardware"));
     }
 
     #[test]

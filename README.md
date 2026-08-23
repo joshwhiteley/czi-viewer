@@ -49,7 +49,7 @@ Pyramid viewing follows the Deep Zoom/OpenSeadragon model: it requests the fines
 
 ## Inspect, annotate, and export
 
-The left **Dataset** panel has **Display** and **Metadata** tabs. Display names each C channel from CZI metadata when available. Metadata provides a searchable, lazy tree of ordered XML elements, values, and attributes. It retains unknown elements and reports malformed or bounded metadata as diagnostics without blocking image opening. The optional **Raw XML** disclosure is retained only when it fits the 2 MiB metadata raw-XML limit.
+The left **Dataset** panel has **Display** and **Metadata** tabs. Display names each C channel from CZI metadata when available. Metadata starts with a concise overview and channel list, followed by searchable image-oriented sections; vendor details and raw XML stay collapsed by default. High-value fields are extracted with separate strict bounds, so channels, calibration, acquisition date, and objective can remain available when the generic ordered XML tree is partial. Unknown elements remain searchable, and malformed or bounded metadata is reported without blocking image opening. Raw XML is retained only when it fits the 2 MiB metadata raw-XML limit.
 
 The compact strip above the canvas identifies the source file, Scene, named Channel, Z/T, and requested and displayed pyramid scales. The lower-left scale bar uses CZI X/Y physical calibration in micrometers when available; otherwise it reports logical pixels.
 

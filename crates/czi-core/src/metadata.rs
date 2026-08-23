@@ -39,7 +39,7 @@ pub struct MetadataDiagnostic {
 }
 
 /// A bounded, optionally raw-preserving XML document.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MetadataDocument {
     /// The parsed root, when one could be retained.
     pub root: Option<MetadataNode>,
@@ -47,6 +47,8 @@ pub struct MetadataDocument {
     pub diagnostics: Vec<MetadataDiagnostic>,
     /// Original XML when requested and within the raw XML limit.
     pub raw_xml: Option<String>,
+    /// High-value fields extracted independently of generic tree retention.
+    pub summary: MetadataSummary,
 }
 
 /// Limits applied while retaining parsed metadata.
@@ -98,6 +100,7 @@ impl MetadataDocument {
             diagnostics: Vec::new(),
             raw_xml: (options.retain_raw_xml && xml.len() <= options.limits.max_raw_xml_bytes)
                 .then(|| xml.to_owned()),
+            summary: extract_summary(xml),
         };
         if options.retain_raw_xml && xml.len() > options.limits.max_raw_xml_bytes {
             document.diagnostics.push(MetadataDiagnostic {
@@ -137,6 +140,7 @@ impl MetadataDocument {
                         &mut document.diagnostics,
                         stack.len() + 1,
                     ) else {
+                        finish_partial_tree(&mut stack, &mut roots);
                         break;
                     };
                     stack.push(node);
@@ -150,6 +154,7 @@ impl MetadataDocument {
                         &mut document.diagnostics,
                         stack.len() + 1,
                     ) else {
+                        finish_partial_tree(&mut stack, &mut roots);
                         break;
                     };
                     append_node(node, &mut stack, &mut roots, &mut document.diagnostics);
@@ -176,6 +181,7 @@ impl MetadataDocument {
                         &mut counts,
                         &mut document.diagnostics,
                     ) {
+                        finish_partial_tree(&mut stack, &mut roots);
                         break;
                     }
                 }
@@ -190,6 +196,7 @@ impl MetadataDocument {
                         &mut counts,
                         &mut document.diagnostics,
                     ) {
+                        finish_partial_tree(&mut stack, &mut roots);
                         break;
                     }
                 }
@@ -204,6 +211,7 @@ impl MetadataDocument {
                         &mut counts,
                         &mut document.diagnostics,
                     ) {
+                        finish_partial_tree(&mut stack, &mut roots);
                         break;
                     }
                 }
@@ -379,8 +387,20 @@ fn reserve_allocation(
 
 fn diagnostic_limit(diagnostics: &mut Vec<MetadataDiagnostic>, name: &str, limit: usize) {
     diagnostics.push(MetadataDiagnostic {
-        message: format!("Metadata {name} limit of {limit} was reached; parsing stopped."),
+        message: format!(
+            "Metadata {name} limit of {limit} was reached; the structured view is partial."
+        ),
     });
+}
+
+fn finish_partial_tree(stack: &mut Vec<MetadataNode>, roots: &mut Vec<MetadataNode>) {
+    while let Some(node) = stack.pop() {
+        if let Some(parent) = stack.last_mut() {
+            parent.children.push(node);
+        } else if roots.is_empty() {
+            roots.push(node);
+        }
+    }
 }
 
 fn append_node(
@@ -421,6 +441,8 @@ pub struct ChannelMetadata {
     pub id: Option<String>,
     /// Human-readable label from `Name`, child `Name`, `Id`, or a generated fallback.
     pub label: String,
+    /// Dye or fluorophore name when explicitly recorded.
+    pub fluor: Option<String>,
 }
 
 /// Physical pixel calibration in micrometers per pixel.
@@ -435,43 +457,167 @@ pub struct PhysicalPixelSize {
 /// Application-oriented semantic metadata derived from a generic document.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MetadataSummary {
+    /// Image or document name from the standard information section.
+    pub name: Option<String>,
     /// Channel labels in metadata order.
     pub channels: Vec<ChannelMetadata>,
     /// Physical X/Y pixel size when both CZI scaling values are available.
     pub pixel_size: Option<PhysicalPixelSize>,
+    /// Acquisition timestamp as recorded by the CZI metadata.
+    pub acquisition_date: Option<String>,
+    /// Selected objective name when explicitly recorded.
+    pub objective: Option<String>,
 }
 
 /// Extract common CZI metadata without coupling the generic tree to a vendor schema.
 #[must_use]
 pub fn summarize_metadata(document: &MetadataDocument) -> MetadataSummary {
+    document.summary.clone()
+}
+
+const SUMMARY_MAX_DEPTH: usize = 64;
+const SUMMARY_MAX_VALUE_BYTES: usize = 1024;
+const SUMMARY_MAX_CHANNELS: usize = 256;
+
+#[derive(Default)]
+struct SummaryChannel {
+    depth: usize,
+    id: Option<String>,
+    name: Option<String>,
+    fluor: Option<String>,
+}
+
+#[derive(Default)]
+struct SummaryDistance {
+    depth: usize,
+    axis: Option<String>,
+    value: Option<String>,
+}
+
+// The CZI reader bounds `xml` before this pass. The scan is linear in those input bytes, does not
+// retain a second XML copy, and caps retained path depth, value size, and channel count below.
+fn extract_summary(xml: &str) -> MetadataSummary {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut path = Vec::<String>::new();
+    let mut depth = 0_usize;
     let mut summary = MetadataSummary::default();
-    if let Some(root) = document.root.as_ref() {
-        let mut path = Vec::new();
-        collect_channels(root, &mut path, &mut summary.channels);
-        let mut x_meters = None;
-        let mut y_meters = None;
-        collect_scaling(root, &mut path, &mut x_meters, &mut y_meters);
-        summary.pixel_size = match (x_meters, y_meters) {
-            (Some(x), Some(y)) => Some(PhysicalPixelSize {
-                x_um: x * 1_000_000.0,
-                y_um: y * 1_000_000.0,
-            }),
-            _ => None,
-        };
+    let mut channel = None::<SummaryChannel>;
+    let mut distance = None::<SummaryDistance>;
+    let mut x_meters = None;
+    let mut y_meters = None;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                depth = depth.saturating_add(1);
+                if depth <= SUMMARY_MAX_DEPTH {
+                    push_summary_name(&mut path, element.name().as_ref());
+                    summary_start(
+                        &element,
+                        &reader,
+                        &path,
+                        &mut summary,
+                        &mut channel,
+                        &mut distance,
+                    );
+                }
+            }
+            Ok(Event::Empty(element)) => {
+                depth = depth.saturating_add(1);
+                if depth <= SUMMARY_MAX_DEPTH {
+                    push_summary_name(&mut path, element.name().as_ref());
+                    summary_start(
+                        &element,
+                        &reader,
+                        &path,
+                        &mut summary,
+                        &mut channel,
+                        &mut distance,
+                    );
+                    summary_end(
+                        path.len(),
+                        &mut summary,
+                        &mut channel,
+                        &mut distance,
+                        &mut x_meters,
+                        &mut y_meters,
+                    );
+                    path.pop();
+                }
+                depth = depth.saturating_sub(1);
+            }
+            Ok(Event::Text(text)) => {
+                if depth <= SUMMARY_MAX_DEPTH && text.len() <= SUMMARY_MAX_VALUE_BYTES {
+                    let value = decode_text(text.as_ref());
+                    summary_text(
+                        &path,
+                        value.trim(),
+                        &mut summary,
+                        &mut channel,
+                        &mut distance,
+                    );
+                }
+            }
+            Ok(Event::CData(text)) => {
+                if depth <= SUMMARY_MAX_DEPTH && text.len() <= SUMMARY_MAX_VALUE_BYTES {
+                    let value = decode_text(text.as_ref());
+                    summary_text(
+                        &path,
+                        value.trim(),
+                        &mut summary,
+                        &mut channel,
+                        &mut distance,
+                    );
+                }
+            }
+            Ok(Event::End(_)) => {
+                if depth <= SUMMARY_MAX_DEPTH {
+                    summary_end(
+                        path.len(),
+                        &mut summary,
+                        &mut channel,
+                        &mut distance,
+                        &mut x_meters,
+                        &mut y_meters,
+                    );
+                    path.pop();
+                }
+                depth = depth.saturating_sub(1);
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            Ok(_) => {}
+        }
     }
+    summary.pixel_size = match (x_meters, y_meters) {
+        (Some(x), Some(y)) => Some(PhysicalPixelSize {
+            x_um: x * 1_000_000.0,
+            y_um: y * 1_000_000.0,
+        }),
+        _ => None,
+    };
     summary
 }
 
-fn collect_channels<'a>(
-    node: &'a MetadataNode,
-    path: &mut Vec<&'a MetadataNode>,
-    channels: &mut Vec<ChannelMetadata>,
+fn push_summary_name(path: &mut Vec<String>, bytes: &[u8]) {
+    if bytes.len() <= 128 {
+        path.push(local_name(bytes));
+    } else {
+        path.push(String::new());
+    }
+}
+
+fn summary_start(
+    element: &BytesStart<'_>,
+    reader: &Reader<&[u8]>,
+    path: &[String],
+    summary: &mut MetadataSummary,
+    channel: &mut Option<SummaryChannel>,
+    distance: &mut Option<SummaryDistance>,
 ) {
-    path.push(node);
-    if path_matches(
+    if path_ends(
         path,
         &[
-            "imagedocument",
             "metadata",
             "information",
             "image",
@@ -480,48 +626,190 @@ fn collect_channels<'a>(
             "channel",
         ],
     ) {
-        let id = attribute(node, "id").map(str::to_owned);
-        let label = attribute(node, "name")
-            .map(str::to_owned)
-            .or_else(|| child_text(node, "name"))
-            .or_else(|| id.clone())
-            .unwrap_or_else(|| format!("Channel {}", channels.len()));
-        let index = id
-            .as_deref()
-            .and_then(channel_index)
-            .unwrap_or_else(|| i32::try_from(channels.len()).unwrap_or(i32::MAX));
-        if !channels.iter().any(|channel| channel.index == index) {
-            channels.push(ChannelMetadata { index, id, label });
-        }
+        *channel = Some(SummaryChannel {
+            depth: path.len(),
+            id: summary_attribute(element, reader, "id"),
+            name: summary_attribute(element, reader, "name"),
+            fluor: None,
+        });
     }
-    for child in &node.children {
-        collect_channels(child, path, channels);
+    if path_ends(path, &["metadata", "scaling", "items", "distance"])
+        || path_ends(path, &["metadata", "scaling", "distance"])
+    {
+        *distance = Some(SummaryDistance {
+            depth: path.len(),
+            axis: summary_attribute(element, reader, "id")
+                .or_else(|| summary_attribute(element, reader, "axis")),
+            value: summary_attribute(element, reader, "value"),
+        });
     }
-    path.pop();
+    if summary.objective.is_none()
+        && path_ends(
+            path,
+            &[
+                "metadata",
+                "information",
+                "instrument",
+                "objectives",
+                "objective",
+            ],
+        )
+    {
+        summary.objective = summary_attribute(element, reader, "name");
+    }
 }
 
-fn collect_scaling<'a>(
-    node: &'a MetadataNode,
-    path: &mut Vec<&'a MetadataNode>,
+fn summary_attribute(
+    element: &BytesStart<'_>,
+    reader: &Reader<&[u8]>,
+    wanted: &str,
+) -> Option<String> {
+    element.attributes().flatten().find_map(|attribute| {
+        let name = local_name(attribute.key.as_ref());
+        if !name.eq_ignore_ascii_case(wanted) || attribute.value.len() > SUMMARY_MAX_VALUE_BYTES {
+            return None;
+        }
+        Some(
+            attribute
+                .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+                .map_or_else(
+                    |_| decode_text(attribute.value.as_ref()),
+                    std::borrow::Cow::into_owned,
+                ),
+        )
+    })
+}
+
+fn summary_text(
+    path: &[String],
+    value: &str,
+    summary: &mut MetadataSummary,
+    channel: &mut Option<SummaryChannel>,
+    distance: &mut Option<SummaryDistance>,
+) {
+    if value.is_empty() {
+        return;
+    }
+    if summary.name.is_none()
+        && (path_ends(path, &["metadata", "information", "document", "name"])
+            || path_ends(path, &["metadata", "information", "document", "title"])
+            || path_ends(path, &["metadata", "information", "image", "name"])
+            || path_ends(path, &["metadata", "information", "image", "title"]))
+    {
+        summary.name = Some(value.to_owned());
+    }
+    if summary.acquisition_date.is_none()
+        && (path_ends(
+            path,
+            &["metadata", "information", "image", "acquisitiondateandtime"],
+        ) || path_ends(
+            path,
+            &["metadata", "information", "image", "acquisitiondate"],
+        ))
+    {
+        summary.acquisition_date = Some(value.to_owned());
+    }
+    if summary.objective.is_none()
+        && (path_ends(
+            path,
+            &["metadata", "scaling", "autoscaling", "objectivename"],
+        ) || path_ends(
+            path,
+            &[
+                "metadata",
+                "information",
+                "instrument",
+                "objectives",
+                "objective",
+                "name",
+            ],
+        ))
+    {
+        summary.objective = Some(value.to_owned());
+    }
+    if let Some(channel) = channel.as_mut() {
+        if path_ends(path, &["fluorescencedye", "name"])
+            || path
+                .last()
+                .is_some_and(|name| name.eq_ignore_ascii_case("dyename"))
+        {
+            channel.fluor.get_or_insert_with(|| value.to_owned());
+        } else if path.len() == channel.depth.saturating_add(1)
+            && path
+                .last()
+                .is_some_and(|name| name.eq_ignore_ascii_case("name"))
+        {
+            channel.name.get_or_insert_with(|| value.to_owned());
+        } else if path
+            .last()
+            .is_some_and(|name| name.eq_ignore_ascii_case("fluor"))
+        {
+            channel.fluor.get_or_insert_with(|| value.to_owned());
+        }
+    }
+    if let Some(distance) = distance.as_mut()
+        && (path
+            .last()
+            .is_some_and(|name| name.eq_ignore_ascii_case("value"))
+            || (path
+                .last()
+                .is_some_and(|name| name.eq_ignore_ascii_case("distance"))
+                && path.len() == distance.depth))
+    {
+        distance.value.get_or_insert_with(|| value.to_owned());
+    }
+}
+
+fn summary_end(
+    depth: usize,
+    summary: &mut MetadataSummary,
+    channel: &mut Option<SummaryChannel>,
+    distance: &mut Option<SummaryDistance>,
     x_meters: &mut Option<f64>,
     y_meters: &mut Option<f64>,
 ) {
-    path.push(node);
-    let standard_distance =
-        path_matches(path, &["imagedocument", "metadata", "scaling", "distance"])
-            || path_matches(
-                path,
-                &["imagedocument", "metadata", "scaling", "items", "distance"],
-            );
-    if standard_distance {
-        let axis = attribute(node, "id").or_else(|| attribute(node, "axis"));
-        let value = attribute(node, "value")
-            .map(str::to_owned)
-            .or_else(|| child_text(node, "value"))
-            .or_else(|| (!node.text.is_empty()).then(|| node.text.clone()))
+    if channel
+        .as_ref()
+        .is_some_and(|pending| pending.depth == depth)
+    {
+        let pending = channel.take().expect("checked channel");
+        if summary.channels.len() < SUMMARY_MAX_CHANNELS {
+            let index = pending
+                .id
+                .as_deref()
+                .and_then(channel_index)
+                .unwrap_or_else(|| i32::try_from(summary.channels.len()).unwrap_or(i32::MAX));
+            if !summary
+                .channels
+                .iter()
+                .any(|existing| existing.index == index)
+            {
+                let label = pending
+                    .name
+                    .clone()
+                    .or_else(|| pending.fluor.clone())
+                    .or_else(|| pending.id.clone())
+                    .unwrap_or_else(|| format!("Channel {index}"));
+                summary.channels.push(ChannelMetadata {
+                    index,
+                    id: pending.id,
+                    label,
+                    fluor: pending.fluor,
+                });
+            }
+        }
+    }
+    if distance
+        .as_ref()
+        .is_some_and(|pending| pending.depth == depth)
+    {
+        let pending = distance.take().expect("checked distance");
+        let value = pending
+            .value
+            .as_deref()
             .and_then(|value| value.trim().parse::<f64>().ok())
             .filter(|value| value.is_finite() && *value > 0.0);
-        match (axis.map(str::trim), value) {
+        match (pending.axis.as_deref().map(str::trim), value) {
             (Some(axis), Some(value)) if axis.eq_ignore_ascii_case("x") && x_meters.is_none() => {
                 *x_meters = Some(value);
             }
@@ -531,36 +819,14 @@ fn collect_scaling<'a>(
             _ => {}
         }
     }
-    for child in &node.children {
-        collect_scaling(child, path, x_meters, y_meters);
-    }
-    path.pop();
 }
 
-fn path_matches(path: &[&MetadataNode], expected: &[&str]) -> bool {
-    path.len() == expected.len()
-        && path
+fn path_ends(path: &[String], expected: &[&str]) -> bool {
+    path.len() >= expected.len()
+        && path[path.len() - expected.len()..]
             .iter()
             .zip(expected)
-            .all(|(node, expected)| node.name.eq_ignore_ascii_case(expected))
-}
-
-fn attribute<'a>(node: &'a MetadataNode, name: &str) -> Option<&'a str> {
-    node.attributes
-        .iter()
-        .find(|attribute| attribute.name.eq_ignore_ascii_case(name))
-        .map(|attribute| attribute.value.as_str())
-}
-
-fn child_text(node: &MetadataNode, name: &str) -> Option<String> {
-    node.children
-        .iter()
-        .find(|child| named(child, name) && !child.text.is_empty())
-        .map(|child| child.text.clone())
-}
-
-fn named(node: &MetadataNode, name: &str) -> bool {
-    node.name.eq_ignore_ascii_case(name)
+            .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
 }
 
 fn channel_index(id: &str) -> Option<i32> {
@@ -573,6 +839,7 @@ fn channel_index(id: &str) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     fn parse(xml: &str) -> MetadataDocument {
         MetadataDocument::parse(
@@ -616,17 +883,20 @@ mod tests {
                 ChannelMetadata {
                     index: 0,
                     id: Some(String::from("Channel:0")),
-                    label: String::from("DAPI")
+                    label: String::from("DAPI"),
+                    fluor: None,
                 },
                 ChannelMetadata {
                     index: 1,
                     id: Some(String::from("Channel:1")),
-                    label: String::from("FITC")
+                    label: String::from("FITC"),
+                    fluor: None,
                 },
                 ChannelMetadata {
                     index: 2,
                     id: Some(String::from("Channel:2")),
-                    label: String::from("Channel:2")
+                    label: String::from("Channel:2"),
+                    fluor: None,
                 },
             ]
         );
@@ -716,6 +986,68 @@ mod tests {
             allocation_limit.diagnostics[0]
                 .message
                 .contains("allocation limit")
+        );
+        assert_eq!(allocation_limit.root, None);
+    }
+
+    #[test]
+    fn node_limit_keeps_partial_tree_and_summary_beyond_ten_thousand_nodes() {
+        let mut xml = String::from("<ImageDocument><Metadata><Experiment>");
+        for index in 0..10_050 {
+            write!(xml, "<Setting Index=\"{index}\"/>").expect("write synthetic XML");
+        }
+        xml.push_str(
+            "</Experiment><Information><Document><Name>HADA bridge</Name></Document><Image><AcquisitionDateAndTime>2025-06-02T18:23:49Z</AcquisitionDateAndTime><Dimensions><Channels><Channel Id=\"Channel:0\" Name=\"Phase PH3\"><Fluor>TL Phase</Fluor></Channel><Channel Id=\"Channel:1\"><Name>AF405</Name><DyeName>Alexa Fluor 405</DyeName></Channel></Channels></Dimensions></Image><Instrument><Objectives><Objective Id=\"Objective:1\" Name=\"Plan-Apochromat 63x/1.40 Oil\"/></Objectives></Instrument></Information><Scaling><Items><Distance Id=\"X\"><Value>1.031746e-7</Value><DefaultUnitFormat>µm</DefaultUnitFormat></Distance><Distance Id=\"Y\" Value=\"1.031746e-7\"/></Items></Scaling></Metadata></ImageDocument>",
+        );
+
+        let document = parse(&xml);
+        let root = document.root.as_ref().expect("partial root");
+        assert_eq!(root.name, "ImageDocument");
+        assert!(!root.children.is_empty());
+        assert!(document.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("node limit of 10000")
+                && diagnostic.message.contains("partial")
+        }));
+        let summary = summarize_metadata(&document);
+        assert_eq!(summary.name.as_deref(), Some("HADA bridge"));
+        assert_eq!(summary.channels.len(), 2);
+        assert_eq!(summary.channels[1].label, "AF405");
+        assert_eq!(
+            summary.channels[1].fluor.as_deref(),
+            Some("Alexa Fluor 405")
+        );
+        assert_eq!(
+            summary.objective.as_deref(),
+            Some("Plan-Apochromat 63x/1.40 Oil")
+        );
+        assert_eq!(
+            summary.acquisition_date.as_deref(),
+            Some("2025-06-02T18:23:49Z")
+        );
+        let pixel_size = summary.pixel_size.expect("X/Y scaling");
+        assert!((pixel_size.x_um - 0.103_174_6).abs() < 1e-12);
+        assert!((pixel_size.y_um - 0.103_174_6).abs() < 1e-12);
+    }
+
+    #[test]
+    fn summary_tolerates_namespaced_channel_and_calibration_variants() {
+        let document = parse(
+            r#"<z:ImageDocument xmlns:z="urn:zeiss"><z:Metadata><z:Information><z:Image><z:AcquisitionDate>2024-01-02</z:AcquisitionDate><z:Dimensions><z:Channels><z:Channel id="C0"><z:Detector><z:Name>Nested camera name</z:Name></z:Detector><z:Name>HADA</z:Name><z:FluorescenceDye><z:Name>Alexa Fluor 405</z:Name></z:FluorescenceDye></z:Channel></z:Channels></z:Dimensions></z:Image><z:Instrument><z:Objectives><z:Objective Name="63x Oil"/></z:Objectives></z:Instrument></z:Information><z:Scaling><z:Distance axis="x" value="2.5e-7"/><z:Distance Axis="Y">5e-7</z:Distance></z:Scaling></z:Metadata></z:ImageDocument>"#,
+        );
+        let summary = summarize_metadata(&document);
+        assert_eq!(summary.channels[0].label, "HADA");
+        assert_eq!(
+            summary.channels[0].fluor.as_deref(),
+            Some("Alexa Fluor 405")
+        );
+        assert_eq!(summary.objective.as_deref(), Some("63x Oil"));
+        assert_eq!(summary.acquisition_date.as_deref(), Some("2024-01-02"));
+        assert_eq!(
+            summary.pixel_size,
+            Some(PhysicalPixelSize {
+                x_um: 0.25,
+                y_um: 0.5
+            })
         );
     }
 
