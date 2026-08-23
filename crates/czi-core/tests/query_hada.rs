@@ -5,8 +5,9 @@ use std::sync::{
 };
 
 use czi_core::{
-    CziDataset, LocalFileSource, MetadataDocument, MetadataParseOptions, PlaneSelector,
-    RandomAccessSource, SourceError, SourceInfo, TileQueryIndex, ViewQuery, summarize_metadata,
+    CziDataset, LocalFileSource, MetadataDocument, MetadataParseLimits, MetadataParseOptions,
+    PlaneSelector, RandomAccessSource, SourceError, SourceInfo, TileQueryIndex, ViewQuery,
+    summarize_metadata,
 };
 
 #[derive(Clone)]
@@ -35,13 +36,20 @@ fn hada_metadata_summary_survives_bounded_tree_retention() {
         xml,
         MetadataParseOptions {
             retain_raw_xml: true,
-            ..MetadataParseOptions::default()
+            limits: MetadataParseLimits {
+                max_nodes: 1_000,
+                ..MetadataParseLimits::default()
+            },
         },
     );
     let summary = summarize_metadata(&document);
 
-    assert_eq!(xml.len(), 609_577);
-    assert!(document.root.is_some());
+    let root = document.root.as_ref().expect("partial metadata tree");
+    assert_eq!(root.name, "ImageDocument");
+    assert!(document.diagnostics.iter().any(|diagnostic| {
+        diagnostic.message.contains("node limit of 1000")
+            && diagnostic.message.contains("structured view is partial")
+    }));
     assert_eq!(summary.channels.len(), 3);
     assert_eq!(summary.channels[0].label, "Phase PH3");
     assert_eq!(summary.channels[0].fluor.as_deref(), Some("TL Phase"));

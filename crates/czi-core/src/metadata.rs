@@ -66,6 +66,16 @@ pub struct MetadataParseLimits {
     pub max_allocation_bytes: usize,
     /// Maximum original XML bytes copied into [`MetadataDocument::raw_xml`].
     pub max_raw_xml_bytes: usize,
+    /// Maximum XML input bytes inspected for high-value summary fields.
+    pub max_summary_input_bytes: usize,
+    /// Maximum XML events inspected for high-value summary fields.
+    pub max_summary_events: usize,
+    /// Maximum nesting depth inspected for high-value summary fields.
+    pub max_summary_depth: usize,
+    /// Maximum decoded bytes retained for one high-value summary field.
+    pub max_summary_value_bytes: usize,
+    /// Maximum channels retained in the high-value summary.
+    pub max_summary_channels: usize,
 }
 
 impl Default for MetadataParseLimits {
@@ -77,6 +87,11 @@ impl Default for MetadataParseLimits {
             max_attribute_bytes: 512 * 1024,
             max_allocation_bytes: 2 * 1024 * 1024,
             max_raw_xml_bytes: 2 * 1024 * 1024,
+            max_summary_input_bytes: 16 * 1024 * 1024,
+            max_summary_events: 100_000,
+            max_summary_depth: 64,
+            max_summary_value_bytes: 1024,
+            max_summary_channels: 256,
         }
     }
 }
@@ -95,12 +110,13 @@ impl MetadataDocument {
     #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn parse(xml: &str, options: MetadataParseOptions) -> Self {
+        let (summary, summary_diagnostics) = extract_summary(xml, options.limits);
         let mut document = Self {
             root: None,
-            diagnostics: Vec::new(),
+            diagnostics: summary_diagnostics,
             raw_xml: (options.retain_raw_xml && xml.len() <= options.limits.max_raw_xml_bytes)
                 .then(|| xml.to_owned()),
-            summary: extract_summary(xml),
+            summary,
         };
         if options.retain_raw_xml && xml.len() > options.limits.max_raw_xml_bytes {
             document.diagnostics.push(MetadataDiagnostic {
@@ -475,10 +491,6 @@ pub fn summarize_metadata(document: &MetadataDocument) -> MetadataSummary {
     document.summary.clone()
 }
 
-const SUMMARY_MAX_DEPTH: usize = 64;
-const SUMMARY_MAX_VALUE_BYTES: usize = 1024;
-const SUMMARY_MAX_CHANNELS: usize = 256;
-
 #[derive(Default)]
 struct SummaryChannel {
     depth: usize,
@@ -494,109 +506,193 @@ struct SummaryDistance {
     value: Option<String>,
 }
 
-// The CZI reader bounds `xml` before this pass. The scan is linear in those input bytes, does not
-// retain a second XML copy, and caps retained path depth, value size, and channel count below.
-fn extract_summary(xml: &str) -> MetadataSummary {
-    let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
-    let mut path = Vec::<String>::new();
-    let mut depth = 0_usize;
-    let mut summary = MetadataSummary::default();
-    let mut channel = None::<SummaryChannel>;
-    let mut distance = None::<SummaryDistance>;
-    let mut x_meters = None;
-    let mut y_meters = None;
+#[derive(Default)]
+struct SummaryCapture {
+    value: String,
+    truncated: bool,
+}
 
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(element)) => {
-                depth = depth.saturating_add(1);
-                if depth <= SUMMARY_MAX_DEPTH {
-                    push_summary_name(&mut path, element.name().as_ref());
-                    summary_start(
-                        &element,
-                        &reader,
-                        &path,
-                        &mut summary,
-                        &mut channel,
-                        &mut distance,
-                    );
-                }
-            }
-            Ok(Event::Empty(element)) => {
-                depth = depth.saturating_add(1);
-                if depth <= SUMMARY_MAX_DEPTH {
-                    push_summary_name(&mut path, element.name().as_ref());
-                    summary_start(
-                        &element,
-                        &reader,
-                        &path,
-                        &mut summary,
-                        &mut channel,
-                        &mut distance,
-                    );
-                    summary_end(
-                        path.len(),
-                        &mut summary,
-                        &mut channel,
-                        &mut distance,
-                        &mut x_meters,
-                        &mut y_meters,
-                    );
-                    path.pop();
-                }
-                depth = depth.saturating_sub(1);
-            }
-            Ok(Event::Text(text)) => {
-                if depth <= SUMMARY_MAX_DEPTH && text.len() <= SUMMARY_MAX_VALUE_BYTES {
-                    let value = decode_text(text.as_ref());
-                    summary_text(
-                        &path,
-                        value.trim(),
-                        &mut summary,
-                        &mut channel,
-                        &mut distance,
-                    );
-                }
-            }
-            Ok(Event::CData(text)) => {
-                if depth <= SUMMARY_MAX_DEPTH && text.len() <= SUMMARY_MAX_VALUE_BYTES {
-                    let value = decode_text(text.as_ref());
-                    summary_text(
-                        &path,
-                        value.trim(),
-                        &mut summary,
-                        &mut channel,
-                        &mut distance,
-                    );
-                }
-            }
-            Ok(Event::End(_)) => {
-                if depth <= SUMMARY_MAX_DEPTH {
-                    summary_end(
-                        path.len(),
-                        &mut summary,
-                        &mut channel,
-                        &mut distance,
-                        &mut x_meters,
-                        &mut y_meters,
-                    );
-                    path.pop();
-                }
-                depth = depth.saturating_sub(1);
-            }
-            Ok(Event::Eof) | Err(_) => break,
-            Ok(_) => {}
+const MAX_SUMMARY_DIAGNOSTICS: usize = 8;
+
+struct SummaryState {
+    limits: MetadataParseLimits,
+    diagnostics: Vec<MetadataDiagnostic>,
+    path: Vec<String>,
+    captures: Vec<Option<SummaryCapture>>,
+    summary: MetadataSummary,
+    channel: Option<SummaryChannel>,
+    distance: Option<SummaryDistance>,
+    x_meters: Option<f64>,
+    y_meters: Option<f64>,
+}
+
+impl SummaryState {
+    fn new(limits: MetadataParseLimits) -> Self {
+        Self {
+            limits,
+            diagnostics: Vec::new(),
+            path: Vec::new(),
+            captures: Vec::new(),
+            summary: MetadataSummary::default(),
+            channel: None,
+            distance: None,
+            x_meters: None,
+            y_meters: None,
         }
     }
-    summary.pixel_size = match (x_meters, y_meters) {
+}
+
+#[allow(clippy::too_many_lines)]
+fn extract_summary(
+    xml: &str,
+    limits: MetadataParseLimits,
+) -> (MetadataSummary, Vec<MetadataDiagnostic>) {
+    let mut state = SummaryState::new(limits);
+    if xml.len() > limits.max_summary_input_bytes {
+        summary_diagnostic_once(
+            &mut state.diagnostics,
+            format!(
+                "Metadata summary input limit of {} bytes was exceeded; summary fields are unavailable.",
+                limits.max_summary_input_bytes
+            ),
+        );
+        return (state.summary, state.diagnostics);
+    }
+    let mut reader = Reader::from_str(xml);
+    let config = reader.config_mut();
+    config.trim_text(false);
+    config.check_end_names = true;
+    config.check_comments = true;
+    let mut events = 0_usize;
+
+    loop {
+        if events >= limits.max_summary_events {
+            summary_diagnostic_once(
+                &mut state.diagnostics,
+                format!(
+                    "Metadata summary event limit of {} was reached; summary fields may be incomplete.",
+                    limits.max_summary_events
+                ),
+            );
+            break;
+        }
+        let event = match reader.read_event() {
+            Ok(event) => event,
+            Err(error) => {
+                summary_diagnostic_once(
+                    &mut state.diagnostics,
+                    format!("Malformed metadata summary XML: {error}"),
+                );
+                break;
+            }
+        };
+        events = events.saturating_add(1);
+        match event {
+            Event::Start(element) => {
+                if state.path.len() >= limits.max_summary_depth {
+                    summary_diagnostic_once(
+                        &mut state.diagnostics,
+                        format!(
+                            "Metadata summary depth limit of {} was reached; summary fields may be incomplete.",
+                            limits.max_summary_depth
+                        ),
+                    );
+                    break;
+                }
+                push_summary_name(&mut state.path, element.name().as_ref());
+                summary_start(&element, &reader, &mut state);
+                state.captures.push(summary_capture(
+                    &state.path,
+                    state.channel.as_ref(),
+                    state.distance.as_ref(),
+                ));
+            }
+            Event::Empty(element) => {
+                if state.path.len() >= limits.max_summary_depth {
+                    summary_diagnostic_once(
+                        &mut state.diagnostics,
+                        format!(
+                            "Metadata summary depth limit of {} was reached; summary fields may be incomplete.",
+                            limits.max_summary_depth
+                        ),
+                    );
+                    break;
+                }
+                push_summary_name(&mut state.path, element.name().as_ref());
+                summary_start(&element, &reader, &mut state);
+                summary_end(state.path.len(), &mut state);
+                state.path.pop();
+            }
+            Event::Text(text) => {
+                append_summary_fragment(
+                    state.captures.last_mut().and_then(Option::as_mut),
+                    &decode_text(text.as_ref()),
+                    limits,
+                    &mut state.diagnostics,
+                );
+            }
+            Event::CData(text) => {
+                append_summary_fragment(
+                    state.captures.last_mut().and_then(Option::as_mut),
+                    &String::from_utf8_lossy(text.as_ref()),
+                    limits,
+                    &mut state.diagnostics,
+                );
+            }
+            Event::GeneralRef(reference) => {
+                let value = predefined_reference(reference.as_ref()).map_or_else(
+                    || format!("&{};", String::from_utf8_lossy(reference.as_ref())),
+                    str::to_owned,
+                );
+                append_summary_fragment(
+                    state.captures.last_mut().and_then(Option::as_mut),
+                    &value,
+                    limits,
+                    &mut state.diagnostics,
+                );
+            }
+            Event::End(_) => {
+                if state.path.is_empty() {
+                    summary_diagnostic_once(
+                        &mut state.diagnostics,
+                        String::from("Malformed metadata summary XML: unexpected closing element."),
+                    );
+                    break;
+                }
+                if let Some(Some(capture)) = state.captures.pop()
+                    && !capture.truncated
+                {
+                    summary_value(
+                        &state.path,
+                        capture.value.trim(),
+                        &mut state.summary,
+                        &mut state.channel,
+                        &mut state.distance,
+                    );
+                }
+                summary_end(state.path.len(), &mut state);
+                state.path.pop();
+            }
+            Event::Eof => {
+                if !state.path.is_empty() {
+                    summary_diagnostic_once(
+                        &mut state.diagnostics,
+                        String::from("Malformed metadata summary XML: unclosed element."),
+                    );
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+    state.summary.pixel_size = match (state.x_meters, state.y_meters) {
         (Some(x), Some(y)) => Some(PhysicalPixelSize {
             x_um: x * 1_000_000.0,
             y_um: y * 1_000_000.0,
         }),
         _ => None,
     };
-    summary
+    (state.summary, state.diagnostics)
 }
 
 fn push_summary_name(path: &mut Vec<String>, bytes: &[u8]) {
@@ -607,55 +703,61 @@ fn push_summary_name(path: &mut Vec<String>, bytes: &[u8]) {
     }
 }
 
-fn summary_start(
-    element: &BytesStart<'_>,
-    reader: &Reader<&[u8]>,
-    path: &[String],
-    summary: &mut MetadataSummary,
-    channel: &mut Option<SummaryChannel>,
-    distance: &mut Option<SummaryDistance>,
-) {
-    if path_ends(
-        path,
-        &[
-            "metadata",
-            "information",
-            "image",
-            "dimensions",
-            "channels",
-            "channel",
-        ],
+fn summary_start(element: &BytesStart<'_>, reader: &Reader<&[u8]>, state: &mut SummaryState) {
+    if canonical_path(
+        &state.path,
+        &["information", "image", "dimensions", "channels", "channel"],
     ) {
-        *channel = Some(SummaryChannel {
-            depth: path.len(),
-            id: summary_attribute(element, reader, "id"),
-            name: summary_attribute(element, reader, "name"),
+        state.channel = Some(SummaryChannel {
+            depth: state.path.len(),
+            id: summary_attribute(element, reader, "id", state.limits, &mut state.diagnostics),
+            name: summary_attribute(
+                element,
+                reader,
+                "name",
+                state.limits,
+                &mut state.diagnostics,
+            ),
             fluor: None,
         });
     }
-    if path_ends(path, &["metadata", "scaling", "items", "distance"])
-        || path_ends(path, &["metadata", "scaling", "distance"])
+    if canonical_path(&state.path, &["scaling", "items", "distance"])
+        || canonical_path(&state.path, &["scaling", "distance"])
     {
-        *distance = Some(SummaryDistance {
-            depth: path.len(),
-            axis: summary_attribute(element, reader, "id")
-                .or_else(|| summary_attribute(element, reader, "axis")),
-            value: summary_attribute(element, reader, "value"),
+        state.distance = Some(SummaryDistance {
+            depth: state.path.len(),
+            axis: summary_attribute(element, reader, "id", state.limits, &mut state.diagnostics)
+                .or_else(|| {
+                    summary_attribute(
+                        element,
+                        reader,
+                        "axis",
+                        state.limits,
+                        &mut state.diagnostics,
+                    )
+                }),
+            value: summary_attribute(
+                element,
+                reader,
+                "value",
+                state.limits,
+                &mut state.diagnostics,
+            ),
         });
     }
-    if summary.objective.is_none()
-        && path_ends(
-            path,
-            &[
-                "metadata",
-                "information",
-                "instrument",
-                "objectives",
-                "objective",
-            ],
+    if state.summary.objective.is_none()
+        && canonical_path(
+            &state.path,
+            &["information", "instrument", "objectives", "objective"],
         )
     {
-        summary.objective = summary_attribute(element, reader, "name");
+        state.summary.objective = summary_attribute(
+            element,
+            reader,
+            "name",
+            state.limits,
+            &mut state.diagnostics,
+        );
     }
 }
 
@@ -663,24 +765,94 @@ fn summary_attribute(
     element: &BytesStart<'_>,
     reader: &Reader<&[u8]>,
     wanted: &str,
+    limits: MetadataParseLimits,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
 ) -> Option<String> {
-    element.attributes().flatten().find_map(|attribute| {
+    for attribute in element.attributes() {
+        let attribute = match attribute {
+            Ok(attribute) => attribute,
+            Err(error) => {
+                summary_diagnostic_once(
+                    diagnostics,
+                    format!("Malformed metadata summary XML attribute: {error}"),
+                );
+                continue;
+            }
+        };
         let name = local_name(attribute.key.as_ref());
-        if !name.eq_ignore_ascii_case(wanted) || attribute.value.len() > SUMMARY_MAX_VALUE_BYTES {
+        if !name.eq_ignore_ascii_case(wanted) {
+            continue;
+        }
+        let value = attribute
+            .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+            .map_or_else(
+                |_| decode_text(attribute.value.as_ref()),
+                std::borrow::Cow::into_owned,
+            );
+        if value.len() > limits.max_summary_value_bytes {
+            summary_value_limit_diagnostic(diagnostics, limits.max_summary_value_bytes);
             return None;
         }
-        Some(
-            attribute
-                .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
-                .map_or_else(
-                    |_| decode_text(attribute.value.as_ref()),
-                    std::borrow::Cow::into_owned,
-                ),
-        )
-    })
+        return Some(value);
+    }
+    None
 }
 
-fn summary_text(
+fn summary_capture(
+    path: &[String],
+    channel: Option<&SummaryChannel>,
+    distance: Option<&SummaryDistance>,
+) -> Option<SummaryCapture> {
+    let global_value = canonical_path(path, &["information", "document", "name"])
+        || canonical_path(path, &["information", "document", "title"])
+        || canonical_path(path, &["information", "image", "name"])
+        || canonical_path(path, &["information", "image", "title"])
+        || canonical_path(path, &["information", "image", "acquisitiondateandtime"])
+        || canonical_path(path, &["information", "image", "acquisitiondate"])
+        || canonical_path(path, &["scaling", "autoscaling", "objectivename"]);
+    let channel_value = channel.is_some_and(|channel| {
+        (path.len() == channel.depth.saturating_add(1)
+            && path.last().is_some_and(|name| {
+                name.eq_ignore_ascii_case("name")
+                    || name.eq_ignore_ascii_case("fluor")
+                    || name.eq_ignore_ascii_case("dyename")
+            }))
+            || (path.len() == channel.depth.saturating_add(2)
+                && path[path.len() - 2].eq_ignore_ascii_case("fluorescencedye")
+                && path[path.len() - 1].eq_ignore_ascii_case("name"))
+    });
+    let distance_value = distance.is_some_and(|distance| {
+        path.len() == distance.depth
+            || (path.len() == distance.depth.saturating_add(1)
+                && path
+                    .last()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("value")))
+    });
+    (global_value || channel_value || distance_value).then(SummaryCapture::default)
+}
+
+fn append_summary_fragment(
+    capture: Option<&mut SummaryCapture>,
+    fragment: &str,
+    limits: MetadataParseLimits,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) {
+    let Some(capture) = capture else {
+        return;
+    };
+    if capture.truncated {
+        return;
+    }
+    if capture.value.len().saturating_add(fragment.len()) > limits.max_summary_value_bytes {
+        capture.value.clear();
+        capture.truncated = true;
+        summary_value_limit_diagnostic(diagnostics, limits.max_summary_value_bytes);
+        return;
+    }
+    capture.value.push_str(fragment);
+}
+
+fn summary_value(
     path: &[String],
     value: &str,
     summary: &mut MetadataSummary,
@@ -691,47 +863,32 @@ fn summary_text(
         return;
     }
     if summary.name.is_none()
-        && (path_ends(path, &["metadata", "information", "document", "name"])
-            || path_ends(path, &["metadata", "information", "document", "title"])
-            || path_ends(path, &["metadata", "information", "image", "name"])
-            || path_ends(path, &["metadata", "information", "image", "title"]))
+        && (canonical_path(path, &["information", "document", "name"])
+            || canonical_path(path, &["information", "document", "title"])
+            || canonical_path(path, &["information", "image", "name"])
+            || canonical_path(path, &["information", "image", "title"]))
     {
         summary.name = Some(value.to_owned());
     }
     if summary.acquisition_date.is_none()
-        && (path_ends(
-            path,
-            &["metadata", "information", "image", "acquisitiondateandtime"],
-        ) || path_ends(
-            path,
-            &["metadata", "information", "image", "acquisitiondate"],
-        ))
+        && (canonical_path(path, &["information", "image", "acquisitiondateandtime"])
+            || canonical_path(path, &["information", "image", "acquisitiondate"]))
     {
         summary.acquisition_date = Some(value.to_owned());
     }
     if summary.objective.is_none()
-        && (path_ends(
-            path,
-            &["metadata", "scaling", "autoscaling", "objectivename"],
-        ) || path_ends(
-            path,
-            &[
-                "metadata",
-                "information",
-                "instrument",
-                "objectives",
-                "objective",
-                "name",
-            ],
-        ))
+        && canonical_path(path, &["scaling", "autoscaling", "objectivename"])
     {
         summary.objective = Some(value.to_owned());
     }
     if let Some(channel) = channel.as_mut() {
-        if path_ends(path, &["fluorescencedye", "name"])
-            || path
-                .last()
-                .is_some_and(|name| name.eq_ignore_ascii_case("dyename"))
+        if (path.len() == channel.depth.saturating_add(2)
+            && path[path.len() - 2].eq_ignore_ascii_case("fluorescencedye")
+            && path[path.len() - 1].eq_ignore_ascii_case("name"))
+            || (path.len() == channel.depth.saturating_add(1)
+                && path
+                    .last()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("dyename")))
         {
             channel.fluor.get_or_insert_with(|| value.to_owned());
         } else if path.len() == channel.depth.saturating_add(1)
@@ -740,9 +897,10 @@ fn summary_text(
                 .is_some_and(|name| name.eq_ignore_ascii_case("name"))
         {
             channel.name.get_or_insert_with(|| value.to_owned());
-        } else if path
-            .last()
-            .is_some_and(|name| name.eq_ignore_ascii_case("fluor"))
+        } else if path.len() == channel.depth.saturating_add(1)
+            && path
+                .last()
+                .is_some_and(|name| name.eq_ignore_ascii_case("fluor"))
         {
             channel.fluor.get_or_insert_with(|| value.to_owned());
         }
@@ -760,26 +918,21 @@ fn summary_text(
     }
 }
 
-fn summary_end(
-    depth: usize,
-    summary: &mut MetadataSummary,
-    channel: &mut Option<SummaryChannel>,
-    distance: &mut Option<SummaryDistance>,
-    x_meters: &mut Option<f64>,
-    y_meters: &mut Option<f64>,
-) {
-    if channel
+fn summary_end(depth: usize, state: &mut SummaryState) {
+    if state
+        .channel
         .as_ref()
         .is_some_and(|pending| pending.depth == depth)
     {
-        let pending = channel.take().expect("checked channel");
-        if summary.channels.len() < SUMMARY_MAX_CHANNELS {
+        let pending = state.channel.take().expect("checked channel");
+        if state.summary.channels.len() < state.limits.max_summary_channels {
             let index = pending
                 .id
                 .as_deref()
                 .and_then(channel_index)
-                .unwrap_or_else(|| i32::try_from(summary.channels.len()).unwrap_or(i32::MAX));
-            if !summary
+                .unwrap_or_else(|| i32::try_from(state.summary.channels.len()).unwrap_or(i32::MAX));
+            if !state
+                .summary
                 .channels
                 .iter()
                 .any(|existing| existing.index == index)
@@ -790,43 +943,77 @@ fn summary_end(
                     .or_else(|| pending.fluor.clone())
                     .or_else(|| pending.id.clone())
                     .unwrap_or_else(|| format!("Channel {index}"));
-                summary.channels.push(ChannelMetadata {
+                state.summary.channels.push(ChannelMetadata {
                     index,
                     id: pending.id,
                     label,
                     fluor: pending.fluor,
                 });
             }
+        } else {
+            summary_diagnostic_once(
+                &mut state.diagnostics,
+                format!(
+                    "Metadata summary channel limit of {} was reached; additional channels were omitted.",
+                    state.limits.max_summary_channels
+                ),
+            );
         }
     }
-    if distance
+    if state
+        .distance
         .as_ref()
         .is_some_and(|pending| pending.depth == depth)
     {
-        let pending = distance.take().expect("checked distance");
+        let pending = state.distance.take().expect("checked distance");
         let value = pending
             .value
             .as_deref()
             .and_then(|value| value.trim().parse::<f64>().ok())
             .filter(|value| value.is_finite() && *value > 0.0);
         match (pending.axis.as_deref().map(str::trim), value) {
-            (Some(axis), Some(value)) if axis.eq_ignore_ascii_case("x") && x_meters.is_none() => {
-                *x_meters = Some(value);
+            (Some(axis), Some(value))
+                if axis.eq_ignore_ascii_case("x") && state.x_meters.is_none() =>
+            {
+                state.x_meters = Some(value);
             }
-            (Some(axis), Some(value)) if axis.eq_ignore_ascii_case("y") && y_meters.is_none() => {
-                *y_meters = Some(value);
+            (Some(axis), Some(value))
+                if axis.eq_ignore_ascii_case("y") && state.y_meters.is_none() =>
+            {
+                state.y_meters = Some(value);
             }
             _ => {}
         }
     }
 }
 
-fn path_ends(path: &[String], expected: &[&str]) -> bool {
-    path.len() >= expected.len()
-        && path[path.len() - expected.len()..]
+fn canonical_path(path: &[String], after_metadata: &[&str]) -> bool {
+    path.len() == after_metadata.len().saturating_add(2)
+        && path[0].eq_ignore_ascii_case("imagedocument")
+        && path[1].eq_ignore_ascii_case("metadata")
+        && path[2..]
             .iter()
-            .zip(expected)
+            .zip(after_metadata)
             .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+}
+
+fn summary_value_limit_diagnostic(diagnostics: &mut Vec<MetadataDiagnostic>, limit: usize) {
+    summary_diagnostic_once(
+        diagnostics,
+        format!(
+            "Metadata summary value limit of {limit} bytes was reached; some fields were omitted."
+        ),
+    );
+}
+
+fn summary_diagnostic_once(diagnostics: &mut Vec<MetadataDiagnostic>, message: String) {
+    if diagnostics.len() < MAX_SUMMARY_DIAGNOSTICS
+        && !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message == message)
+    {
+        diagnostics.push(MetadataDiagnostic { message });
+    }
 }
 
 fn channel_index(id: &str) -> Option<i32> {
@@ -1008,6 +1195,7 @@ mod tests {
             diagnostic.message.contains("node limit of 10000")
                 && diagnostic.message.contains("partial")
         }));
+        assert!(!has_summary_diagnostic(&document, "event limit"));
         let summary = summarize_metadata(&document);
         assert_eq!(summary.name.as_deref(), Some("HADA bridge"));
         assert_eq!(summary.channels.len(), 2);
@@ -1049,6 +1237,123 @@ mod tests {
                 y_um: 0.5
             })
         );
+    }
+
+    #[test]
+    fn summary_accumulates_text_cdata_and_references_per_field() {
+        let document = parse(
+            r#"<ImageDocument><Metadata><Information><Document><Name>H&amp;<![CDATA[E]]></Name></Document><Image><Dimensions><Channels><Channel Id="Channel:0"><Name>AF<![CDATA[405]]></Name><Fluor>Alexa &amp; Fluor</Fluor></Channel></Channels></Dimensions></Image></Information><Scaling><Items><Distance Id="X"><Value>2.5<![CDATA[e-7]]></Value></Distance><Distance Id="Y">5<![CDATA[e-7]]></Distance></Items></Scaling></Metadata></ImageDocument>"#,
+        );
+        let summary = summarize_metadata(&document);
+        assert_eq!(summary.name.as_deref(), Some("H&E"));
+        assert_eq!(summary.channels[0].label, "AF405");
+        assert_eq!(summary.channels[0].fluor.as_deref(), Some("Alexa & Fluor"));
+        assert_eq!(
+            summary.pixel_size,
+            Some(PhysicalPixelSize {
+                x_um: 0.25,
+                y_um: 0.5
+            })
+        );
+    }
+
+    #[test]
+    fn summary_requires_the_canonical_image_document_metadata_root() {
+        let document = parse(
+            r#"<ImageDocument><Metadata><Extension><Metadata><Information><Document><Name>False nested name</Name></Document><Image><Dimensions><Channels><Channel Id="Channel:9" Name="False channel"/></Channels></Dimensions></Image></Information><Scaling><Distance Id="X" Value="9e-7"/><Distance Id="Y" Value="9e-7"/></Scaling></Metadata></Extension><Information><Document><Name>Real global name</Name></Document><Image><Dimensions><Channels><Channel Id="Channel:0" Name="Real channel"/></Channels></Dimensions></Image></Information><Scaling><Distance Id="X" Value="2e-7"/><Distance Id="Y" Value="3e-7"/></Scaling></Metadata></ImageDocument>"#,
+        );
+        let summary = summarize_metadata(&document);
+        assert_eq!(summary.name.as_deref(), Some("Real global name"));
+        assert_eq!(summary.channels.len(), 1);
+        assert_eq!(summary.channels[0].label, "Real channel");
+        let pixel_size = summary.pixel_size.expect("real global scaling");
+        assert!((pixel_size.x_um - 0.2).abs() < f64::EPSILON);
+        assert!((pixel_size.y_um - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn summary_reports_input_event_depth_and_malformed_limits() {
+        let xml = "<ImageDocument><Metadata><Information><Document><Name>bounded</Name></Document></Information></Metadata></ImageDocument>";
+        let input = MetadataDocument::parse(
+            xml,
+            MetadataParseOptions {
+                limits: MetadataParseLimits {
+                    max_summary_input_bytes: xml.len() - 1,
+                    ..MetadataParseLimits::default()
+                },
+                ..MetadataParseOptions::default()
+            },
+        );
+        assert!(input.summary.name.is_none());
+        assert!(has_summary_diagnostic(&input, "input limit"));
+
+        let events = MetadataDocument::parse(
+            xml,
+            MetadataParseOptions {
+                limits: MetadataParseLimits {
+                    max_summary_events: 3,
+                    ..MetadataParseLimits::default()
+                },
+                ..MetadataParseOptions::default()
+            },
+        );
+        assert!(has_summary_diagnostic(&events, "event limit"));
+
+        let depth = MetadataDocument::parse(
+            xml,
+            MetadataParseOptions {
+                limits: MetadataParseLimits {
+                    max_summary_depth: 2,
+                    ..MetadataParseLimits::default()
+                },
+                ..MetadataParseOptions::default()
+            },
+        );
+        assert!(has_summary_diagnostic(&depth, "depth limit"));
+
+        let malformed = parse(
+            "<ImageDocument><Metadata><Information><Document><Name>broken</Document></Information></Metadata></ImageDocument>",
+        );
+        assert!(has_summary_diagnostic(
+            &malformed,
+            "Malformed metadata summary XML"
+        ));
+    }
+
+    #[test]
+    fn summary_reports_value_and_channel_retention_limits() {
+        let value = MetadataDocument::parse(
+            "<ImageDocument><Metadata><Information><Document><Name>too long</Name></Document></Information></Metadata></ImageDocument>",
+            MetadataParseOptions {
+                limits: MetadataParseLimits {
+                    max_summary_value_bytes: 3,
+                    ..MetadataParseLimits::default()
+                },
+                ..MetadataParseOptions::default()
+            },
+        );
+        assert!(value.summary.name.is_none());
+        assert!(has_summary_diagnostic(&value, "value limit"));
+
+        let channels = MetadataDocument::parse(
+            "<ImageDocument><Metadata><Information><Image><Dimensions><Channels><Channel Id=\"Channel:0\" Name=\"zero\"/><Channel Id=\"Channel:1\" Name=\"one\"/><Channel Id=\"Channel:2\" Name=\"two\"/></Channels></Dimensions></Image></Information></Metadata></ImageDocument>",
+            MetadataParseOptions {
+                limits: MetadataParseLimits {
+                    max_summary_channels: 2,
+                    ..MetadataParseLimits::default()
+                },
+                ..MetadataParseOptions::default()
+            },
+        );
+        assert_eq!(channels.summary.channels.len(), 2);
+        assert!(has_summary_diagnostic(&channels, "channel limit"));
+    }
+
+    fn has_summary_diagnostic(document: &MetadataDocument, text: &str) -> bool {
+        document
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains(text))
     }
 
     #[test]

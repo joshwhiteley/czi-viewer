@@ -4535,25 +4535,43 @@ fn metadata_sections(ui: &mut egui::Ui, root: &czi_core::MetadataNode, filter: &
             .any(|name| node.name.eq_ignore_ascii_case(name))
             && metadata_matches(node, filter)
     });
-    if vendor_matches {
-        egui::CollapsingHeader::new("Vendor details")
-            .id_salt("czi-vendor-metadata")
-            .default_open(vendor_details_default_open(filter))
-            .show(ui, |ui| {
-                for node in &metadata.children {
-                    if !useful
-                        .iter()
-                        .any(|name| node.name.eq_ignore_ascii_case(name))
-                    {
-                        metadata_tree(ui, node, filter, 1);
-                    }
-                }
-            });
+    let show_vendor_nodes = |ui: &mut egui::Ui| {
+        for node in &metadata.children {
+            if !useful
+                .iter()
+                .any(|name| node.name.eq_ignore_ascii_case(name))
+            {
+                metadata_tree(ui, node, filter, 1);
+            }
+        }
+    };
+    match vendor_details_presentation(filter, vendor_matches) {
+        VendorDetailsPresentation::Hidden => {}
+        VendorDetailsPresentation::Collapsed => {
+            egui::CollapsingHeader::new("Vendor details")
+                .id_salt("czi-vendor-metadata")
+                .show(ui, show_vendor_nodes);
+        }
+        VendorDetailsPresentation::SearchResults => {
+            ui.strong("Vendor details");
+            show_vendor_nodes(ui);
+        }
     }
 }
 
-fn vendor_details_default_open(filter: &str) -> bool {
-    !filter.is_empty()
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VendorDetailsPresentation {
+    Hidden,
+    Collapsed,
+    SearchResults,
+}
+
+fn vendor_details_presentation(filter: &str, has_matches: bool) -> VendorDetailsPresentation {
+    match (filter.is_empty(), has_matches) {
+        (_, false) => VendorDetailsPresentation::Hidden,
+        (true, true) => VendorDetailsPresentation::Collapsed,
+        (false, true) => VendorDetailsPresentation::SearchResults,
+    }
 }
 
 fn metadata_overview_row(ui: &mut egui::Ui, label: &str, value: &str) {
@@ -4700,10 +4718,19 @@ mod tests {
     }
 
     #[test]
-    fn vendor_details_open_for_every_nonempty_search() {
-        assert!(!vendor_details_default_open(""));
-        assert!(vendor_details_default_open("channel"));
-        assert!(vendor_details_default_open("hardware"));
+    fn vendor_details_render_directly_for_searches_and_collapsed_without_one() {
+        assert_eq!(
+            vendor_details_presentation("", true),
+            VendorDetailsPresentation::Collapsed
+        );
+        assert_eq!(
+            vendor_details_presentation("channel", true),
+            VendorDetailsPresentation::SearchResults
+        );
+        assert_eq!(
+            vendor_details_presentation("hardware", false),
+            VendorDetailsPresentation::Hidden
+        );
     }
 
     #[test]
