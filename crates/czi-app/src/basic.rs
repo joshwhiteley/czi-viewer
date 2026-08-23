@@ -25,7 +25,7 @@ pub(crate) const WARN_SAMPLES_PER_CHANNEL: usize = 100;
 const MAX_CHANNELS: usize = 64;
 const MAX_CHANNEL_NAME_CHARS: usize = 128;
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
-const MAX_INPUT_BYTES: u64 = 32 * 1024 * 1024;
+pub(crate) const MAX_INPUT_BYTES: u64 = 32 * 1024 * 1024;
 const MIN_SUPPORTED_GAIN: f32 = 1.0e-6;
 const MAX_SUPPORTED_GAIN: f32 = 1.0e6;
 const RESPONSE_JSON_LIMIT: u64 = 64 * 1024;
@@ -42,9 +42,37 @@ pub(crate) struct ChannelSpec {
     pub(crate) is_phase: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SampleRepresentation {
+    Native,
+    Pyramid,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SampleCandidate {
     pub(crate) tile_id: TileId,
+    pub(crate) representation: SampleRepresentation,
+    pub(crate) decoded_bytes: u64,
+    pub(crate) staging_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PlanStats {
+    pub(crate) positions_per_channel: Vec<(i32, usize)>,
+    pub(crate) total_tile_reads: usize,
+    pub(crate) native_reads: usize,
+    pub(crate) pyramid_reads: usize,
+    pub(crate) estimated_decoded_bytes: u64,
+}
+
+impl PlanStats {
+    pub(crate) fn representation_label(&self) -> String {
+        match (self.native_reads, self.pyramid_reads) {
+            (native, 0) => format!("native ({native})"),
+            (0, pyramid) => format!("pyramid ({pyramid})"),
+            (native, pyramid) => format!("mixed ({native} native, {pyramid} pyramid)"),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -58,6 +86,47 @@ pub(crate) struct ChannelSamplePlan {
 pub(crate) struct SamplePlan {
     pub(crate) channels: Vec<ChannelSamplePlan>,
     pub(crate) verified_scales: HashMap<PlaneKey, Vec<PyramidScale>>,
+}
+
+impl SamplePlan {
+    pub(crate) fn stats(&self) -> Result<PlanStats, String> {
+        let positions_per_channel = self
+            .channels
+            .iter()
+            .map(|channel| (channel.spec.c_index, channel.candidates.len()))
+            .collect::<Vec<_>>();
+        let total_tile_reads =
+            positions_per_channel
+                .iter()
+                .try_fold(0_usize, |total, (_, count)| {
+                    total
+                        .checked_add(*count)
+                        .ok_or_else(|| String::from("BaSiC plan total tile read count overflows."))
+                })?;
+        let native_reads = self
+            .channels
+            .iter()
+            .flat_map(|channel| &channel.candidates)
+            .filter(|candidate| candidate.representation == SampleRepresentation::Native)
+            .count();
+        let pyramid_reads = total_tile_reads - native_reads;
+        let estimated_decoded_bytes = self
+            .channels
+            .iter()
+            .flat_map(|channel| &channel.candidates)
+            .try_fold(0_u64, |total, candidate| {
+                total.checked_add(candidate.decoded_bytes).ok_or_else(|| {
+                    String::from("BaSiC plan estimated decoded byte count overflows.")
+                })
+            })?;
+        Ok(PlanStats {
+            positions_per_channel,
+            total_tile_reads,
+            native_reads,
+            pyramid_reads,
+            estimated_decoded_bytes,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -171,6 +240,13 @@ impl TempRequest {
         }
         for channel in &plan.channels {
             validate_channel_spec(&channel.spec)?;
+            if channel.candidates.len() > MAX_SAMPLES_PER_CHANNEL {
+                return Err(format!(
+                    "BaSiC channel {} has {} samples; protocol v1 allows at most {MAX_SAMPLES_PER_CHANNEL}.",
+                    channel.spec.id,
+                    channel.candidates.len()
+                ));
+            }
         }
         let aggregate_bytes = plan.channels.iter().try_fold(0_u64, |total, channel| {
             expected_sample_bytes(channel.candidates.len()).and_then(|size| {
@@ -369,7 +445,6 @@ pub(crate) fn plan_samples(
             "BaSiC request does not exactly match the CZI sparse channels.",
         ));
     }
-    let verified_scales = verified_scales(index, query, cancelled)?;
     let mut native_channels = Vec::with_capacity(specs.len());
     for spec in specs {
         check_cancelled(cancelled)?;
@@ -389,80 +464,28 @@ pub(crate) fn plan_samples(
             );
         }
         native_hits.sort_unstable_by_key(hit_order_key);
-        if native_hits.len() < MIN_SAMPLES_PER_CHANNEL {
-            return Err(format!(
-                "{} has only {} acquisition positions; at least {} are required.",
-                spec.name,
-                native_hits.len(),
-                MIN_SAMPLES_PER_CHANNEL
-            ));
-        }
         let pixel_max = channel_pixel_max(index, &native_hits, cancelled)?;
         native_channels.push((spec, pixel_max, native_hits));
     }
-    let phase_alignment = if specs.iter().any(|spec| spec.is_phase) {
-        let mut common: Option<Vec<AcquisitionIdentity>> = None;
-        for (_, _, hits) in &native_channels {
-            check_cancelled(cancelled)?;
-            let identities = unique_acquisition_hits(hits, cancelled)?
-                .keys()
-                .copied()
-                .collect::<Vec<_>>();
-            common = Some(match common {
-                None => identities,
-                Some(previous) => previous
-                    .into_iter()
-                    .filter(|identity| identities.binary_search(identity).is_ok())
-                    .collect(),
-            });
-        }
-        common
-    } else {
-        None
-    };
-    let available_count = phase_alignment.as_ref().map_or_else(
-        || {
-            native_channels
-                .iter()
-                .map(|(_, _, hits)| hits.len())
-                .min()
-                .unwrap_or_default()
-        },
-        Vec::len,
-    );
-    let common_count = available_count
-        .min(MAX_SAMPLES_PER_CHANNEL)
-        .min(aggregate_sample_cap(native_channels.len())?);
-    if common_count < MIN_SAMPLES_PER_CHANNEL {
-        return Err(String::from(
-            "BaSiC protocol bounds leave fewer than 32 samples per sparse channel.",
-        ));
-    }
-    let selected_phase_identities = phase_alignment
-        .as_ref()
-        .map(|identities| stratified_values(identities, common_count));
+    let selected_channels = aligned_channel_hits(
+        &native_channels
+            .iter()
+            .map(|(_, _, hits)| hits.as_slice())
+            .collect::<Vec<_>>(),
+        specs.iter().any(|spec| spec.is_phase),
+        cancelled,
+    )?;
+    let counts = selected_channels.iter().map(Vec::len).collect::<Vec<_>>();
+    validate_whole_czi_limits(specs, &counts)?;
+    let verified_scales = verified_scales(index, query, cancelled)?;
     let mut channels = Vec::with_capacity(specs.len());
-    for (spec, pixel_max, native_hits) in native_channels {
+    for ((spec, pixel_max, _), selected) in native_channels.into_iter().zip(selected_channels) {
         check_cancelled(cancelled)?;
-        let selected = if let Some(identities) = selected_phase_identities.as_ref() {
-            let hits = unique_acquisition_hits(&native_hits, cancelled)?;
-            identities
-                .iter()
-                .map(|identity| {
-                    hits.get(identity).copied().ok_or_else(|| {
-                        String::from("Aligned BaSiC acquisition position disappeared.")
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            stratified_hits(&native_hits, common_count)
-        };
         let candidates = selected
             .into_iter()
             .map(|native| {
                 check_cancelled(cancelled)?;
-                sample_representation(query, native, &verified_scales)
-                    .map(|tile_id| SampleCandidate { tile_id })
+                sample_representation(index, query, native, &verified_scales)
             })
             .collect::<Result<Vec<_>, _>>()?;
         channels.push(ChannelSamplePlan {
@@ -539,7 +562,7 @@ pub(crate) fn select_verified_scale(
     Some(selected)
 }
 
-pub(crate) fn downsample_tile(tile: &DecodedTile) -> Result<Vec<u16>, String> {
+pub(crate) fn downsample_tile(tile: DecodedTile) -> Result<Vec<u16>, String> {
     let width =
         usize::try_from(tile.width).map_err(|_| String::from("Tile width is too large."))?;
     let height =
@@ -547,12 +570,11 @@ pub(crate) fn downsample_tile(tile: &DecodedTile) -> Result<Vec<u16>, String> {
     let count = width
         .checked_mul(height)
         .ok_or_else(|| String::from("Tile shape overflows memory bounds."))?;
-    let values = match &tile.pixels {
-        DecodedPixels::Gray8(values) if values.len() == count => values
-            .iter()
-            .map(|value| u16::from(*value))
-            .collect::<Vec<_>>(),
-        DecodedPixels::Gray16(values) if values.len() == count => values.clone(),
+    let values = match tile.pixels {
+        DecodedPixels::Gray8(values) if values.len() == count => {
+            values.into_iter().map(u16::from).collect::<Vec<_>>()
+        }
+        DecodedPixels::Gray16(values) if values.len() == count => values,
         _ => return Err(String::from("Decoded BaSiC sample has an invalid shape.")),
     };
     Ok(resize_bilinear_u16(
@@ -863,10 +885,11 @@ fn channel_pixel_max(
 }
 
 fn sample_representation(
+    index: &DatasetIndex,
     query: &TileQueryIndex,
     native: TileHit,
     verified: &HashMap<PlaneKey, Vec<PyramidScale>>,
-) -> Result<TileId, String> {
+) -> Result<SampleCandidate, String> {
     query
         .plane(native.plane)
         .ok_or_else(|| String::from("BaSiC native plane disappeared."))?;
@@ -886,7 +909,27 @@ fn sample_representation(
             selected = hit;
         }
     }
-    Ok(selected.tile_id)
+    let tile = index
+        .tile(selected.tile_id.index())
+        .ok_or_else(|| String::from("BaSiC representation tile is missing from the CZI index."))?;
+    let decoded_bytes = tile
+        .entry
+        .stored_byte_size()
+        .ok_or_else(|| String::from("BaSiC representation decoded size overflows."))?;
+    let staging_bytes = decoded_bytes
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(expected_sample_bytes(1).ok()?))
+        .ok_or_else(|| String::from("BaSiC representation staging size overflows."))?;
+    Ok(SampleCandidate {
+        tile_id: selected.tile_id,
+        representation: if selected.scale == native.scale {
+            SampleRepresentation::Native
+        } else {
+            SampleRepresentation::Pyramid
+        },
+        decoded_bytes,
+        staging_bytes,
+    })
 }
 
 fn unique_hit_signatures(
@@ -963,20 +1006,94 @@ fn unique_acquisition_hits(
     Ok(indexed)
 }
 
-fn stratified_hits(hits: &[TileHit], cap: usize) -> Vec<TileHit> {
-    stratified_values(hits, cap)
-}
-
-fn stratified_values<T: Copy>(values: &[T], cap: usize) -> Vec<T> {
-    if values.len() <= cap {
-        return values.to_vec();
+fn aligned_channel_hits(
+    channels: &[&[TileHit]],
+    align_channels: bool,
+    cancelled: &AtomicBool,
+) -> Result<Vec<Vec<TileHit>>, String> {
+    if !align_channels {
+        return Ok(channels.iter().map(|hits| hits.to_vec()).collect());
     }
-    (0..cap)
-        .map(|stratum| {
-            let numerator = (2 * stratum + 1) * values.len();
-            values[numerator / (2 * cap)]
+    let mut indexed = Vec::with_capacity(channels.len());
+    for hits in channels {
+        check_cancelled(cancelled)?;
+        indexed.push(unique_acquisition_hits(hits, cancelled)?);
+    }
+    let Some(first) = indexed.first() else {
+        return Ok(Vec::new());
+    };
+    let identities = first
+        .keys()
+        .filter(|identity| {
+            indexed
+                .iter()
+                .skip(1)
+                .all(|channel| channel.contains_key(identity))
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    indexed
+        .iter()
+        .map(|channel| {
+            identities
+                .iter()
+                .map(|identity| {
+                    channel.get(identity).copied().ok_or_else(|| {
+                        String::from("Aligned BaSiC acquisition position disappeared.")
+                    })
+                })
+                .collect()
         })
         .collect()
+}
+
+fn validate_whole_czi_limits(specs: &[ChannelSpec], counts: &[usize]) -> Result<u64, String> {
+    if specs.len() != counts.len() {
+        return Err(String::from(
+            "BaSiC channel counts do not match the request.",
+        ));
+    }
+    let total_tile_reads = counts.iter().try_fold(0_usize, |total, count| {
+        total
+            .checked_add(*count)
+            .ok_or_else(|| String::from("BaSiC total tile read count overflows."))
+    })?;
+    let sample_bytes = expected_sample_bytes(total_tile_reads)?;
+    let exact_counts = specs
+        .iter()
+        .zip(counts)
+        .map(|(spec, count)| format!("{} (C={}): {count}", spec.name, spec.c_index))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let summary = format!(
+        "positions/channel [{exact_counts}], total tile reads {total_tile_reads}, sample bytes {sample_bytes}"
+    );
+    if let Some((spec, count)) = specs
+        .iter()
+        .zip(counts)
+        .find(|(_, count)| **count > MAX_SAMPLES_PER_CHANNEL)
+    {
+        return Err(format!(
+            "BaSiC whole-CZI plan rejected before reads: {summary}. {} (C={}) has {count} positions; protocol v1 allows at most {MAX_SAMPLES_PER_CHANNEL}. Use offline/cluster profile generation for this dataset.",
+            spec.name, spec.c_index
+        ));
+    }
+    if sample_bytes > MAX_INPUT_BYTES {
+        return Err(format!(
+            "BaSiC whole-CZI plan rejected before reads: {summary}; protocol v1 allows at most {MAX_INPUT_BYTES} sample bytes (32 MiB). Use offline/cluster profile generation for this dataset."
+        ));
+    }
+    if let Some((spec, count)) = specs
+        .iter()
+        .zip(counts)
+        .find(|(_, count)| **count < MIN_SAMPLES_PER_CHANNEL)
+    {
+        return Err(format!(
+            "{} has only {count} aligned acquisition positions; at least {MIN_SAMPLES_PER_CHANNEL} are required. Whole-CZI plan: {summary}.",
+            spec.name
+        ));
+    }
+    Ok(sample_bytes)
 }
 
 fn resize_bilinear_u16(
@@ -1043,23 +1160,6 @@ fn expected_sample_bytes(sample_count: usize) -> Result<u64, String> {
         .ok_or_else(|| String::from("BaSiC sample file size overflow."))
 }
 
-fn aggregate_sample_cap(channel_count: usize) -> Result<usize, String> {
-    let channels = u64::try_from(channel_count)
-        .map_err(|_| String::from("BaSiC channel count is too large."))?;
-    let bytes_per_channel_sample = u64::from(GRID_WIDTH)
-        .checked_mul(u64::from(GRID_HEIGHT))
-        .and_then(|value| value.checked_mul(2))
-        .ok_or_else(|| String::from("BaSiC sample shape size overflow."))?;
-    let denominator = channels
-        .checked_mul(bytes_per_channel_sample)
-        .ok_or_else(|| String::from("BaSiC aggregate sample size overflow."))?;
-    if denominator == 0 {
-        return Err(String::from("BaSiC channel count must be positive."));
-    }
-    usize::try_from(MAX_INPUT_BYTES / denominator)
-        .map_err(|_| String::from("BaSiC aggregate sample cap does not fit memory bounds."))
-}
-
 const fn grid_pixels() -> usize {
     GRID_WIDTH as usize * GRID_HEIGHT as usize
 }
@@ -1122,6 +1222,72 @@ mod tests {
         }
     }
 
+    fn candidate(tile_id: TileId) -> SampleCandidate {
+        SampleCandidate {
+            tile_id,
+            representation: SampleRepresentation::Native,
+            decoded_bytes: 1,
+            staging_bytes: 1,
+        }
+    }
+
+    fn channel_specs(count: usize) -> Vec<ChannelSpec> {
+        (0..count)
+            .map(|channel| ChannelSpec {
+                id: format!("c{channel}"),
+                c_index: i32::try_from(channel).expect("small channel"),
+                name: format!("Channel {channel}"),
+                is_phase: channel == 0,
+            })
+            .collect()
+    }
+
+    fn acquisition_hits(channel: i32, count: usize) -> Vec<TileHit> {
+        (0..count)
+            .map(|index| TileHit {
+                tile_id: TileId(
+                    usize::try_from(channel).expect("non-negative channel") * 1_000 + index,
+                ),
+                plane: PlaneKey::new(channel, SceneId::Implicit, 0, 0),
+                logical_rect: SpatialRect::new(
+                    i64::try_from(index).expect("small index"),
+                    0,
+                    i64::try_from(index + 1).expect("small index"),
+                    1,
+                )
+                .expect("rect"),
+                physical_stored_size: czi_core::PhysicalSize {
+                    width: 256,
+                    height: 256,
+                },
+                scale: PyramidScale::new(1, 1).expect("scale"),
+                m_index: None,
+                paint_order: index,
+            })
+            .collect()
+    }
+
+    #[derive(Clone)]
+    struct CountingSource {
+        inner: Arc<czi_core::LocalFileSource>,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl czi_core::RandomAccessSource for CountingSource {
+        fn info(&self) -> czi_core::SourceInfo {
+            self.inner.info()
+        }
+
+        fn read_at(
+            &self,
+            offset: u64,
+            destination: &mut [u8],
+        ) -> Result<(), czi_core::SourceError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.inner.read_at(offset, destination)
+        }
+    }
+
     #[test]
     fn correction_uses_detector_orientation_bilinear_gain_and_nearest_support() {
         let mut gain = vec![1.0; grid_pixels()];
@@ -1158,7 +1324,7 @@ mod tests {
             channels: vec![ChannelSamplePlan {
                 spec,
                 pixel_max: 255,
-                candidates: vec![SampleCandidate { tile_id: TileId(0) }; MIN_SAMPLES_PER_CHANNEL],
+                candidates: vec![candidate(TileId(0)); MIN_SAMPLES_PER_CHANNEL],
             }],
             verified_scales: HashMap::new(),
         };
@@ -1236,45 +1402,94 @@ mod tests {
     }
 
     #[test]
-    fn stratified_selection_is_deterministic_and_bounded() {
-        let hits = (0..1_000)
-            .map(|index| TileHit {
-                tile_id: TileId(index),
-                plane: PlaneKey::new(0, czi_core::SceneId::Implicit, 0, 0),
-                logical_rect: SpatialRect::new(
-                    i64::try_from(index).expect("small index"),
-                    0,
-                    i64::try_from(index + 1).expect("small index"),
-                    1,
-                )
-                .expect("rect"),
-                physical_stored_size: czi_core::PhysicalSize {
-                    width: 256,
-                    height: 256,
-                },
-                scale: PyramidScale::new(1, 1).expect("scale"),
-                m_index: None,
-                paint_order: index,
-            })
+    fn aligned_selection_uses_every_position_without_subsampling() {
+        let channels = (0..3)
+            .map(|channel| acquisition_hits(channel, 300))
             .collect::<Vec<_>>();
-        let first = stratified_hits(&hits, MAX_SAMPLES_PER_CHANNEL);
-        let second = stratified_hits(&hits, MAX_SAMPLES_PER_CHANNEL);
-        assert_eq!(first, second);
-        assert_eq!(first.len(), MAX_SAMPLES_PER_CHANNEL);
-        assert!(first.first().unwrap().tile_id.0 < 2);
-        assert!(first.last().unwrap().tile_id.0 > 997);
+        let selected = aligned_channel_hits(
+            &channels.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            true,
+            &AtomicBool::new(false),
+        )
+        .expect("aligned positions");
+        assert_eq!(selected.iter().map(Vec::len).collect::<Vec<_>>(), [300; 3]);
+        for (original, selected) in channels.iter().zip(selected) {
+            assert_eq!(
+                selected.iter().map(|hit| hit.tile_id).collect::<Vec<_>>(),
+                original.iter().map(|hit| hit.tile_id).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
-    fn aggregate_protocol_bound_reduces_the_common_sample_count() {
-        assert_eq!(aggregate_sample_cap(3).expect("3 channels"), 341);
-        assert_eq!(aggregate_sample_cap(17).expect("17 channels"), 60);
-        assert_eq!(aggregate_sample_cap(32).expect("32 channels"), 32);
-        assert_eq!(aggregate_sample_cap(64).expect("64 channels"), 16);
-        let bytes =
-            expected_sample_bytes(aggregate_sample_cap(32).expect("cap")).expect("bytes") * 32;
-        assert_eq!(bytes, MAX_INPUT_BYTES);
-        assert_eq!(expected_sample_bytes(300).expect("bytes") * 3, 29_491_200);
+    fn whole_czi_limits_accept_hada_300_by_3_and_report_exact_limit_errors() {
+        let specs = channel_specs(3);
+        assert_eq!(
+            validate_whole_czi_limits(&specs, &[300, 300, 300]).expect("HADA plan"),
+            29_491_200
+        );
+
+        let count_error =
+            validate_whole_czi_limits(&specs, &[513, 300, 300]).expect_err("per-channel limit");
+        assert!(count_error.contains("Channel 0 (C=0): 513"));
+        assert!(count_error.contains("total tile reads 1113"));
+        assert!(count_error.contains("sample bytes 36470784"));
+        assert!(count_error.contains("offline/cluster profile generation"));
+
+        let byte_error =
+            validate_whole_czi_limits(&specs, &[400, 400, 400]).expect_err("aggregate limit");
+        assert!(byte_error.contains("positions/channel [Channel 0 (C=0): 400"));
+        assert!(byte_error.contains("total tile reads 1200"));
+        assert!(byte_error.contains("sample bytes 39321600"));
+        assert!(byte_error.contains(&MAX_INPUT_BYTES.to_string()));
+        assert!(byte_error.contains("offline/cluster profile generation"));
+    }
+
+    #[test]
+    #[ignore = "requires the 2,700-tile HADA fixture and CZI_RUN_FIXTURES=1"]
+    fn hada_whole_czi_plan_uses_all_900_native_positions_without_source_reads() {
+        if std::env::var_os("CZI_RUN_FIXTURES").is_none() {
+            return;
+        }
+        let path = std::env::var_os("CZI_HADA_FIXTURE").map_or_else(
+            || PathBuf::from("/Users/josh/Downloads/czi-tests/tf_HADA_BOD_d1_bridge_060225-02.czi"),
+            PathBuf::from,
+        );
+        assert!(path.is_file(), "missing HADA fixture: {}", path.display());
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = CountingSource {
+            inner: Arc::new(czi_core::LocalFileSource::open(path).expect("fixture source")),
+            reads: Arc::clone(&reads),
+        };
+        let dataset = czi_core::CziDataset::open(source).expect("fixture index");
+        let after_open = reads.load(Ordering::Relaxed);
+        let query = TileQueryIndex::new(dataset.index()).expect("query index");
+        let specs = query
+            .axis_choices()
+            .c
+            .iter()
+            .enumerate()
+            .map(|(ordinal, channel)| ChannelSpec {
+                id: format!("channel-{ordinal}"),
+                c_index: *channel,
+                name: format!("Channel {channel}"),
+                is_phase: ordinal == 0,
+            })
+            .collect::<Vec<_>>();
+        let plan = plan_samples(dataset.index(), &query, &specs, &AtomicBool::new(false))
+            .expect("whole-CZI plan");
+        let stats = plan.stats().expect("plan stats");
+        assert_eq!(stats.positions_per_channel, [(0, 300), (1, 300), (2, 300)]);
+        assert_eq!(stats.total_tile_reads, 900);
+        assert_eq!(
+            expected_sample_bytes(stats.total_tile_reads).expect("sample bytes"),
+            29_491_200
+        );
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            after_open,
+            "BaSiC planning read source payloads"
+        );
     }
 
     #[test]
@@ -1332,7 +1547,7 @@ mod tests {
                     is_phase: false,
                 },
                 pixel_max: u16::MAX,
-                candidates: vec![SampleCandidate { tile_id: TileId(0) }; MIN_SAMPLES_PER_CHANNEL],
+                candidates: vec![candidate(TileId(0)); MIN_SAMPLES_PER_CHANNEL],
             }],
             verified_scales: HashMap::new(),
         };

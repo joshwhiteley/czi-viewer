@@ -35,7 +35,7 @@ The helper reads `request.json`:
 }
 ```
 
-Each channel file contains exactly `sample_count * 128 * 128` row-major little-endian `u16` values. Gray8 input is widened without changing its 0–255 range.
+Each channel file contains exactly `sample_count * 128 * 128` row-major little-endian `u16` values. Gray8 input is widened without changing its 0–255 range. Channel sample counts may differ unless Phase-mask alignment requires common acquisition identities.
 
 The helper writes `response.json` and one gain/support pair per channel:
 
@@ -59,7 +59,7 @@ The helper writes `response.json` and one gain/support pair per channel:
 }
 ```
 
-Protocol v1 permits at most 64 channels, 512 samples per channel, 32 MiB (33,554,432 bytes) of aggregate sample data, and 64 KiB for each JSON manifest. All supplied channels use the same sample count, and at most one is marked as Phase. IDs are 1–64 ASCII letters, digits, `_`, or `-`; names are 1–128 characters; C indices are unique non-negative `i32` values; and `pixel_max` is exactly 255 or 65535.
+Protocol v1 permits at most 64 channels, 512 samples per channel, 32 MiB (33,554,432 bytes) of aggregate sample data, and 64 KiB for each JSON manifest. At most one channel is marked as Phase. IDs are 1–64 ASCII letters, digits, `_`, or `-`; names are 1–128 characters; C indices are unique non-negative `i32` values; and `pixel_max` is exactly 255 or 65535.
 
 Gain contains exactly `128 * 128` little-endian `f32` values. Support contains exactly `128 * 128` bytes, each 0 or 1. Output paths must be single relative filenames and regular non-symlink files inside the request directory. The viewer rejects a response with a wrong version, validation status, darkfield mode, method, sample count, channel identity/count, size, path, non-finite gain, non-positive or extreme supported gain, invalid support byte, or reported range/fraction that does not match the files. One invalid or missing channel rejects the complete profile set.
 
@@ -67,11 +67,15 @@ The helper must normalize gain so raw division has the intended scale. Darkfield
 
 ## Sampling and scheduling
 
-The viewer fits every observed sparse C index within the protocol-v1 64-channel/32-MiB bounds. For each channel it considers only native detector tiles when selecting acquisition positions, so CZI pyramid duplicates do not increase the count. Selection is deterministic, spatial/key ordered, and stratified. It uses the same count for every channel: the smallest available channel count, capped at 512 and reduced as needed by the 32 MiB aggregate bound. When a Phase channel supplies shared masks, positions are aligned across channels by scene, Z/T, detector rectangle, and mosaic index. At least 32 positions are required. The UI warns below 100. Consequently, the 32 MiB aggregate bound prevents preparation of more than 32 channels at the required minimum, even though the manifest can describe up to 64.
+The viewer fits every observed sparse C index. For each channel it uses every native acquisition position, so CZI pyramid duplicates do not increase the count and no position is stratified, capped, or silently omitted. When a Phase channel supplies shared masks, it uses every position aligned across channels by scene, Z/T, detector rectangle, and mosaic index. At least 32 aligned positions are required. The UI warns below 100.
+
+Before any tile payload read, the viewer rejects a whole-CZI plan when any channel exceeds 512 positions or the aggregate 128 × 128 `u16` samples exceed 32 MiB. The error includes exact per-channel counts, total tile reads, exact sample bytes, and guidance to use offline/cluster profile generation. For example, the HADA 300 × 3 plan retains all 900 tile reads and uses 29,491,200 sample bytes.
 
 For sample decoding, a pyramid tile is used only when its logical rectangle and mosaic index map one-to-one to one native detector tile and its stored dimensions remain at least 128 × 128. Otherwise the native tile is decoded. Every sample is resized to 128 × 128 in detector-tile orientation and written as little-endian `u16`.
 
-Local and Shared SFTP sources use the same read-only dataset worker. Sampling performs one tile step only when no viewer command is waiting. Visible viewport work therefore preempts sampling between tile reads. A single source read or decode cannot be interrupted with the current random-access abstraction; cancellation takes effect after that bounded tile operation. Helper fitting runs on a separate worker and cancellation terminates the helper process.
+Local and Shared SFTP sources use the same read-only dataset worker. Local sampling runs at most four concurrent decode/downsample operations in a batch and caps aggregate staging estimates at 64 MiB. Shared SFTP remains one single-session tile step at a time. Sampling runs only when no viewer command is waiting, so visible viewport work preempts it between bounded local batches or remote tile steps. A batch, source read, or decode cannot be interrupted with the current random-access abstraction; cancellation discards a completed local batch before its samples are written. Helper fitting runs on a separate worker and cancellation terminates the helper process.
+
+The UI reports positions per channel, total tile reads, native/pyramid representation counts, estimated decoded bytes, and whether sampling is waiting for viewport work. Sample files are app-owned temporary data, source access remains read-only, and fitted profiles remain session-only.
 
 Detector/pyramid mapping verification is deferred until **Prepare BaSiC Preview**, so opening a dataset has no unconditional BaSiC planning cost. Planning polls the same cancellation token between planes and scales. A single in-memory geometry query or sort is not preemptible and can briefly delay queued viewport work before tile sampling begins. Source and fit generations reject late progress and results after cancel, refit, or source replacement.
 

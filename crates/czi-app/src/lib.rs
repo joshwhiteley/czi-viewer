@@ -41,6 +41,8 @@ const MAX_PREFETCH_TILES: usize = 128;
 const MAX_COMPOSITE_LEGEND_CHARS: usize = 96;
 const MAX_CANVAS_TITLE_CHARS: usize = 180;
 const MAX_TITLE_FILENAME_CHARS: usize = 64;
+const MAX_BASIC_LOCAL_CONCURRENCY: usize = 4;
+const MAX_BASIC_STAGING_BYTES: u64 = 64 * 1024 * 1024;
 const S_IFMT: u32 = 0o170_000;
 const S_IFDIR: u32 = 0o040_000;
 const S_IFREG: u32 = 0o100_000;
@@ -1036,6 +1038,16 @@ enum WorkerEvent {
         source_generation: u64,
         view_generation: u64,
     },
+    BasicPlanned {
+        stats: basic::PlanStats,
+        source_generation: u64,
+        fit_generation: u64,
+    },
+    BasicWaitingForViewport {
+        waiting: bool,
+        source_generation: u64,
+        fit_generation: u64,
+    },
     BasicProgress {
         channel: i32,
         sampled: usize,
@@ -1064,11 +1076,14 @@ enum WorkerEvent {
 struct WorkerDataset {
     dataset: CziDataset,
     query: TileQueryIndex,
+    local: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BasicSampleTask {
     channel: usize,
     tile_id: TileId,
+    staging_bytes: u64,
 }
 
 struct BasicSamplingJob {
@@ -1077,7 +1092,9 @@ struct BasicSamplingJob {
     tasks: VecDeque<BasicSampleTask>,
     sampled: Vec<usize>,
     totals: Vec<usize>,
+    stats: basic::PlanStats,
     verified_scales: HashMap<PlaneKey, Vec<PyramidScale>>,
+    local: bool,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -1325,6 +1342,7 @@ fn worker_loop(
     let mut pending_commands = VecDeque::new();
     let mut basic_sampling: Option<BasicSamplingJob> = None;
     let mut basic_fits: Vec<BasicFitHandle> = Vec::new();
+    let mut basic_waiting_for_viewport = false;
     loop {
         reap_basic_fits(&mut basic_fits);
         let command = match pending_commands.pop_front() {
@@ -1332,6 +1350,12 @@ fn worker_loop(
             None if basic_sampling.is_some() => match commands.try_recv() {
                 Ok(command) => command,
                 Err(TryRecvError::Empty) => {
+                    if basic_waiting_for_viewport {
+                        if let Some(job) = basic_sampling.as_ref() {
+                            send_basic_waiting(events, job, false);
+                        }
+                        basic_waiting_for_viewport = false;
+                    }
                     let outcome = process_basic_sample_step(
                         events,
                         dataset.as_ref(),
@@ -1354,6 +1378,15 @@ fn worker_loop(
                 Err(_) => break,
             },
         };
+        if basic_sampling.is_some()
+            && matches!(&command, WorkerCommand::View(_))
+            && !basic_waiting_for_viewport
+        {
+            if let Some(job) = basic_sampling.as_ref() {
+                send_basic_waiting(events, job, true);
+            }
+            basic_waiting_for_viewport = true;
+        }
         match command {
             WorkerCommand::Open {
                 locator,
@@ -1485,6 +1518,11 @@ fn worker_loop(
                 } else if let Some(opened) = dataset.as_ref() {
                     match start_basic_sampling(opened, request.clone()) {
                         Ok(job) => {
+                            let _ = events.send(WorkerEvent::BasicPlanned {
+                                stats: job.stats.clone(),
+                                source_generation: job.request.source_generation,
+                                fit_generation: job.request.fit_generation,
+                            });
                             basic_sampling = Some(job);
                         }
                         Err(message) => {
@@ -1542,6 +1580,7 @@ fn start_basic_sampling(
         return Err(String::from("BaSiC preparation cancelled."));
     }
     let temp = basic::TempRequest::create(&plan)?;
+    let stats = plan.stats()?;
     let totals = plan
         .channels
         .iter()
@@ -1557,6 +1596,7 @@ fn start_basic_sampling(
                 .map(|candidate| BasicSampleTask {
                     channel,
                     tile_id: candidate.tile_id,
+                    staging_bytes: candidate.staging_bytes,
                 })
                 .collect::<VecDeque<_>>()
         })
@@ -1583,7 +1623,9 @@ fn start_basic_sampling(
         tasks,
         sampled: vec![0; channel_count],
         totals,
+        stats,
         verified_scales,
+        local: opened.local,
         cancelled,
     })
 }
@@ -1599,29 +1641,21 @@ fn process_basic_sample_step(
     let Some(opened) = opened else {
         return send_basic_sample_failure(events, job, "dataset closed during BaSiC sampling");
     };
-    if let Some(task) = job.tasks.pop_front() {
-        let sample = opened
-            .dataset
-            .decoded_tile(task.tile_id.index())
-            .map_err(|error| format!("BaSiC sample tile {}: {error}", task.tile_id))
-            .and_then(|tile| basic::downsample_tile(&tile))
-            .and_then(|pixels| {
-                job.temp
-                    .as_ref()
-                    .ok_or_else(|| String::from("BaSiC request directory is unavailable."))?
-                    .append_sample(task.channel, &pixels)
-            });
-        if let Err(message) = sample {
+    if !job.tasks.is_empty() {
+        let batch = match take_basic_sample_batch(&mut job.tasks, job.local) {
+            Ok(batch) => batch,
+            Err(message) => return send_basic_sample_failure(events, job, &message),
+        };
+        let samples = match decode_basic_sample_batch(opened, &batch, &job.cancelled, job.local) {
+            Ok(samples) => samples,
+            Err(message) => return send_basic_sample_failure(events, job, &message),
+        };
+        if job.cancelled.load(Ordering::Acquire) {
+            return BasicSampleOutcome::Finished;
+        }
+        if let Err(message) = append_basic_samples(events, job, batch, samples) {
             return send_basic_sample_failure(events, job, &message);
         }
-        job.sampled[task.channel] += 1;
-        let _ = events.try_send(WorkerEvent::BasicProgress {
-            channel: job.request.channels[task.channel].c_index,
-            sampled: job.sampled[task.channel],
-            total: job.totals[task.channel],
-            source_generation: job.request.source_generation,
-            fit_generation: job.request.fit_generation,
-        });
         return BasicSampleOutcome::Continue;
     }
     if let Err(message) = job
@@ -1691,6 +1725,153 @@ fn process_basic_sample_step(
     }
 }
 
+fn append_basic_samples(
+    events: &SyncSender<WorkerEvent>,
+    job: &mut BasicSamplingJob,
+    batch: Vec<BasicSampleTask>,
+    samples: Vec<Vec<u16>>,
+) -> Result<(), String> {
+    if batch.len() != samples.len() {
+        return Err(String::from(
+            "BaSiC decoded batch length does not match its sample tasks.",
+        ));
+    }
+    for (task, pixels) in batch.into_iter().zip(samples) {
+        job.temp
+            .as_ref()
+            .ok_or_else(|| String::from("BaSiC request directory is unavailable."))?
+            .append_sample(task.channel, &pixels)?;
+        job.sampled[task.channel] += 1;
+        let _ = events.try_send(WorkerEvent::BasicProgress {
+            channel: job.request.channels[task.channel].c_index,
+            sampled: job.sampled[task.channel],
+            total: job.totals[task.channel],
+            source_generation: job.request.source_generation,
+            fit_generation: job.request.fit_generation,
+        });
+    }
+    Ok(())
+}
+
+fn take_basic_sample_batch(
+    tasks: &mut VecDeque<BasicSampleTask>,
+    local: bool,
+) -> Result<Vec<BasicSampleTask>, String> {
+    let maximum = if local {
+        MAX_BASIC_LOCAL_CONCURRENCY
+    } else {
+        1
+    };
+    let mut staging_bytes = 0_u64;
+    let mut batch = Vec::with_capacity(maximum);
+    while batch.len() < maximum {
+        let Some(task) = tasks.front().copied() else {
+            break;
+        };
+        if task.staging_bytes > MAX_BASIC_STAGING_BYTES {
+            return Err(format!(
+                "BaSiC tile {} needs {} staging bytes; the explicit staging limit is {} bytes.",
+                task.tile_id, task.staging_bytes, MAX_BASIC_STAGING_BYTES
+            ));
+        }
+        let next = staging_bytes
+            .checked_add(task.staging_bytes)
+            .ok_or_else(|| String::from("BaSiC batch staging size overflows."))?;
+        if !batch.is_empty() && next > MAX_BASIC_STAGING_BYTES {
+            break;
+        }
+        staging_bytes = next;
+        batch.push(tasks.pop_front().expect("front task is present"));
+    }
+    Ok(batch)
+}
+
+fn decode_basic_sample_batch(
+    opened: &WorkerDataset,
+    batch: &[BasicSampleTask],
+    cancelled: &AtomicBool,
+    local: bool,
+) -> Result<Vec<Vec<u16>>, String> {
+    let decode = |task: &BasicSampleTask| {
+        opened
+            .dataset
+            .decoded_tile(task.tile_id.index())
+            .map_err(|error| format!("BaSiC sample tile {}: {error}", task.tile_id))
+            .and_then(basic::downsample_tile)
+    };
+    if local {
+        run_bounded_parallel(batch, cancelled, decode)
+    } else {
+        batch
+            .iter()
+            .map(|task| {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(String::from("BaSiC preparation cancelled."));
+                }
+                let result = decode(task)?;
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(String::from("BaSiC preparation cancelled."));
+                }
+                Ok(result)
+            })
+            .collect()
+    }
+}
+
+fn run_bounded_parallel<T, R, F>(
+    inputs: &[T],
+    cancelled: &AtomicBool,
+    operation: F,
+) -> Result<Vec<R>, String>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> Result<R, String> + Sync,
+{
+    if inputs.len() > MAX_BASIC_LOCAL_CONCURRENCY {
+        return Err(format!(
+            "BaSiC local batch has {} operations; the concurrency bound is {MAX_BASIC_LOCAL_CONCURRENCY}.",
+            inputs.len()
+        ));
+    }
+    if cancelled.load(Ordering::Acquire) {
+        return Err(String::from("BaSiC preparation cancelled."));
+    }
+    thread::scope(|scope| {
+        let handles = inputs
+            .iter()
+            .map(|input| {
+                scope.spawn(|| {
+                    if cancelled.load(Ordering::Acquire) {
+                        return Err(String::from("BaSiC preparation cancelled."));
+                    }
+                    let result = operation(input)?;
+                    if cancelled.load(Ordering::Acquire) {
+                        return Err(String::from("BaSiC preparation cancelled."));
+                    }
+                    Ok(result)
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| String::from("BaSiC local sampling worker panicked."))?
+            })
+            .collect()
+    })
+}
+
+fn send_basic_waiting(events: &SyncSender<WorkerEvent>, job: &BasicSamplingJob, waiting: bool) {
+    let _ = events.send(WorkerEvent::BasicWaitingForViewport {
+        waiting,
+        source_generation: job.request.source_generation,
+        fit_generation: job.request.fit_generation,
+    });
+}
+
 fn send_basic_sample_failure(
     events: &SyncSender<WorkerEvent>,
     job: &BasicSamplingJob,
@@ -1742,7 +1923,14 @@ fn send_open_result(
                     remote,
                 })
                 .is_ok();
-            (sent.then_some(WorkerDataset { dataset, query }), sent)
+            (
+                sent.then_some(WorkerDataset {
+                    dataset,
+                    query,
+                    local: !remote,
+                }),
+                sent,
+            )
         }
         Err(OpenFailure {
             message,
@@ -2728,6 +2916,8 @@ struct BasicPreviewState {
     profiles: Option<basic::ProfileSet>,
     verified_scales: HashMap<PlaneKey, Vec<PyramidScale>>,
     progress: HashMap<i32, (usize, usize)>,
+    plan_stats: Option<basic::PlanStats>,
+    waiting_for_viewport: bool,
     error: Option<String>,
     on: bool,
 }
@@ -4119,6 +4309,7 @@ impl ViewerApp {
         self.basic_preview.profiles = None;
         self.basic_preview.verified_scales.clear();
         self.basic_preview.progress.clear();
+        self.basic_preview.waiting_for_viewport = false;
         self.basic_preview.error = None;
         self.basic_preview.phase = BasicPhase::Cancelled;
         if self.basic_preview.on {
@@ -4616,6 +4807,30 @@ impl ViewerApp {
                 ui.weak("Preparation cancelled.");
             }
         }
+        if let Some(stats) = &self.basic_preview.plan_stats {
+            let positions = stats
+                .positions_per_channel
+                .iter()
+                .map(|(channel, count)| format!("C{channel}={count}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            ui.weak(format!("Positions/channel: {positions}"));
+            ui.weak(format!("Total tile reads: {}", stats.total_tile_reads));
+            ui.weak(format!("Representation: {}", stats.representation_label()));
+            ui.weak(format!(
+                "Estimated decoded bytes: {} ({})",
+                stats.estimated_decoded_bytes,
+                format_byte_count(stats.estimated_decoded_bytes)
+            ));
+            ui.weak(format!(
+                "Waiting for viewport: {}",
+                if self.basic_preview.waiting_for_viewport {
+                    "yes"
+                } else {
+                    "no"
+                }
+            ));
+        }
         if let Some(dataset) = self.dataset.as_ref() {
             for channel in &dataset.c.values {
                 let label = channel_label(&dataset.metadata_summary, *channel);
@@ -4972,6 +5187,32 @@ impl ViewerApp {
             {
                 self.status = Status::error(message);
             }
+            WorkerEvent::BasicPlanned {
+                stats,
+                source_generation,
+                fit_generation,
+            } if self
+                .generations
+                .accepts_basic_fit(source_generation, fit_generation) =>
+            {
+                self.basic_preview.progress = stats
+                    .positions_per_channel
+                    .iter()
+                    .map(|(channel, total)| (*channel, (0, *total)))
+                    .collect();
+                self.basic_preview.plan_stats = Some(stats);
+                self.basic_preview.waiting_for_viewport = false;
+            }
+            WorkerEvent::BasicWaitingForViewport {
+                waiting,
+                source_generation,
+                fit_generation,
+            } if self
+                .generations
+                .accepts_basic_fit(source_generation, fit_generation) =>
+            {
+                self.basic_preview.waiting_for_viewport = waiting;
+            }
             WorkerEvent::BasicProgress {
                 channel,
                 sampled,
@@ -4996,6 +5237,7 @@ impl ViewerApp {
                 .accepts_basic_fit(source_generation, fit_generation) =>
             {
                 self.basic_preview.phase = BasicPhase::Fitting;
+                self.basic_preview.waiting_for_viewport = false;
                 self.basic_preview.progress = totals
                     .into_iter()
                     .map(|(channel, total)| (channel, (total, total)))
@@ -5022,6 +5264,7 @@ impl ViewerApp {
                     self.basic_preview.profiles = Some(profiles);
                     self.basic_preview.verified_scales = verified_scales;
                     self.basic_preview.error = None;
+                    self.basic_preview.waiting_for_viewport = false;
                     self.basic_preview.phase = BasicPhase::Ready;
                 } else {
                     self.basic_preview.profiles = None;
@@ -5042,6 +5285,7 @@ impl ViewerApp {
                 self.basic_preview.on = false;
                 self.basic_preview.profiles = None;
                 self.basic_preview.verified_scales.clear();
+                self.basic_preview.waiting_for_viewport = false;
                 self.basic_preview.phase = BasicPhase::Failed;
                 self.basic_preview.error = Some(sanitize_error(message));
             }
@@ -5058,6 +5302,8 @@ impl ViewerApp {
             | WorkerEvent::TileLoaded { .. }
             | WorkerEvent::ViewFinished { .. }
             | WorkerEvent::ViewFailed { .. }
+            | WorkerEvent::BasicPlanned { .. }
+            | WorkerEvent::BasicWaitingForViewport { .. }
             | WorkerEvent::BasicProgress { .. }
             | WorkerEvent::BasicFitting { .. }
             | WorkerEvent::BasicReady { .. }
@@ -8782,6 +9028,79 @@ mod tests {
             })
             .expect("event channel capacity");
         assert_eq!(take_worker_event_batch(&events).len(), 1);
+    }
+
+    fn basic_task(index: usize, staging_bytes: u64) -> BasicSampleTask {
+        BasicSampleTask {
+            channel: index % 3,
+            tile_id: TileId(index),
+            staging_bytes,
+        }
+    }
+
+    #[test]
+    fn local_basic_batches_preserve_order_concurrency_cancellation_and_bounds() {
+        let inputs = [0_u64, 1, 2, 3];
+        let active = std::sync::atomic::AtomicUsize::new(0);
+        let maximum = std::sync::atomic::AtomicUsize::new(0);
+        let output = run_bounded_parallel(&inputs, &AtomicBool::new(false), |input| {
+            let concurrent = active.fetch_add(1, Ordering::AcqRel) + 1;
+            maximum.fetch_max(concurrent, Ordering::AcqRel);
+            thread::sleep(Duration::from_millis(4 * (4 - *input)));
+            active.fetch_sub(1, Ordering::AcqRel);
+            Ok(*input)
+        })
+        .expect("bounded local operations");
+        assert_eq!(output, inputs);
+        assert!((2..=MAX_BASIC_LOCAL_CONCURRENCY).contains(&maximum.load(Ordering::Acquire)));
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let cancel_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            worker_cancelled.store(true, Ordering::Release);
+        });
+        let error = run_bounded_parallel(&inputs, &cancelled, |_| {
+            thread::sleep(Duration::from_millis(20));
+            Ok(())
+        })
+        .expect_err("cancelled local batch");
+        cancel_thread.join().expect("canceller");
+        assert!(error.contains("cancelled"));
+
+        assert!(
+            run_bounded_parallel(&[0, 1, 2, 3, 4], &AtomicBool::new(false), |value| Ok(
+                *value
+            ))
+            .unwrap_err()
+            .contains("concurrency bound")
+        );
+    }
+
+    #[test]
+    fn local_staging_is_bounded_and_remote_sampling_is_serialized() {
+        let half_plus_one = MAX_BASIC_STAGING_BYTES / 2 + 1;
+        let mut local = VecDeque::from([
+            basic_task(0, half_plus_one),
+            basic_task(1, half_plus_one),
+            basic_task(2, 1),
+        ]);
+        let first = take_basic_sample_batch(&mut local, true).expect("first local batch");
+        assert_eq!(first, [basic_task(0, half_plus_one)]);
+        assert_eq!(local.front().copied(), Some(basic_task(1, half_plus_one)));
+
+        let mut oversized = VecDeque::from([basic_task(7, MAX_BASIC_STAGING_BYTES + 1)]);
+        let error = take_basic_sample_batch(&mut oversized, true).expect_err("staging limit");
+        assert!(error.contains(&(MAX_BASIC_STAGING_BYTES + 1).to_string()));
+        assert!(error.contains(&MAX_BASIC_STAGING_BYTES.to_string()));
+        assert_eq!(oversized.len(), 1, "rejected task must not be consumed");
+
+        let mut remote = VecDeque::from([basic_task(0, 1), basic_task(1, 1), basic_task(2, 1)]);
+        for expected in 0..3 {
+            let batch = take_basic_sample_batch(&mut remote, false).expect("remote step");
+            assert_eq!(batch, [basic_task(expected, 1)]);
+        }
+        assert!(remote.is_empty());
     }
 
     #[test]
