@@ -1,9 +1,13 @@
 //! Thread-safe, bounded random-access sources.
 
 use std::fs::{File, Metadata, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
+#[cfg(not(any(unix, windows)))]
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(not(any(unix, windows)))]
+use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 
 use thiserror::Error;
@@ -108,10 +112,13 @@ pub trait RandomAccessSource: Send + Sync {
 
 /// A portable local-file random-access source.
 ///
-/// Reads use a mutex-protected `File` plus `Seek`, so this implementation does not require
-/// platform-specific positional-read APIs.
+/// Unix and Windows use safe positioned-read APIs, so independent reads can run concurrently
+/// without sharing a file cursor. Other targets use a mutex-protected seek/read fallback.
 pub struct LocalFileSource {
     path: PathBuf,
+    #[cfg(any(unix, windows))]
+    file: File,
+    #[cfg(not(any(unix, windows)))]
     file: Mutex<File>,
     info: SourceInfo,
 }
@@ -129,12 +136,16 @@ impl LocalFileSource {
         let info = source_info(&metadata);
         Ok(Self {
             path,
+            #[cfg(any(unix, windows))]
+            file,
+            #[cfg(not(any(unix, windows)))]
             file: Mutex::new(file),
             info,
         })
     }
 
     /// Return the path used to open this source.
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -150,13 +161,60 @@ impl RandomAccessSource for LocalFileSource {
         if dst.is_empty() {
             return Ok(());
         }
-        let mut file = self.file.lock().map_err(|_| {
-            SourceError::Io(io::Error::other("local file source lock was poisoned"))
-        })?;
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(dst)?;
+        #[cfg(any(unix, windows))]
+        {
+            read_exact_positioned(&self.file, offset, dst)?;
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let mut file = self.file.lock().map_err(|_| {
+                SourceError::Io(io::Error::other("local file source lock was poisoned"))
+            })?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(dst)?;
+        }
         Ok(())
     }
+}
+
+#[cfg(any(unix, windows))]
+fn read_exact_positioned(file: &File, mut offset: u64, mut dst: &mut [u8]) -> io::Result<()> {
+    while !dst.is_empty() {
+        match positioned_read(file, dst, offset) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
+            }
+            Ok(read) => {
+                offset = offset
+                    .checked_add(u64::try_from(read).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "positioned read is too large")
+                    })?)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "positioned read offset overflow",
+                        )
+                    })?;
+                dst = &mut dst[read..];
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn positioned_read(file: &File, dst: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, dst, offset)
+}
+
+#[cfg(windows)]
+fn positioned_read(file: &File, dst: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(file, dst, offset)
 }
 
 impl std::fmt::Debug for LocalFileSource {

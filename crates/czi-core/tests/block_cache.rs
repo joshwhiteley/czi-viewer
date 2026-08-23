@@ -187,6 +187,44 @@ fn concurrent_readers_single_flight_one_block_load() {
 }
 
 #[test]
+fn distinct_block_misses_load_concurrently_when_budget_allows() {
+    let mut source = InstrumentedSource::new(8, 7);
+    let gate = Arc::new(Gate::default());
+    source.gate = Some(Arc::clone(&gate));
+    let reads = Arc::clone(&source.reads);
+    let peak_active_bytes = Arc::clone(&source.peak_active_bytes);
+    let cache = Arc::new(BlockCache::new(source, BlockCacheConfig::new(4, 8)).expect("cache"));
+
+    let readers = [0_u64, 4].map(|offset| {
+        let cache = Arc::clone(&cache);
+        thread::spawn(move || {
+            let mut bytes = [0; 4];
+            cache.read_at(offset, &mut bytes).map(|()| bytes)
+        })
+    });
+    let concurrent = gate.wait_until_started_count(2, Duration::from_secs(1));
+    let observed_reads = reads.load(Ordering::SeqCst);
+    let observed_peak = peak_active_bytes.load(Ordering::SeqCst);
+    gate.release();
+    let [first, second] = readers;
+
+    assert_eq!(
+        first.join().expect("first thread").expect("first read"),
+        [0, 1, 2, 3]
+    );
+    assert_eq!(
+        second.join().expect("second thread").expect("second read"),
+        [4, 5, 6, 7]
+    );
+    assert!(
+        concurrent,
+        "distinct misses did not reach the source together"
+    );
+    assert_eq!(observed_reads, 2, "distinct misses serialized");
+    assert_eq!(observed_peak, 8);
+}
+
+#[test]
 fn distinct_misses_reserve_the_one_block_budget() {
     let mut source = InstrumentedSource::new(8, 7);
     let gate = Arc::new(Gate::default());
@@ -317,21 +355,30 @@ impl RandomAccessSource for InstrumentedSource {
 
 #[derive(Default)]
 struct Gate {
-    state: Mutex<(bool, bool)>,
+    state: Mutex<(usize, bool)>,
     changed: Condvar,
 }
 
 impl Gate {
     fn wait_until_started(&self) {
         let mut state = self.state.lock().expect("gate lock");
-        while !state.0 {
+        while state.0 == 0 {
             state = self.changed.wait(state).expect("gate wait");
         }
     }
 
+    fn wait_until_started_count(&self, count: usize, timeout: Duration) -> bool {
+        let state = self.state.lock().expect("gate lock");
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| state.0 < count)
+            .expect("gate wait");
+        state.0 >= count
+    }
+
     fn wait_for_release(&self) {
         let mut state = self.state.lock().expect("gate lock");
-        state.0 = true;
+        state.0 += 1;
         self.changed.notify_all();
         while !state.1 {
             state = self.changed.wait(state).expect("gate wait");
