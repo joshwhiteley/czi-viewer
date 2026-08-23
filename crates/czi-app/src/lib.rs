@@ -2424,6 +2424,7 @@ fn apply_view_finished(
     visible_tiles: &mut HashMap<PlaneKey, Vec<TileId>>,
     pyramid: &mut PyramidDisplay,
     cache: &mut TextureCache,
+    active_state: &ActivePlaneState,
     active_planes: &[PlaneKey],
     source_generation: u64,
     view_generation: u64,
@@ -2443,10 +2444,12 @@ fn apply_view_finished(
     let (visible, resident, bytes) =
         cache.current_counts_for_planes(source_generation, active_planes);
     let (completed, expected) = pyramid.completion_counts();
-    let progress = if pyramid.is_ready() {
-        String::from("Ready")
-    } else {
+    let progress = if !pyramid.is_ready() {
         format!("Loading channels {completed}/{expected}")
+    } else if matches!(active_state, ActivePlaneState::Partial { .. }) {
+        String::from("Partial · Missing assigned channels")
+    } else {
+        String::from("Ready")
     };
     Status::normal(format!(
         "{progress} · Requested {}× · Displayed {}× · {visible} visible · {resident} resident · {} cache",
@@ -3562,15 +3565,22 @@ impl ViewerApp {
                     .iter()
                     .any(|active| active.key() == plane) =>
             {
-                let active_planes = self
-                    .active_planes()
-                    .iter()
-                    .map(|active| active.key())
-                    .collect::<Vec<_>>();
+                let active_state = self.active_plane_state();
+                let active_planes = match &active_state {
+                    ActivePlaneState::Active(planes)
+                    | ActivePlaneState::Partial { active: planes, .. } => planes,
+                    ActivePlaneState::NoActiveChannels | ActivePlaneState::NoMatchingPlanes => {
+                        return;
+                    }
+                }
+                .iter()
+                .map(|active| active.key())
+                .collect::<Vec<_>>();
                 self.status = apply_view_finished(
                     &mut self.visible_tile_ids,
                     &mut self.pyramid_display,
                     &mut self.cache,
+                    &active_state,
                     &active_planes,
                     source_generation,
                     view_generation,
@@ -4061,6 +4071,9 @@ impl ViewerApp {
             {
                 self.request_snapshot(ui.ctx());
             }
+            if let Some(reason) = self.export_unavailable_message() {
+                ui.colored_label(egui::Color32::YELLOW, reason);
+            }
             ui.weak("Wheel: zoom at cursor · Drag: pan · logical world coordinates");
         });
         let title_height = if self.display_mode == DisplayMode::Composite {
@@ -4297,13 +4310,24 @@ fn draw_canvas_title(painter: &egui::Painter, rect: egui::Rect, title: CanvasTit
         egui::Color32::from_rgb(232, 236, 241),
     );
     if let Some(legend) = title.legend {
-        painter.text(
-            egui::pos2(rect.left() + 8.0, rect.top() + 31.0),
-            egui::Align2::LEFT_CENTER,
-            legend,
-            egui::FontId::proportional(12.0),
-            egui::Color32::from_rgb(190, 205, 220),
-        );
+        let font = egui::FontId::proportional(12.0);
+        let color = egui::Color32::from_rgb(190, 205, 220);
+        let available_width = (rect.width() - 16.0).max(0.0);
+        let fitted = fit_text_to_width(&legend, available_width, |candidate| {
+            painter
+                .layout_no_wrap(candidate.to_owned(), font.clone(), color)
+                .size()
+                .x
+        });
+        if !fitted.is_empty() {
+            painter.text(
+                egui::pos2(rect.left() + 8.0, rect.top() + 31.0),
+                egui::Align2::LEFT_CENTER,
+                fitted,
+                font,
+                color,
+            );
+        }
     }
 }
 
@@ -4453,6 +4477,54 @@ fn push_bounded(output: &mut String, text: &str, remaining: &mut usize) -> bool 
         *remaining -= 1;
     }
     characters.next().is_none()
+}
+
+fn fit_text_to_width(
+    text: &str,
+    maximum_width: f32,
+    mut measure: impl FnMut(&str) -> f32,
+) -> String {
+    const MAX_MEASURED_CHARS: usize = MAX_COMPOSITE_LEGEND_CHARS + 16;
+
+    if !maximum_width.is_finite() || maximum_width <= 0.0 {
+        return String::new();
+    }
+    let mut bounded = String::with_capacity(MAX_MEASURED_CHARS);
+    let mut characters = text.chars();
+    for _ in 0..MAX_MEASURED_CHARS {
+        let Some(character) = characters.next() else {
+            break;
+        };
+        bounded.push(character);
+    }
+    if characters.next().is_some() {
+        bounded.pop();
+        bounded.push('…');
+    }
+    let text = bounded.as_str();
+    if measure(text) <= maximum_width {
+        return text.to_owned();
+    }
+    if measure("…") > maximum_width {
+        return String::new();
+    }
+    let mut boundaries = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    boundaries.push(text.len());
+    let mut lower = 0;
+    let mut upper = boundaries.len();
+    while lower + 1 < upper {
+        let middle = usize::midpoint(lower, upper);
+        let candidate = format!("{}…", &text[..boundaries[middle]]);
+        if measure(&candidate) <= maximum_width {
+            lower = middle;
+        } else {
+            upper = middle;
+        }
+    }
+    format!("{}…", &text[..boundaries[lower]])
 }
 
 fn truncate_chars(text: &str, maximum_chars: usize) -> String {
@@ -5678,6 +5750,20 @@ mod tests {
     }
 
     #[test]
+    fn legend_width_fitter_handles_narrow_canvases_and_unicode() {
+        let measure = |text: &str| text.chars().count() as f32 * 10.0;
+        assert_eq!(
+            fit_text_to_width("Channels: AF405=Blue", 500.0, measure),
+            "Channels: AF405=Blue"
+        );
+        let narrow = fit_text_to_width("蛍光=Blue, Bod493=Green", 50.0, measure);
+        assert_eq!(narrow.chars().count(), 5);
+        assert!(narrow.ends_with('…'));
+        assert!(measure(&narrow) <= 50.0);
+        assert_eq!(fit_text_to_width("AF405=Blue", 5.0, measure), "");
+    }
+
+    #[test]
     fn empty_composite_states_have_canvas_and_export_guidance() {
         assert!(
             ActivePlaneState::NoActiveChannels
@@ -6119,11 +6205,16 @@ mod tests {
         );
         let mut visible = HashMap::new();
         let mut cache = TextureCache::new(1024);
+        let active_state = ActivePlaneState::Active(vec![
+            PlaneSelector::new(7, SceneId::Implicit, 0, 0),
+            PlaneSelector::new(11, SceneId::Implicit, 0, 0),
+        ]);
 
         let status = apply_view_finished(
             &mut visible,
             &mut display,
             &mut cache,
+            &active_state,
             &[plane, second_plane],
             3,
             12,
@@ -6141,21 +6232,13 @@ mod tests {
         assert!(status.message.contains("Loading channels 1/2"));
         assert!(status.message.contains("Requested Mixed×"));
         assert!(status.message.contains("Displayed 2×"));
-        assert!(
-            export_blocker(
-                &ActivePlaneState::Active(vec![
-                    PlaneSelector::new(7, SceneId::Implicit, 0, 0),
-                    PlaneSelector::new(11, SceneId::Implicit, 0, 0),
-                ]),
-                &display,
-            )
-            .is_some()
-        );
+        assert!(export_blocker(&active_state, &display).is_some());
 
         let final_status = apply_view_finished(
             &mut visible,
             &mut display,
             &mut cache,
+            &active_state,
             &[plane, second_plane],
             3,
             12,
@@ -6167,15 +6250,41 @@ mod tests {
         assert_eq!(display.displayed_summary(), ScaleSummary::Mixed);
         assert!(final_status.message.contains("Ready"));
         assert!(final_status.message.contains("Displayed Mixed×"));
-        assert!(
-            export_blocker(
-                &ActivePlaneState::Active(vec![
-                    PlaneSelector::new(7, SceneId::Implicit, 0, 0),
-                    PlaneSelector::new(11, SceneId::Implicit, 0, 0),
-                ]),
-                &display,
-            )
-            .is_none()
+        assert!(export_blocker(&active_state, &display).is_none());
+    }
+
+    #[test]
+    fn final_partial_view_finished_stays_partial_and_export_blocked() {
+        let scale = PyramidScale::new(1, 1).expect("scale");
+        let plane = PlaneKey::new(0, SceneId::Implicit, 0, 0);
+        let mut display = PyramidDisplay::default();
+        display.request(3, HashMap::from([(plane, scale)]));
+        let active_state = ActivePlaneState::Partial {
+            active: vec![PlaneSelector::new(0, SceneId::Implicit, 0, 0)],
+            missing_channels: vec![4],
+        };
+        let mut visible = HashMap::new();
+        let mut cache = TextureCache::new(1024);
+
+        let status = apply_view_finished(
+            &mut visible,
+            &mut display,
+            &mut cache,
+            &active_state,
+            &[plane],
+            1,
+            3,
+            plane,
+            scale,
+            vec![TileId(2)],
+        );
+
+        assert!(display.is_ready());
+        assert!(status.message.starts_with("Partial"));
+        assert!(!status.message.contains("Ready"));
+        assert_eq!(
+            export_blocker(&active_state, &display),
+            Some("Some assigned channels are missing from this scene, Z, or T plane.")
         );
     }
 
