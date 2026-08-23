@@ -47,7 +47,7 @@ cargo about --version | grep -q '0\.8\.2$' || {
 
 cd -- "$repo_root"
 mkdir -p -- "$dist_dir" "$app/Contents/MacOS" "$resources"
-rustflags="${RUSTFLAGS:-} --remap-path-prefix=$HOME=~ --remap-path-prefix=$repo_root=. -C link-arg=-Wl,-no_uuid"
+rustflags="${RUSTFLAGS:-} --remap-path-prefix=$HOME=~ --remap-path-prefix=$repo_root=."
 MACOSX_DEPLOYMENT_TARGET="$minimum_macos" RUSTFLAGS="$rustflags" \
   cargo build --locked --release --target "$target" --package czi-viewer
 
