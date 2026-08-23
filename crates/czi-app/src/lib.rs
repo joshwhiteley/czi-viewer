@@ -32,6 +32,8 @@ const MAX_CONSOLE_INPUT_BYTES: usize = 4_096;
 const EMBEDDED_START_TIMEOUT: Duration = Duration::from_secs(10);
 const VIEWPORT_PREFETCH_PERCENT: u64 = 12;
 const MAX_PREFETCH_TILES: usize = 128;
+const MAX_COMPOSITE_LEGEND_CHARS: usize = 96;
+const MAX_CANVAS_TITLE_CHARS: usize = 180;
 const S_IFMT: u32 = 0o170_000;
 const S_IFDIR: u32 = 0o040_000;
 const S_IFREG: u32 = 0o100_000;
@@ -822,6 +824,22 @@ enum TileDecodeResult {
     Failed,
 }
 
+struct PlanePrefetch {
+    hits: Vec<TileHit>,
+}
+
+enum PlaneViewOutcome {
+    Complete(PlanePrefetch),
+    Interrupted(Box<ViewInterruption>),
+    Failed,
+}
+
+enum VisiblePlanesOutcome {
+    Complete(Vec<Vec<TileHit>>),
+    Interrupted(Box<ViewInterruption>),
+    Failed,
+}
+
 struct WorkerBrowseSession {
     profile: String,
     config: OpenSshConfig,
@@ -1476,12 +1494,57 @@ fn process_view(
     if let Some(newer) = take_newer_command(commands, request) {
         return Some(newer);
     }
-    for plane in &request.planes {
-        if let Some(interruption) = process_plane_view(commands, events, opened, request, *plane) {
-            return Some(interruption);
+    let plane_count = request.planes.len();
+    let prefetch_planes = match process_visible_planes(&request.planes, |index, plane| {
+        process_plane_view(
+            commands,
+            events,
+            opened,
+            request,
+            plane,
+            prefetch_quota(index, plane_count, MAX_PREFETCH_TILES),
+        )
+    }) {
+        VisiblePlanesOutcome::Complete(prefetch) => prefetch,
+        VisiblePlanesOutcome::Interrupted(interruption) => return Some(*interruption),
+        VisiblePlanesOutcome::Failed => return None,
+    };
+    let resident = request
+        .resident_tile_ids
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let prefetch = interleave_prefetch(prefetch_planes, MAX_PREFETCH_TILES);
+    let mut interruption =
+        match decode_tiles(commands, events, opened, request, &resident, prefetch, true) {
+            TileDecodeResult::Complete | TileDecodeResult::Failed => return None,
+            TileDecodeResult::Interrupted(interruption) => *interruption,
+        };
+    if interruption
+        .resume
+        .as_ref()
+        .is_some_and(|resume| resume.view_generation == request.view_generation)
+    {
+        interruption.resume = None;
+    }
+    Some(interruption)
+}
+
+fn process_visible_planes(
+    planes: &[PlaneSelector],
+    mut process: impl FnMut(usize, PlaneSelector) -> PlaneViewOutcome,
+) -> VisiblePlanesOutcome {
+    let mut prefetch = Vec::with_capacity(planes.len());
+    for (index, plane) in planes.iter().enumerate() {
+        match process(index, *plane) {
+            PlaneViewOutcome::Complete(plane) => prefetch.push(plane.hits),
+            PlaneViewOutcome::Interrupted(interruption) => {
+                return VisiblePlanesOutcome::Interrupted(interruption);
+            }
+            PlaneViewOutcome::Failed => return VisiblePlanesOutcome::Failed,
         }
     }
-    None
+    VisiblePlanesOutcome::Complete(prefetch)
 }
 
 fn process_plane_view(
@@ -1490,7 +1553,8 @@ fn process_plane_view(
     opened: &WorkerDataset,
     request: &ViewRequest,
     plane: PlaneSelector,
-) -> Option<ViewInterruption> {
+    prefetch_limit: usize,
+) -> PlaneViewOutcome {
     let query = match ViewQuery::new(plane, request.viewport, request.target_downsample)
         .map_err(|error| error.to_string())
         .and_then(|view| opened.query.query(&view).map_err(|error| error.to_string()))
@@ -1502,7 +1566,7 @@ fn process_plane_view(
                 source_generation: request.source_generation,
                 view_generation: request.view_generation,
             });
-            return None;
+            return PlaneViewOutcome::Failed;
         }
     };
     let prefetch = match ViewQuery::new(plane, request.prefetch_viewport, request.target_downsample)
@@ -1516,7 +1580,7 @@ fn process_plane_view(
                 source_generation: request.source_generation,
                 view_generation: request.view_generation,
             });
-            return None;
+            return PlaneViewOutcome::Failed;
         }
     };
 
@@ -1539,8 +1603,10 @@ fn process_plane_view(
         false,
     ) {
         TileDecodeResult::Complete => {}
-        TileDecodeResult::Interrupted(interruption) => return Some(*interruption),
-        TileDecodeResult::Failed => return None,
+        TileDecodeResult::Interrupted(interruption) => {
+            return PlaneViewOutcome::Interrupted(interruption);
+        }
+        TileDecodeResult::Failed => return PlaneViewOutcome::Failed,
     }
     if events
         .send(WorkerEvent::ViewFinished {
@@ -1552,7 +1618,7 @@ fn process_plane_view(
         })
         .is_err()
     {
-        return None;
+        return PlaneViewOutcome::Failed;
     }
     let mut prefetch_decode = prefetch
         .hits
@@ -1560,27 +1626,38 @@ fn process_plane_view(
         .filter(|hit| !visible.contains(&hit.tile_id))
         .collect::<Vec<_>>();
     sort_center_first(&mut prefetch_decode, request.viewport);
-    prefetch_decode.truncate(MAX_PREFETCH_TILES);
-    let mut interruption = match decode_tiles(
-        commands,
-        events,
-        opened,
-        request,
-        &resident,
-        prefetch_decode,
-        true,
-    ) {
-        TileDecodeResult::Complete | TileDecodeResult::Failed => return None,
-        TileDecodeResult::Interrupted(interruption) => *interruption,
-    };
-    if interruption
-        .resume
-        .as_ref()
-        .is_some_and(|resume| resume.view_generation == request.view_generation)
-    {
-        interruption.resume = None;
+    prefetch_decode.truncate(prefetch_limit);
+    PlaneViewOutcome::Complete(PlanePrefetch {
+        hits: prefetch_decode,
+    })
+}
+
+fn prefetch_quota(index: usize, plane_count: usize, limit: usize) -> usize {
+    if plane_count == 0 {
+        return 0;
     }
-    Some(interruption)
+    limit / plane_count + usize::from(index < limit % plane_count)
+}
+
+fn interleave_prefetch(planes: Vec<Vec<TileHit>>, limit: usize) -> Vec<TileHit> {
+    let mut planes = planes.into_iter().map(VecDeque::from).collect::<Vec<_>>();
+    let mut hits = Vec::with_capacity(limit);
+    while hits.len() < limit {
+        let mut added = false;
+        for plane in &mut planes {
+            if let Some(hit) = plane.pop_front() {
+                hits.push(hit);
+                added = true;
+                if hits.len() == limit {
+                    break;
+                }
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    hits
 }
 
 fn decode_tiles(
@@ -1697,6 +1774,36 @@ enum DisplayMode {
     Composite,
 }
 
+enum ActivePlaneState {
+    Active(Vec<PlaneSelector>),
+    NoActiveChannels,
+    NoMatchingPlanes,
+}
+
+impl ActivePlaneState {
+    const fn canvas_message(&self) -> Option<&'static str> {
+        match self {
+            Self::Active(_) => None,
+            Self::NoActiveChannels => Some("No active composite channels. Assign one in Display."),
+            Self::NoMatchingPlanes => {
+                Some("No assigned channels match this scene, Z, and T plane.")
+            }
+        }
+    }
+
+    const fn export_message(&self) -> Option<&'static str> {
+        match self {
+            Self::Active(_) => None,
+            Self::NoActiveChannels => {
+                Some("Assign at least one composite channel before exporting PNG.")
+            }
+            Self::NoMatchingPlanes => {
+                Some("No assigned channels match the selected scene, Z, and T plane.")
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord)]
 enum ChannelRole {
     #[default]
@@ -1717,6 +1824,13 @@ impl ChannelRole {
             Self::Red => "Red",
             Self::Green => "Green",
             Self::Blue => "Blue",
+        }
+    }
+
+    const fn legend_label(self) -> &'static str {
+        match self {
+            Self::Gray => "Gray",
+            _ => self.label(),
         }
     }
 }
@@ -2242,6 +2356,41 @@ fn record_finished_plane(
     visible.insert(plane, visible_tile_ids);
 }
 
+fn optional_scale(scale: Option<PyramidScale>) -> String {
+    scale.map_or_else(|| String::from("—"), format_scale)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_view_finished(
+    visible_tiles: &mut HashMap<PlaneKey, Vec<TileId>>,
+    pyramid: &mut PyramidDisplay,
+    cache: &mut TextureCache,
+    active_planes: &[PlaneKey],
+    source_generation: u64,
+    view_generation: u64,
+    plane: PlaneKey,
+    scale: PyramidScale,
+    visible_tile_ids: Vec<TileId>,
+) -> Status {
+    record_finished_plane(
+        visible_tiles,
+        pyramid,
+        view_generation,
+        plane,
+        scale,
+        visible_tile_ids,
+    );
+    cache.finish_view(source_generation, plane, &visible_tiles[&plane]);
+    let (visible, resident, bytes) =
+        cache.current_counts_for_planes(source_generation, active_planes);
+    Status::normal(format!(
+        "Requested {}× · Displayed {}× · {visible} visible · {resident} resident · {} cache",
+        optional_scale(pyramid.requested),
+        optional_scale(pyramid.displayed),
+        format_bytes(bytes)
+    ))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AuthenticationStatus {
     Connecting,
@@ -2699,25 +2848,31 @@ impl ViewerApp {
         self.remote_selected_path = None;
     }
 
-    fn active_planes(&self) -> Vec<PlaneSelector> {
+    fn active_plane_state(&self) -> ActivePlaneState {
         let Some(dataset) = self.dataset.as_ref() else {
-            return Vec::new();
+            return ActivePlaneState::NoMatchingPlanes;
         };
         if self.display_mode == DisplayMode::Single {
-            return dataset
-                .plane(self.selection)
-                .is_some()
-                .then_some(self.selection)
-                .into_iter()
-                .collect();
+            return if dataset.plane(self.selection).is_some() {
+                ActivePlaneState::Active(vec![self.selection])
+            } else {
+                ActivePlaneState::NoMatchingPlanes
+            };
         }
-        dataset
+        let assigned = dataset
             .c
             .values
             .iter()
             .filter(|channel| {
                 self.channel_roles.get(channel).copied().unwrap_or_default() != ChannelRole::Off
             })
+            .copied()
+            .collect::<Vec<_>>();
+        if assigned.is_empty() {
+            return ActivePlaneState::NoActiveChannels;
+        }
+        let planes = assigned
+            .iter()
             .filter_map(|channel| {
                 let plane = PlaneSelector::new(
                     *channel,
@@ -2727,7 +2882,23 @@ impl ViewerApp {
                 );
                 dataset.plane(plane).is_some().then_some(plane)
             })
-            .collect()
+            .collect::<Vec<_>>();
+        if planes.is_empty() {
+            ActivePlaneState::NoMatchingPlanes
+        } else {
+            ActivePlaneState::Active(planes)
+        }
+    }
+
+    fn active_planes(&self) -> Vec<PlaneSelector> {
+        match self.active_plane_state() {
+            ActivePlaneState::Active(planes) => planes,
+            ActivePlaneState::NoActiveChannels | ActivePlaneState::NoMatchingPlanes => Vec::new(),
+        }
+    }
+
+    fn export_unavailable_message(&self) -> Option<&'static str> {
+        self.active_plane_state().export_message()
     }
 
     fn role_for_plane(&self, plane: PlaneKey) -> ChannelRole {
@@ -2870,6 +3041,10 @@ impl ViewerApp {
     }
 
     fn request_snapshot(&mut self, context: &egui::Context) {
+        if let Some(message) = self.export_unavailable_message() {
+            self.status = Status::error(message);
+            return;
+        }
         if self.pending_snapshot.is_some() || self.snapshot_writing.is_some() {
             self.status = Status::normal("A PNG snapshot is already in progress.");
             return;
@@ -3291,33 +3466,22 @@ impl ViewerApp {
                     .iter()
                     .any(|active| active.key() == plane) =>
             {
-                record_finished_plane(
+                let active_planes = self
+                    .active_planes()
+                    .iter()
+                    .map(|active| active.key())
+                    .collect::<Vec<_>>();
+                self.status = apply_view_finished(
                     &mut self.visible_tile_ids,
                     &mut self.pyramid_display,
+                    &mut self.cache,
+                    &active_planes,
+                    source_generation,
                     view_generation,
                     plane,
                     scale,
                     visible_tile_ids,
                 );
-                self.cache
-                    .finish_view(source_generation, plane, &self.visible_tile_ids[&plane]);
-                let (visible, resident, bytes) = self.active_cache_counts(source_generation);
-                self.status = Status::normal(format!(
-                    "Requested {}× · Displayed {}× · {} visible · {} resident · {} cache",
-                    format_scale(
-                        self.pyramid_display
-                            .requested
-                            .expect("finished request scale")
-                    ),
-                    format_scale(
-                        self.pyramid_display
-                            .displayed
-                            .expect("finished display scale")
-                    ),
-                    visible,
-                    resident,
-                    format_bytes(bytes)
-                ));
             }
             WorkerEvent::ViewFailed {
                 message,
@@ -3793,7 +3957,8 @@ impl ViewerApp {
                 .add_enabled(
                     self.snapshot_region.is_some()
                         && self.pending_snapshot.is_none()
-                        && self.snapshot_writing.is_none(),
+                        && self.snapshot_writing.is_none()
+                        && self.export_unavailable_message().is_none(),
                     egui::Button::new("Save PNG"),
                 )
                 .clicked()
@@ -3810,6 +3975,7 @@ impl ViewerApp {
             self.dataset.as_ref(),
             self.selection,
             self.display_mode,
+            &self.channel_roles,
             self.pyramid_display,
         );
         let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::drag());
@@ -3836,6 +4002,10 @@ impl ViewerApp {
             canvas_message(&painter, response.rect, "Open a CZI to view its mosaic.");
             return;
         };
+        if let Some(message) = self.active_plane_state().canvas_message() {
+            canvas_message(&painter, response.rect, message);
+            return;
+        }
         let Some(plane) = dataset.plane(self.selection) else {
             canvas_message(
                 &painter,
@@ -3999,6 +4169,7 @@ fn draw_canvas_title(
     dataset: Option<&DatasetInfo>,
     selection: PlaneSelection,
     display_mode: DisplayMode,
+    channel_roles: &HashMap<i32, ChannelRole>,
     pyramid: PyramidDisplay,
 ) {
     painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(20, 24, 29));
@@ -4012,19 +4183,30 @@ fn draw_canvas_title(
                 .displayed
                 .map_or_else(|| String::from("—"), format_scale);
             let channel = if display_mode == DisplayMode::Composite {
-                String::from("Composite")
+                format!(
+                    "Composite [{}]",
+                    composite_legend(
+                        &dataset.c,
+                        &dataset.metadata_summary,
+                        channel_roles,
+                        MAX_COMPOSITE_LEGEND_CHARS,
+                    )
+                )
             } else {
                 channel_label(&dataset.metadata_summary, selection.c)
             };
-            format!(
-                "{}  ·  Scene {}  ·  {}  ·  Z {}  ·  T {}  ·  Requested {}×  ·  Displayed {}×",
-                source_filename(&dataset.source_label),
-                scene_label(selection.scene),
-                channel,
-                selection.z,
-                selection.t,
-                requested,
-                displayed,
+            truncate_chars(
+                &format!(
+                    "{}  ·  Scene {}  ·  {}  ·  Z {}  ·  T {}  ·  Requested {}×  ·  Displayed {}×",
+                    source_filename(&dataset.source_label),
+                    scene_label(selection.scene),
+                    channel,
+                    selection.z,
+                    selection.t,
+                    requested,
+                    displayed,
+                ),
+                MAX_CANVAS_TITLE_CHARS,
             )
         },
     );
@@ -4035,6 +4217,39 @@ fn draw_canvas_title(
         egui::FontId::proportional(13.0),
         egui::Color32::from_rgb(232, 236, 241),
     );
+}
+
+fn composite_legend(
+    choices: &DimensionChoices,
+    summary: &MetadataSummary,
+    roles: &HashMap<i32, ChannelRole>,
+    maximum_chars: usize,
+) -> String {
+    let parts = choices.values.iter().filter_map(|channel| {
+        let role = roles.get(channel).copied().unwrap_or_default();
+        (role != ChannelRole::Off).then(|| {
+            let label = summary
+                .channels
+                .iter()
+                .find(|metadata| metadata.index == *channel)
+                .map_or_else(|| format!("C {channel}"), |metadata| metadata.label.clone());
+            format!("{label}={}", role.legend_label())
+        })
+    });
+    truncate_chars(&parts.collect::<Vec<_>>().join(", "), maximum_chars)
+}
+
+fn truncate_chars(text: &str, maximum_chars: usize) -> String {
+    if text.chars().count() <= maximum_chars {
+        return text.to_owned();
+    }
+    if maximum_chars == 0 {
+        return String::new();
+    }
+    text.chars()
+        .take(maximum_chars.saturating_sub(1))
+        .chain(std::iter::once('…'))
+        .collect()
 }
 
 fn source_filename(source: &str) -> String {
@@ -4998,6 +5213,21 @@ mod tests {
         }
     }
 
+    fn hit(tile_id: usize, channel: i32) -> TileHit {
+        TileHit {
+            tile_id: TileId(tile_id),
+            plane: PlaneKey::new(channel, SceneId::Implicit, 0, 0),
+            logical_rect: SpatialRect::new(0, 0, 1, 1).expect("hit bounds"),
+            physical_stored_size: PhysicalSize {
+                width: 1,
+                height: 1,
+            },
+            scale: PyramidScale::new(1, 1).expect("unit scale"),
+            m_index: None,
+            paint_order: tile_id,
+        }
+    }
+
     #[test]
     fn metadata_preview_is_width_bounded_and_unicode_safe() {
         assert_eq!(value_preview("short", 8), "short");
@@ -5129,6 +5359,70 @@ mod tests {
         assert_eq!(green, [79, 143, 15]);
         assert_eq!(blend_channel([0; 3], 200, ChannelRole::Blue), [0, 0, 200]);
         assert_eq!(blend_channel(gray, 255, ChannelRole::Off), gray);
+    }
+
+    #[test]
+    fn composite_legend_uses_metadata_roles_and_char_safe_bounds() {
+        let choices = DimensionChoices {
+            present: true,
+            values: vec![0, 4, 9],
+        };
+        let summary = MetadataSummary {
+            channels: vec![
+                ChannelMetadata {
+                    index: 0,
+                    id: None,
+                    label: String::from("Phase PH3"),
+                },
+                ChannelMetadata {
+                    index: 4,
+                    id: None,
+                    label: String::from("AF405"),
+                },
+                ChannelMetadata {
+                    index: 9,
+                    id: None,
+                    label: String::from("Bod493"),
+                },
+            ],
+            pixel_size: None,
+        };
+        let roles = HashMap::from([
+            (0, ChannelRole::Gray),
+            (4, ChannelRole::Blue),
+            (9, ChannelRole::Green),
+        ]);
+        assert_eq!(
+            composite_legend(&choices, &summary, &roles, 96),
+            "Phase PH3=Gray, AF405=Blue, Bod493=Green"
+        );
+        let bounded = composite_legend(&choices, &summary, &roles, 18);
+        assert_eq!(bounded.chars().count(), 18);
+        assert!(bounded.ends_with('…'));
+    }
+
+    #[test]
+    fn empty_composite_states_have_canvas_and_export_guidance() {
+        assert!(
+            ActivePlaneState::NoActiveChannels
+                .canvas_message()
+                .is_some_and(|message| message.contains("No active"))
+        );
+        assert!(
+            ActivePlaneState::NoActiveChannels
+                .export_message()
+                .is_some_and(|message| message.contains("Assign at least one"))
+        );
+        assert!(
+            ActivePlaneState::NoMatchingPlanes
+                .canvas_message()
+                .is_some_and(|message| message.contains("No assigned channels match"))
+        );
+        assert!(
+            ActivePlaneState::NoMatchingPlanes
+                .export_message()
+                .is_some_and(|message| message.contains("selected scene"))
+        );
     }
 
     #[test]
@@ -5306,6 +5600,50 @@ mod tests {
     }
 
     #[test]
+    fn visible_plane_failure_aborts_before_later_completion() {
+        let planes = [
+            PlaneSelector::new(0, SceneId::Implicit, 0, 0),
+            PlaneSelector::new(4, SceneId::Implicit, 0, 0),
+            PlaneSelector::new(9, SceneId::Implicit, 0, 0),
+        ];
+        let mut visited = Vec::new();
+        let outcome = process_visible_planes(&planes, |_, plane| {
+            visited.push(plane.c);
+            if plane.c == 4 {
+                PlaneViewOutcome::Failed
+            } else {
+                PlaneViewOutcome::Complete(PlanePrefetch { hits: Vec::new() })
+            }
+        });
+        assert!(matches!(outcome, VisiblePlanesOutcome::Failed));
+        assert_eq!(visited, vec![0, 4]);
+    }
+
+    #[test]
+    fn prefetch_is_round_robin_and_globally_bounded() {
+        let prefetched = interleave_prefetch(
+            vec![vec![hit(1, 0), hit(2, 0)], vec![hit(10, 4), hit(11, 4)]],
+            3,
+        );
+        assert_eq!(
+            prefetched.iter().map(|hit| hit.tile_id).collect::<Vec<_>>(),
+            vec![TileId(1), TileId(10), TileId(2)]
+        );
+        assert_eq!(
+            (0..3)
+                .map(|index| prefetch_quota(index, 3, 8))
+                .collect::<Vec<_>>(),
+            vec![3, 3, 2]
+        );
+        assert_eq!(
+            (0..3)
+                .map(|index| prefetch_quota(index, 3, 8))
+                .sum::<usize>(),
+            8
+        );
+    }
+
+    #[test]
     fn saturated_view_queue_keeps_only_the_latest_pending_view_without_an_error() {
         let (sender, receiver) = mpsc::sync_channel(1);
         sender
@@ -5479,6 +5817,35 @@ mod tests {
         assert_eq!(visible[&plane], vec![TileId(3), TileId(8)]);
         assert_eq!(display.requested, Some(one));
         assert_eq!(display.displayed, None);
+    }
+
+    #[test]
+    fn mismatched_first_view_finished_event_formats_status_without_panicking() {
+        let requested = PyramidScale::new(1, 1).expect("requested scale");
+        let completed = PyramidScale::new(2, 1).expect("completed scale");
+        let plane = PlaneKey::new(7, SceneId::Implicit, 0, 0);
+        let mut display = PyramidDisplay::default();
+        display.request(12, requested);
+        let mut visible = HashMap::new();
+        let mut cache = TextureCache::new(1024);
+
+        let status = apply_view_finished(
+            &mut visible,
+            &mut display,
+            &mut cache,
+            &[plane],
+            3,
+            12,
+            plane,
+            completed,
+            vec![TileId(5)],
+        );
+
+        assert_eq!(visible[&plane], vec![TileId(5)]);
+        assert_eq!(display.displayed, None);
+        assert!(!status.is_error);
+        assert!(status.message.contains("Requested 1×"));
+        assert!(status.message.contains("Displayed —×"));
     }
 
     #[test]
