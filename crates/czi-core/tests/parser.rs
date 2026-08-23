@@ -9,6 +9,11 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+#[path = "support/synthetic_czi.rs"]
+mod synthetic_czi;
+
+use synthetic_czi::{append_segment, dimension};
+
 const SEGMENT_HEADER_SIZE: usize = 32;
 const FILE_HEADER_DATA_SIZE: usize = 512;
 const DIRECTORY_DATA_SIZE: usize = 128;
@@ -764,34 +769,6 @@ fn attachment_directory_data(attachment_offset: u64) -> Vec<u8> {
     entry[40..43].copy_from_slice(b"JPG");
     entry[48..57].copy_from_slice(b"thumbnail");
     data
-}
-
-fn dimension(entry: &mut [u8], index: usize, code: [u8; 4], start: i32, logical: i32, stored: i32) {
-    let offset = DV_FIXED_SIZE + index * DIMENSION_SIZE;
-    entry[offset..offset + 4].copy_from_slice(&code);
-    entry[offset + 4..offset + 8].copy_from_slice(&start.to_le_bytes());
-    entry[offset + 8..offset + 12].copy_from_slice(&logical.to_le_bytes());
-    entry[offset + 12..offset + 16].copy_from_slice(&0.0_f32.to_le_bytes());
-    entry[offset + 16..offset + 20].copy_from_slice(&stored.to_le_bytes());
-}
-
-fn append_segment(file: &mut Vec<u8>, id: &[u8], mut data: Vec<u8>, used: Option<usize>) -> u64 {
-    while data.len() % 32 != 0 {
-        data.push(0);
-    }
-    let offset = u64::try_from(file.len()).expect("file offset");
-    let used = used.unwrap_or(data.len());
-    let mut header = [0; SEGMENT_HEADER_SIZE];
-    header[..id.len()].copy_from_slice(id);
-    header[16..24].copy_from_slice(
-        &u64::try_from(data.len())
-            .expect("allocated size")
-            .to_le_bytes(),
-    );
-    header[24..32].copy_from_slice(&u64::try_from(used).expect("used size").to_le_bytes());
-    file.extend_from_slice(&header);
-    file.extend_from_slice(&data);
-    offset
 }
 
 fn distinct_dimension_starts(dataset: &CziDataset, code: DimensionCode) -> Vec<i32> {
