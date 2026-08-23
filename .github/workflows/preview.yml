@@ -1,0 +1,64 @@
+name: macOS Preview
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "preview-*"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: macos-14
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Install packaging tools
+        run: |
+          cargo install cargo-about --version 0.8.2 --locked
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+      - name: Package preview
+        run: scripts/package-macos.sh
+      - name: Verify preview
+        run: scripts/verify-macos-release.sh
+      - name: Attest release artifacts
+        if: github.server_url == 'https://github.com'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.zip
+            dist/*.cdx.json
+            dist/*NOTICES.html
+            dist/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: czi-viewer-macos-preview
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/preview-')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: czi-viewer-macos-preview
+          path: dist
+      - name: Publish prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          generate_release_notes: true
+          files: dist/*
