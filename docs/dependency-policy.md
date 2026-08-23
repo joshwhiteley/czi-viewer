@@ -16,7 +16,9 @@ Dependencies normally require one of these licenses:
 - OFL-1.1
 - Ubuntu-font-1.0
 
-Other permissive licenses require explicit review. GPL, LGPL, AGPL, SSPL, and proprietary runtime dependencies are not allowed.
+Other permissive licenses require explicit review. GPL, LGPL, AGPL, SSPL, and proprietary runtime dependencies are not allowed in the distributed application.
+
+The optional Tufts VPN integration has one narrow external-tool exception. A user may separately install OpenConnect (LGPL-2.1-only) and ocproxy (BSD-3-Clause). The viewer invokes them only as absolute-path executables from a fixed matching Homebrew pair. They are not linked, bundled, copied, or distributed with the viewer and are not part of its Rust dependency graph. This exception does not permit other LGPL dependencies or distributed native code. The shipped application remains pure Rust.
 
 The eframe `default_fonts` feature embeds font assets under OFL-1.1 and Ubuntu-font-1.0. These two font licenses are allowed only for those bundled assets.
 

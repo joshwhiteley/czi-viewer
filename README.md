@@ -36,10 +36,14 @@ The remote viewer uses your normal macOS OpenSSH configuration and profiles from
 
 1. Start the viewer with `cargo run --release -p czi-viewer`.
 2. Choose **SSH**. The **Remote files** panel opens on the right.
-3. Enter an existing OpenSSH profile or host alias, such as `lab-czi`, then click **Connect**.
+3. Keep the default **Direct SSH** mode. Enter an existing OpenSSH profile or host alias, such as `lab-czi`, then click **Connect**.
 4. When the authentication terminal opens, it takes keyboard focus. Click it again to refocus, then type the normal password, 2FA, or host-key response. Typing goes directly to system `ssh`. The viewer does not store, echo, parse, or interpret credentials. There is no password field.
 5. After SFTP VERSION succeeds, the authentication terminal hides. Use **Home**, **Up**, **Refresh**, or the editable path and **Go** to browse.
 6. Click once to select an entry. Double-click a directory to enter it. Double-click a `.czi` file, or select it and click **Open selected CZI**.
+
+### Optional Tufts VPN mode
+
+On macOS, **Tufts VPN** mode can connect to the fixed `login-prod.pax.tufts.edu` SSH target without changing system routes. It requires separately installed Homebrew OpenConnect and ocproxy tools. Enter only your VPN username in the app. Complete the VPN and SSH authentication phases in their terminals. Passwords and Duo responses are never fields and are not stored. See [Tufts VPN setup and security](docs/tufts-vpn.md).
 
 Remote browsing, opening, and range reads use one authenticated, read-only SFTP session. Directory actions and opening a selected CZI do not prompt again. Change the profile or click **Reconnect** to create a new session. The browser remains available while a dataset is open; use **Hide remote browser** in the open bar to give the canvas more room.
 
@@ -55,9 +59,7 @@ The compact strip above the canvas identifies the source file, Scene, named Chan
 
 Click **Save PNG** in the canvas toolbar to export only the annotated title strip and canvas. Side panels and controls are excluded. The viewer crops the native egui screenshot at the current display scale, then writes and encodes PNG on a background Rust thread. It saves to `~/Desktop` when it exists, otherwise the current working directory. Filenames are sanitized and include a Unix timestamp; collisions receive a numeric suffix.
 
-The viewer does not launch a shell, parse prompts, automate Terminal, prefill commands, use `SSH_ASKPASS`, or retain credentials, passwords, or one-time codes. OpenSSH stdin/stdout carry only binary SFTP packets; authentication output stays on the PTY. Closing the viewer stops its worker sessions. The viewer never writes to the remote host.
-
-A real Tufts connection is out of scope until a user provides a remote path and is present to authenticate.
+Direct SSH does not launch a shell, parse prompts, automate Terminal, prefill commands, use `SSH_ASKPASS`, or retain credentials, passwords, or one-time codes. OpenSSH stdin/stdout carry only binary SFTP packets; authentication output stays on the PTY. Optional Tufts VPN mode gives OpenConnect a fixed, private helper command for ocproxy; no username, password, path, prompt text, or other user input enters that command. Closing the viewer stops its SSH and VPN process groups. The viewer never writes to the remote host.
 
 ## Development and tests
 
