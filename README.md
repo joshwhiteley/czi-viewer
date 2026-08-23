@@ -28,7 +28,7 @@ For a local file, you can also pass a path on the command line:
 cargo run --release -p czi-viewer -- /path/to/image.czi
 ```
 
-The command-line argument is always a local path. In the window, choose **Local**, paste a local CZI path, and click **Open**. You can also drag a local CZI from Finder.
+The command-line argument is always a local path. In the window, choose **Local**, click **Choose CZI…**, paste a local CZI path and click **Open**, or drag a local CZI from Finder.
 
 ## Open a remote CZI through SSH
 
@@ -59,7 +59,7 @@ The compact strip above the canvas identifies the source file, Scene, named Chan
 
 ### Optional BaSiC preview
 
-BaSiC fitting uses a separately installed helper executable. Set `CZI_BASIC_HELPER` to its absolute path before launching the viewer. Open a local or SSH CZI, then click **Prepare BaSiC Preview** in **Display**. Preparation samples every sparse C channel on the background dataset worker, yields to visible viewport requests between tiles, and can be cancelled. The resulting profiles exist only in memory. **BaSiC Preview** remains **Off** until every channel has a valid profile.
+BaSiC fitting uses a separately installed helper executable. Click **Choose helper…** once, or set `CZI_BASIC_HELPER` to an absolute override path. The chosen canonical executable path is stored privately under macOS Application Support and can be cleared in the app; profiles remain session-only. Open a local or SSH CZI, then click **Prepare BaSiC Preview** in **Display**. Preparation samples every sparse C channel on the background dataset worker, yields to visible viewport requests between bounded batches, and can be cancelled. **BaSiC Preview** remains **Off** until every channel has a valid profile.
 
 Turning the preview **On** clears the rendered texture cache and reloads the bounded visible viewport without changing the display range or field of view. Correction is flat-field only; unsupported profile pixels remain raw. Corrected PNG snapshots include `BaSiC preview · darkfield off · not quantitatively validated`. The viewer does not export corrected CZI/TIFF files or persist profiles. See [BaSiC preview and helper protocol](docs/basic-preview.md).
 

@@ -15,6 +15,8 @@ use czi_core::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::settings::validate_helper_path;
+
 pub(crate) const GRID_WIDTH: u32 = 128;
 pub(crate) const GRID_HEIGHT: u32 = 128;
 pub(crate) const MAX_SAMPLES_PER_CHANNEL: usize = 512;
@@ -291,15 +293,8 @@ impl Drop for TempRequest {
     }
 }
 
-pub(crate) fn helper_from_env() -> Result<PathBuf, String> {
-    let value = std::env::var_os("CZI_BASIC_HELPER").ok_or_else(|| {
-        String::from("Set CZI_BASIC_HELPER to an absolute helper executable path.")
-    })?;
-    let path = PathBuf::from(value);
-    if !path.is_absolute() {
-        return Err(String::from("CZI_BASIC_HELPER must be an absolute path."));
-    }
-    Ok(path)
+pub(crate) fn helper_from_env() -> Option<PathBuf> {
+    std::env::var_os("CZI_BASIC_HELPER").map(PathBuf::from)
 }
 
 pub(crate) fn run_helper(
@@ -307,14 +302,7 @@ pub(crate) fn run_helper(
     request: &TempRequest,
     cancelled: &AtomicBool,
 ) -> Result<ProfileSet, String> {
-    if !helper.is_absolute() {
-        return Err(String::from("BaSiC helper path is not absolute."));
-    }
-    let helper = fs::canonicalize(helper)
-        .map_err(|error| format!("Could not resolve BaSiC helper executable: {error}"))?;
-    if !helper.is_file() {
-        return Err(String::from("BaSiC helper does not name a regular file."));
-    }
+    let helper = validate_helper_path(helper)?;
     if cancelled.load(Ordering::Acquire) {
         return Err(String::from("BaSiC preparation cancelled."));
     }

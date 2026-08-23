@@ -5,6 +5,8 @@
 )]
 
 mod basic;
+mod chooser;
+mod settings;
 mod tufts_vpn;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1524,11 +1526,12 @@ enum BasicSampleOutcome {
 
 fn start_basic_sampling(
     opened: &WorkerDataset,
-    request: BasicRequest,
+    mut request: BasicRequest,
 ) -> Result<BasicSamplingJob, String> {
     if request.cancelled.load(Ordering::Acquire) {
         return Err(String::from("BaSiC preparation cancelled."));
     }
+    request.helper = settings::validate_helper_path(&request.helper)?;
     let plan = basic::plan_samples(
         opened.dataset.index(),
         &opened.query,
@@ -3426,6 +3429,11 @@ pub struct ViewerApp {
     worker: DatasetWorker,
     open_mode: OpenMode,
     path_input: String,
+    native_choosers: chooser::NativeChoosers,
+    helper_settings: settings::HelperSettingsWorker,
+    chosen_helper_path: Option<PathBuf>,
+    helper_settings_generation: u64,
+    helper_settings_error: Option<String>,
     remote_connection_mode: RemoteConnectionMode,
     ssh_profile_input: String,
     vpn_username_input: String,
@@ -3485,6 +3493,11 @@ impl ViewerApp {
             path_input: initial_path
                 .as_ref()
                 .map_or_else(String::new, |path| path.display().to_string()),
+            native_choosers: chooser::NativeChoosers::default(),
+            helper_settings: settings::HelperSettingsWorker::spawn(),
+            chosen_helper_path: None,
+            helper_settings_generation: 0,
+            helper_settings_error: None,
             remote_connection_mode: RemoteConnectionMode::default(),
             ssh_profile_input: String::new(),
             vpn_username_input: String::new(),
@@ -3550,6 +3563,81 @@ impl ViewerApp {
         self.pending_view = None;
     }
 
+    fn poll_native_choosers(&mut self) {
+        while let Some(result) = self.native_choosers.try_recv() {
+            match (result.kind, result.selection) {
+                (chooser::ChooserKind::Czi, Ok(Some(path))) => {
+                    self.open_mode = OpenMode::Local;
+                    self.path_input = path.display().to_string();
+                    self.open_local_path_value(path);
+                }
+                (chooser::ChooserKind::Helper, Ok(Some(path))) => {
+                    self.chosen_helper_path = Some(path.clone());
+                    self.helper_settings_error = None;
+                    self.helper_settings_generation =
+                        self.helper_settings_generation.wrapping_add(1);
+                    if let Err(error) = self
+                        .helper_settings
+                        .save(path, self.helper_settings_generation)
+                    {
+                        self.helper_settings_error = Some(error);
+                    }
+                }
+                (_, Ok(None)) => {}
+                (_, Err(error)) => self.status = Status::error(error),
+            }
+        }
+    }
+
+    fn poll_helper_settings(&mut self) {
+        while let Some(result) = self.helper_settings.try_recv() {
+            match result {
+                settings::SettingsResult::Loaded { result, generation } => {
+                    if generation != self.helper_settings_generation {
+                        continue;
+                    }
+                    match result {
+                        Ok(path) => {
+                            self.chosen_helper_path = path;
+                            self.helper_settings_error = None;
+                        }
+                        Err(error) => self.helper_settings_error = Some(error),
+                    }
+                }
+                settings::SettingsResult::Saved { result, generation } => {
+                    if generation != self.helper_settings_generation {
+                        continue;
+                    }
+                    match result {
+                        Ok(path) => {
+                            self.chosen_helper_path = Some(path);
+                            self.helper_settings_error = None;
+                        }
+                        Err(error) => self.helper_settings_error = Some(error),
+                    }
+                }
+                settings::SettingsResult::Cleared { result, generation } => {
+                    if generation != self.helper_settings_generation {
+                        continue;
+                    }
+                    match result {
+                        Ok(()) => self.helper_settings_error = None,
+                        Err(error) => self.helper_settings_error = Some(error),
+                    }
+                }
+            }
+        }
+    }
+
+    fn clear_chosen_helper(&mut self) {
+        self.helper_settings_generation = self.helper_settings_generation.wrapping_add(1);
+        self.chosen_helper_path = None;
+        self.helper_settings_error = None;
+        if let Err(error) = self.helper_settings.clear(self.helper_settings_generation) {
+            self.helper_settings_error = Some(error);
+        }
+    }
+
     fn remote_connection_identity(&self) -> Result<RemoteConnectionIdentity, String> {
         match self.remote_connection_mode {
             RemoteConnectionMode::DirectSsh => {
@@ -3574,11 +3662,14 @@ impl ViewerApp {
     }
 
     fn open_local_path(&mut self) {
-        let path = PathBuf::from(self.path_input.trim());
         if self.path_input.trim().is_empty() {
             self.status = Status::error("Enter a local .czi path first.");
             return;
         }
+        self.open_local_path_value(PathBuf::from(self.path_input.trim()));
+    }
+
+    fn open_local_path_value(&mut self, path: PathBuf) {
         self.disconnect_remote_for_local_source();
         self.open_locator(DatasetLocator::Local(path));
     }
@@ -3984,7 +4075,12 @@ impl ViewerApp {
             self.basic_preview.phase = BasicPhase::Failed;
             return;
         }
-        let helper = match basic::helper_from_env() {
+        let helper = basic::helper_from_env()
+            .or_else(|| self.chosen_helper_path.clone())
+            .ok_or_else(|| {
+                String::from("Choose a BaSiC helper, or set CZI_BASIC_HELPER to an absolute path.")
+            });
+        let helper = match helper {
             Ok(helper) => helper,
             Err(error) => {
                 self.basic_preview.error = Some(error);
@@ -4415,6 +4511,42 @@ impl ViewerApp {
         ui.separator();
         ui.heading("BaSiC preview");
         ui.weak("Reversible display preview only. The CZI is never modified.");
+        ui.horizontal(|ui| {
+            let choose = ui
+                .add_enabled(
+                    !self.native_choosers.helper_pending(),
+                    egui::Button::new("Choose helper…"),
+                )
+                .clicked();
+            if choose && let Err(error) = self.native_choosers.choose_helper() {
+                self.helper_settings_error = Some(error);
+            }
+            if ui
+                .add_enabled(
+                    self.chosen_helper_path.is_some(),
+                    egui::Button::new("Clear"),
+                )
+                .clicked()
+            {
+                self.clear_chosen_helper();
+            }
+            if self.native_choosers.helper_pending() {
+                ui.spinner();
+            }
+        });
+        if let Some(environment) = basic::helper_from_env() {
+            ui.weak(format!(
+                "Helper: {} (CZI_BASIC_HELPER override)",
+                environment.display()
+            ));
+        } else if let Some(chosen) = &self.chosen_helper_path {
+            ui.weak(format!("Helper: {}", chosen.display()));
+        } else {
+            ui.weak("No helper chosen.");
+        }
+        if let Some(error) = &self.helper_settings_error {
+            ui.colored_label(egui::Color32::LIGHT_RED, error);
+        }
         let ready = self.basic_preview.ready_for(self.dataset.as_ref());
         let mut prepare = false;
         let mut cancel = false;
@@ -6490,6 +6622,8 @@ impl eframe::App for ViewerApp {
         self.ui_frame = self.ui_frame.wrapping_add(1);
         self.handle_screenshot_events(context);
         self.poll_snapshot_results();
+        self.poll_native_choosers();
+        self.poll_helper_settings();
         self.handle_dropped_files(context);
         self.handle_worker_events();
         self.poll_embedded_authentication(context);
@@ -6513,12 +6647,25 @@ impl eframe::App for ViewerApp {
                     match self.open_mode {
                         OpenMode::Local => {
                             ui.label("CZI");
-                            let field_width = (ui.available_width() - 146.0).max(120.0);
+                            let field_width = (ui.available_width() - 252.0).max(120.0);
                             let response = ui.add_sized(
                                 [field_width, 24.0],
                                 egui::TextEdit::singleline(&mut self.path_input)
                                     .hint_text("/path/to/image.czi"),
                             );
+                            if ui
+                                .add_enabled(
+                                    !self.native_choosers.czi_pending(),
+                                    egui::Button::new("Choose CZI…"),
+                                )
+                                .clicked()
+                                && let Err(error) = self.native_choosers.choose_czi()
+                            {
+                                self.status = Status::error(error);
+                            }
+                            if self.native_choosers.czi_pending() {
+                                ui.spinner();
+                            }
                             let open = ui.button("Open").clicked()
                                 || (response.lost_focus()
                                     && ui.input(|input| input.key_pressed(egui::Key::Enter)));

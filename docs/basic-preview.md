@@ -4,7 +4,7 @@ The BaSiC feature is a reversible display preview. It never modifies the CZI, wr
 
 ## Configure the helper
 
-Install a compatible helper separately and launch the viewer with an absolute path:
+Install a compatible helper separately, then click **Choose helper…** in the BaSiC preview panel. The viewer validates and stores only its canonical absolute executable path in a private, bounded settings file under macOS Application Support. **Clear** removes that choice. You can instead provide an environment override:
 
 ```sh
 CZI_BASIC_HELPER=/absolute/path/to/basic-helper cargo run --release -p czi-viewer
