@@ -551,7 +551,6 @@ struct DatasetInfo {
     z: DimensionChoices,
     t: DimensionChoices,
     planes: Vec<PlaneInfo>,
-    basic_verified_scales: HashMap<PlaneKey, Vec<PyramidScale>>,
     pixel_type: PixelType,
     metadata: MetadataDocument,
     metadata_summary: MetadataSummary,
@@ -599,8 +598,6 @@ impl DatasetInfo {
             z: query_dimension_choices(tiles, DimensionCode::Z, &query.axis_choices().z),
             t: query_dimension_choices(tiles, DimensionCode::T, &query.axis_choices().t),
             planes: query.planes().cloned().collect(),
-            basic_verified_scales: basic::verified_scales(dataset.index(), query)
-                .expect("a valid tile query has verifiable native scales"),
             pixel_type,
             metadata,
             metadata_summary,
@@ -1051,6 +1048,7 @@ enum WorkerEvent {
     },
     BasicReady {
         profiles: basic::ProfileSet,
+        verified_scales: HashMap<PlaneKey, Vec<PyramidScale>>,
         source_generation: u64,
         fit_generation: u64,
     },
@@ -1077,6 +1075,7 @@ struct BasicSamplingJob {
     tasks: VecDeque<BasicSampleTask>,
     sampled: Vec<usize>,
     totals: Vec<usize>,
+    verified_scales: HashMap<PlaneKey, Vec<PyramidScale>>,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -1094,7 +1093,9 @@ impl BasicCancellationSlot {
     fn replace(&self, cancelled: &Arc<AtomicBool>) {
         if let Ok(mut current) = self.current.lock() {
             if let Some(previous) = current.replace(Arc::clone(cancelled)) {
-                previous.store(true, Ordering::Release);
+                if !Arc::ptr_eq(&previous, cancelled) {
+                    previous.store(true, Ordering::Release);
+                }
             }
         }
     }
@@ -1532,7 +1533,12 @@ fn start_basic_sampling(
     if request.cancelled.load(Ordering::Acquire) {
         return Err(String::from("BaSiC preparation cancelled."));
     }
-    let plan = basic::plan_samples(opened.dataset.index(), &opened.query, &request.channels)?;
+    let plan = basic::plan_samples(
+        opened.dataset.index(),
+        &opened.query,
+        &request.channels,
+        &request.cancelled,
+    )?;
     if request.cancelled.load(Ordering::Acquire) {
         return Err(String::from("BaSiC preparation cancelled."));
     }
@@ -1571,12 +1577,14 @@ fn start_basic_sampling(
     }
     let channel_count = totals.len();
     let cancelled = Arc::clone(&request.cancelled);
+    let verified_scales = plan.verified_scales;
     Ok(BasicSamplingJob {
         request,
         temp: Some(temp),
         tasks,
         sampled: vec![0; channel_count],
         totals,
+        verified_scales,
         cancelled,
     })
 }
@@ -1647,6 +1655,7 @@ fn process_basic_sample_step(
     let cancelled = Arc::clone(&job.cancelled);
     let worker_cancelled = Arc::clone(&cancelled);
     let helper_events = events.clone();
+    let verified_scales = std::mem::take(&mut job.verified_scales);
     let temp = job
         .temp
         .take()
@@ -1661,6 +1670,7 @@ fn process_basic_sample_step(
             let event = match result {
                 Ok(profiles) => WorkerEvent::BasicReady {
                     profiles,
+                    verified_scales,
                     source_generation,
                     fit_generation,
                 },
@@ -2717,6 +2727,7 @@ enum BasicPhase {
 struct BasicPreviewState {
     phase: BasicPhase,
     profiles: Option<basic::ProfileSet>,
+    verified_scales: HashMap<PlaneKey, Vec<PyramidScale>>,
     progress: HashMap<i32, (usize, usize)>,
     error: Option<String>,
     on: bool,
@@ -2731,13 +2742,36 @@ impl BasicPreviewState {
         matches!(self.phase, BasicPhase::Sampling | BasicPhase::Fitting)
     }
 
-    fn ready_for(&self, channels: &[i32]) -> bool {
+    fn ready_for(&self, dataset: Option<&DatasetInfo>) -> bool {
+        let Some(dataset) = dataset else {
+            return false;
+        };
         self.phase == BasicPhase::Ready
             && self
                 .profiles
                 .as_ref()
-                .is_some_and(|profiles| profiles.is_ready_for(channels))
+                .is_some_and(|profiles| profiles.is_ready_for(&dataset.c.values))
+            && basic_scale_map_is_ready(dataset, &self.verified_scales)
     }
+}
+
+fn basic_scale_map_is_ready(
+    dataset: &DatasetInfo,
+    verified: &HashMap<PlaneKey, Vec<PyramidScale>>,
+) -> bool {
+    basic_scale_map_covers_planes(&dataset.planes, verified)
+}
+
+fn basic_scale_map_covers_planes(
+    planes: &[PlaneInfo],
+    verified: &HashMap<PlaneKey, Vec<PyramidScale>>,
+) -> bool {
+    verified.len() == planes.len()
+        && planes.iter().all(|plane| {
+            verified.get(&plane.key).is_some_and(|scales| {
+                !scales.is_empty() && scales.iter().all(|scale| plane.scales.contains(scale))
+            })
+        })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3991,6 +4025,7 @@ impl ViewerApp {
         self.generations.begin_basic_fit();
         let _ = self.worker.send(WorkerCommand::BasicCancel);
         self.basic_preview.profiles = None;
+        self.basic_preview.verified_scales.clear();
         self.basic_preview.progress.clear();
         self.basic_preview.error = None;
         self.basic_preview.phase = BasicPhase::Cancelled;
@@ -4000,11 +4035,7 @@ impl ViewerApp {
     }
 
     fn set_basic_preview_enabled(&mut self, enabled: bool) {
-        let channels = self
-            .dataset
-            .as_ref()
-            .map_or_else(Vec::new, |dataset| dataset.c.values.clone());
-        let enabled = enabled && self.basic_preview.ready_for(&channels);
+        let enabled = enabled && self.basic_preview.ready_for(self.dataset.as_ref());
         if self.basic_preview.on == enabled {
             return;
         }
@@ -4015,12 +4046,22 @@ impl ViewerApp {
         self.invalidate_view();
     }
 
-    fn basic_profile(&self, channel: i32) -> Option<&basic::ChannelProfile> {
+    fn basic_profile(
+        &self,
+        plane: PlaneKey,
+        scale: PyramidScale,
+    ) -> Option<&basic::ChannelProfile> {
         self.basic_preview
             .on
             .then_some(())
+            .filter(|()| {
+                self.basic_preview
+                    .verified_scales
+                    .get(&plane)
+                    .is_some_and(|verified| verified.contains(&scale))
+            })
             .and(self.basic_preview.profiles.as_ref())
-            .and_then(|profiles| profiles.channels.get(&channel))
+            .and_then(|profiles| profiles.channels.get(&plane.c))
     }
 
     fn active_cache_counts(&self, source_generation: u64) -> (usize, usize, usize) {
@@ -4064,11 +4105,7 @@ impl ViewerApp {
                 .iter()
                 .filter_map(|plane| {
                     let info = self.dataset.as_ref()?.plane(*plane)?;
-                    let verified = self
-                        .dataset
-                        .as_ref()?
-                        .basic_verified_scales
-                        .get(&plane.key())?;
+                    let verified = self.basic_preview.verified_scales.get(&plane.key())?;
                     basic::select_verified_scale(&info.scales, verified, target_downsample)
                         .map(|scale| (plane.key(), scale))
                 })
@@ -4382,11 +4419,7 @@ impl ViewerApp {
         ui.separator();
         ui.heading("BaSiC preview");
         ui.weak("Reversible display preview only. The CZI is never modified.");
-        let channels = self
-            .dataset
-            .as_ref()
-            .map_or_else(Vec::new, |dataset| dataset.c.values.clone());
-        let ready = self.basic_preview.ready_for(&channels);
+        let ready = self.basic_preview.ready_for(self.dataset.as_ref());
         let mut prepare = false;
         let mut cancel = false;
         ui.horizontal(|ui| {
@@ -4842,6 +4875,7 @@ impl ViewerApp {
             }
             WorkerEvent::BasicReady {
                 profiles,
+                verified_scales,
                 source_generation,
                 fit_generation,
             } if self
@@ -4852,8 +4886,13 @@ impl ViewerApp {
                     .dataset
                     .as_ref()
                     .map_or_else(Vec::new, |dataset| dataset.c.values.clone());
-                if profiles.is_ready_for(&channels) {
+                let scales_ready = self
+                    .dataset
+                    .as_ref()
+                    .is_some_and(|dataset| basic_scale_map_is_ready(dataset, &verified_scales));
+                if profiles.is_ready_for(&channels) && scales_ready {
                     self.basic_preview.profiles = Some(profiles);
+                    self.basic_preview.verified_scales = verified_scales;
                     self.basic_preview.error = None;
                     self.basic_preview.phase = BasicPhase::Ready;
                 } else {
@@ -4874,6 +4913,7 @@ impl ViewerApp {
             {
                 self.basic_preview.on = false;
                 self.basic_preview.profiles = None;
+                self.basic_preview.verified_scales.clear();
                 self.basic_preview.phase = BasicPhase::Failed;
                 self.basic_preview.error = Some(sanitize_error(message));
             }
@@ -4991,7 +5031,7 @@ impl ViewerApp {
                 m_index: None,
                 paint_order: pending.paint_order,
             };
-            let basic_profile = self.basic_profile(pending.plane.c).cloned();
+            let basic_profile = self.basic_profile(pending.plane, pending.scale).cloned();
             match texture_image(
                 &pending.tile,
                 self.levels,
@@ -7018,6 +7058,32 @@ mod tests {
     }
 
     #[test]
+    fn basic_readiness_requires_verified_scales_for_every_sparse_plane() {
+        let one = PyramidScale::new(1, 1).expect("scale");
+        let two = PyramidScale::new(2, 1).expect("scale");
+        let plane = PlaneInfo {
+            key: PlaneKey::new(0, SceneId::Implicit, 0, 0),
+            world_bounds: SpatialRect::new(0, 0, 10, 10).expect("bounds"),
+            scales: vec![one, two],
+        };
+        assert!(!basic_scale_map_covers_planes(
+            std::slice::from_ref(&plane),
+            &HashMap::new()
+        ));
+        assert!(!basic_scale_map_covers_planes(
+            std::slice::from_ref(&plane),
+            &HashMap::from([(
+                plane.key,
+                vec![PyramidScale::new(3, 1).expect("wrong scale")]
+            )]),
+        ));
+        assert!(basic_scale_map_covers_planes(
+            std::slice::from_ref(&plane),
+            &HashMap::from([(plane.key, vec![one, two])]),
+        ));
+    }
+
+    #[test]
     fn cancelled_queued_basic_start_carries_a_sticky_token() {
         let (sender, receiver) = mpsc::sync_channel(2);
         sender
@@ -7042,6 +7108,20 @@ mod tests {
             panic!("expected BaSiC start");
         };
         assert!(request.cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn registering_a_started_basic_request_keeps_its_token_live() {
+        let slot = BasicCancellationSlot::default();
+        let started = Arc::new(AtomicBool::new(false));
+        slot.replace(&started);
+        slot.replace(&started);
+        assert!(!started.load(Ordering::Acquire));
+
+        let replacement = Arc::new(AtomicBool::new(false));
+        slot.replace(&replacement);
+        assert!(started.load(Ordering::Acquire));
+        assert!(!replacement.load(Ordering::Acquire));
     }
 
     #[test]

@@ -23,7 +23,7 @@ pub(crate) const WARN_SAMPLES_PER_CHANNEL: usize = 100;
 const MAX_CHANNELS: usize = 64;
 const MAX_CHANNEL_NAME_CHARS: usize = 128;
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
-const MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_INPUT_BYTES: u64 = 32 * 1024 * 1024;
 const MIN_SUPPORTED_GAIN: f32 = 1.0e-6;
 const MAX_SUPPORTED_GAIN: f32 = 1.0e6;
 const RESPONSE_JSON_LIMIT: u64 = 64 * 1024;
@@ -55,6 +55,7 @@ pub(crate) struct ChannelSamplePlan {
 #[derive(Clone, Debug)]
 pub(crate) struct SamplePlan {
     pub(crate) channels: Vec<ChannelSamplePlan>,
+    pub(crate) verified_scales: HashMap<PlaneKey, Vec<PyramidScale>>,
 }
 
 #[derive(Clone, Debug)]
@@ -178,7 +179,7 @@ impl TempRequest {
         })?;
         if aggregate_bytes > MAX_INPUT_BYTES {
             return Err(String::from(
-                "BaSiC samples exceed the 256 MiB protocol v1 input bound.",
+                "BaSiC samples exceed the 32 MiB protocol v1 input bound.",
             ));
         }
         let mut request = Self {
@@ -363,7 +364,9 @@ pub(crate) fn plan_samples(
     index: &DatasetIndex,
     query: &TileQueryIndex,
     specs: &[ChannelSpec],
+    cancelled: &AtomicBool,
 ) -> Result<SamplePlan, String> {
+    check_cancelled(cancelled)?;
     if specs.is_empty() || specs.len() > MAX_CHANNELS {
         return Err(String::from("CZI has an invalid sparse channel count."));
     }
@@ -378,12 +381,14 @@ pub(crate) fn plan_samples(
             "BaSiC request does not exactly match the CZI sparse channels.",
         ));
     }
-    let verified_scales = verified_scales(index, query)?;
+    let verified_scales = verified_scales(index, query, cancelled)?;
     let mut native_channels = Vec::with_capacity(specs.len());
     for spec in specs {
+        check_cancelled(cancelled)?;
         validate_channel_spec(spec)?;
         let mut native_hits = Vec::new();
         for plane in query.planes().filter(|plane| plane.key.c == spec.c_index) {
+            check_cancelled(cancelled)?;
             let native = *plane
                 .scales
                 .first()
@@ -404,13 +409,14 @@ pub(crate) fn plan_samples(
                 MIN_SAMPLES_PER_CHANNEL
             ));
         }
-        let pixel_max = channel_pixel_max(index, &native_hits)?;
+        let pixel_max = channel_pixel_max(index, &native_hits, cancelled)?;
         native_channels.push((spec, pixel_max, native_hits));
     }
     let phase_alignment = if specs.iter().any(|spec| spec.is_phase) {
         let mut common: Option<Vec<AcquisitionIdentity>> = None;
         for (_, _, hits) in &native_channels {
-            let identities = unique_acquisition_hits(hits)?
+            check_cancelled(cancelled)?;
+            let identities = unique_acquisition_hits(hits, cancelled)?
                 .keys()
                 .copied()
                 .collect::<Vec<_>>();
@@ -449,8 +455,9 @@ pub(crate) fn plan_samples(
         .map(|identities| stratified_values(identities, common_count));
     let mut channels = Vec::with_capacity(specs.len());
     for (spec, pixel_max, native_hits) in native_channels {
+        check_cancelled(cancelled)?;
         let selected = if let Some(identities) = selected_phase_identities.as_ref() {
-            let hits = unique_acquisition_hits(&native_hits)?;
+            let hits = unique_acquisition_hits(&native_hits, cancelled)?;
             identities
                 .iter()
                 .map(|identity| {
@@ -465,6 +472,7 @@ pub(crate) fn plan_samples(
         let candidates = selected
             .into_iter()
             .map(|native| {
+                check_cancelled(cancelled)?;
                 sample_representation(query, native, &verified_scales)
                     .map(|tile_id| SampleCandidate { tile_id })
             })
@@ -475,15 +483,20 @@ pub(crate) fn plan_samples(
             candidates,
         });
     }
-    Ok(SamplePlan { channels })
+    Ok(SamplePlan {
+        channels,
+        verified_scales,
+    })
 }
 
 pub(crate) fn verified_scales(
     index: &DatasetIndex,
     query: &TileQueryIndex,
+    cancelled: &AtomicBool,
 ) -> Result<HashMap<PlaneKey, Vec<PyramidScale>>, String> {
     let mut result = HashMap::new();
     for plane in query.planes() {
+        check_cancelled(cancelled)?;
         let native_scale = *plane
             .scales
             .first()
@@ -492,15 +505,18 @@ pub(crate) fn verified_scales(
             .query_at_scale(plane.key.into(), plane.world_bounds, native_scale)
             .map_err(|error| error.to_string())?
             .hits;
-        let native_signatures = unique_hit_signatures(index, &native)?;
+        let native_signatures = unique_hit_signatures(index, &native, cancelled)?;
         let mut scales = Vec::new();
         if let Some(native_signatures) = native_signatures {
             for scale in &plane.scales {
+                check_cancelled(cancelled)?;
                 let hits = query
                     .query_at_scale(plane.key.into(), plane.world_bounds, *scale)
                     .map_err(|error| error.to_string())?
                     .hits;
-                if unique_hit_signatures(index, &hits)?.as_ref() == Some(&native_signatures) {
+                if unique_hit_signatures(index, &hits, cancelled)?.as_ref()
+                    == Some(&native_signatures)
+                {
                     scales.push(*scale);
                 }
             }
@@ -511,6 +527,14 @@ pub(crate) fn verified_scales(
         result.insert(plane.key, scales);
     }
     Ok(result)
+}
+
+fn check_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
+    if cancelled.load(Ordering::Acquire) {
+        Err(String::from("BaSiC preparation cancelled."))
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) fn select_verified_scale(
@@ -824,9 +848,14 @@ fn open_checked_regular(
     Ok(file)
 }
 
-fn channel_pixel_max(index: &DatasetIndex, hits: &[TileHit]) -> Result<u16, String> {
+fn channel_pixel_max(
+    index: &DatasetIndex,
+    hits: &[TileHit],
+    cancelled: &AtomicBool,
+) -> Result<u16, String> {
     let mut maximum = None;
     for hit in hits {
+        check_cancelled(cancelled)?;
         let tile = index
             .tile(hit.tile_id.index())
             .ok_or_else(|| String::from("BaSiC sample tile is missing from the CZI index."))?;
@@ -875,10 +904,12 @@ fn sample_representation(
 fn unique_hit_signatures(
     index: &DatasetIndex,
     hits: &[TileHit],
+    cancelled: &AtomicBool,
 ) -> Result<Option<Vec<DetectorTileSignature>>, String> {
     let mut signatures = hits
         .iter()
         .map(|hit| {
+            check_cancelled(cancelled)?;
             let pixel_type = index
                 .tile(hit.tile_id.index())
                 .ok_or_else(|| String::from("Pyramid tile is missing from the CZI index."))?
@@ -930,9 +961,11 @@ fn acquisition_identity(hit: TileHit) -> AcquisitionIdentity {
 
 fn unique_acquisition_hits(
     hits: &[TileHit],
+    cancelled: &AtomicBool,
 ) -> Result<BTreeMap<AcquisitionIdentity, TileHit>, String> {
     let mut indexed = BTreeMap::new();
     for hit in hits {
+        check_cancelled(cancelled)?;
         if indexed.insert(acquisition_identity(*hit), *hit).is_some() {
             return Err(String::from(
                 "BaSiC acquisition positions are not one-to-one within a sparse channel.",
@@ -1139,6 +1172,7 @@ mod tests {
                 pixel_max: 255,
                 candidates: vec![SampleCandidate { tile_id: TileId(0) }; MIN_SAMPLES_PER_CHANNEL],
             }],
+            verified_scales: HashMap::new(),
         };
         let request = TempRequest::create(&plan).expect("temp request");
         assert!(
@@ -1245,11 +1279,14 @@ mod tests {
 
     #[test]
     fn aggregate_protocol_bound_reduces_the_common_sample_count() {
-        assert_eq!(aggregate_sample_cap(17).expect("17 channels"), 481);
-        assert_eq!(aggregate_sample_cap(64).expect("64 channels"), 128);
+        assert_eq!(aggregate_sample_cap(3).expect("3 channels"), 341);
+        assert_eq!(aggregate_sample_cap(17).expect("17 channels"), 60);
+        assert_eq!(aggregate_sample_cap(32).expect("32 channels"), 32);
+        assert_eq!(aggregate_sample_cap(64).expect("64 channels"), 16);
         let bytes =
-            expected_sample_bytes(aggregate_sample_cap(64).expect("cap")).expect("bytes") * 64;
+            expected_sample_bytes(aggregate_sample_cap(32).expect("cap")).expect("bytes") * 32;
         assert_eq!(bytes, MAX_INPUT_BYTES);
+        assert_eq!(expected_sample_bytes(300).expect("bytes") * 3, 29_491_200);
     }
 
     #[test]
@@ -1309,6 +1346,7 @@ mod tests {
                 pixel_max: u16::MAX,
                 candidates: vec![SampleCandidate { tile_id: TileId(0) }; MIN_SAMPLES_PER_CHANNEL],
             }],
+            verified_scales: HashMap::new(),
         };
         let request = TempRequest::create(&plan).expect("request");
         for sample in 0..MIN_SAMPLES_PER_CHANNEL {
