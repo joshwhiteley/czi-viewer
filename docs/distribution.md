@@ -4,7 +4,7 @@ The repository builds one distributable product: **CZI Viewer** for Apple Silico
 
 ## Build a preview
 
-Run this on an Apple Silicon Mac with Xcode command-line tools, Rust 1.88.0, `cargo-about` 0.8.2, and `cargo-cyclonedx` 0.5.9 installed:
+Run this on an Apple Silicon Mac with Xcode command-line tools, Rust 1.88.0, `cargo-about` 0.8.2, `cargo-cyclonedx` 0.5.9, and `jq` installed:
 
 ```sh
 cargo install cargo-about --version 0.8.2 --locked
@@ -35,14 +35,10 @@ The attestation command applies to artifacts produced on GitHub.com. Run it from
 
 ## Preview security posture
 
-These are ad-hoc signed preview builds. They are not Developer ID signed and are not notarized. Gatekeeper will warn or block the first launch. Users who trust the source can use Finder's **Open** action after downloading, or remove the download quarantine attribute themselves:
-
-```sh
-xattr -dr com.apple.quarantine "CZI Viewer.app"
-```
+These are ad-hoc signed preview builds. They are not Developer ID signed and are not notarized. Gatekeeper will warn or block the first launch. Users who trust the source can Control-click the app in Finder and select **Open**, or select **Open Anyway** in **System Settings → Privacy & Security**.
 
 Do not describe this preview as notarized or generally trusted by Gatekeeper.
 
 ## CI releases
 
-`.github/workflows/preview.yml` runs manually and for `preview-*` tags. It uploads the ZIP, checksums, SBOM, and notices as an artifact, and requests GitHub artifact attestations on GitHub.com. A tag run creates a prerelease; ordinary and manual runs do not write repository contents.
+`.github/workflows/preview.yml` runs manually and for `preview-*` tags. It uploads the ZIP, checksums, SBOM, and notices as an artifact, and requests GitHub artifact attestations on GitHub.com. Only a `push` of a preview tag creates a prerelease; manual runs never write repository contents.

@@ -11,6 +11,10 @@ output_name=$(basename -- "$output" .cdx.json)
 source_output="$repo_root/crates/czi-app/${output_name}.json"
 
 command -v cargo >/dev/null
+command -v jq >/dev/null || {
+  printf '%s\n' 'jq is required to normalize the SBOM.' >&2
+  exit 1
+}
 cargo cyclonedx --version | grep -q '0\.5\.9$' || {
   printf '%s\n' 'cargo-cyclonedx 0.5.9 is required; install it with: cargo install cargo-cyclonedx --version 0.5.9 --locked' >&2
   exit 1
@@ -33,4 +37,25 @@ cargo cyclonedx \
 }
 mv -- "$source_output" "$output"
 find "$repo_root/crates" -maxdepth 2 -type f -name "${output_name}.json" -delete
+
+# cargo-cyclonedx emits local file URLs, absolute workspace paths, and a creation
+# timestamp. Remove them and sort every object key for a reproducible SBOM.
+normalized_output="$output_dir/.${output_name}.normalized.json"
+jq -S '
+  def normalize:
+    if type == "object" then
+      with_entries(
+        select(.key != "serialNumber" and .key != "timestamp")
+        | .value |= normalize
+      )
+    elif type == "array" then map(normalize)
+    elif type == "string" then
+      gsub("[?&]download_url=file://[^&[:space:]\\\"]+"; "")
+      | gsub("file:///[^[:space:]\\\"#?]+"; "file://.")
+      | gsub("/Users/[^[:space:]\\\"#?]+"; ".")
+    else .
+    end;
+  normalize
+' "$output" > "$normalized_output"
+mv -- "$normalized_output" "$output"
 printf 'Wrote %s\n' "$output"

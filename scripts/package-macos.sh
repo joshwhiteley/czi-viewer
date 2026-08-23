@@ -15,6 +15,7 @@ resources="$app/Contents/Resources"
 zip_path="$dist_dir/${artifact_stem}.zip"
 sbom_path="$dist_dir/${artifact_stem}-sbom.cdx.json"
 notices_path="$dist_dir/${artifact_stem}-THIRD-PARTY-NOTICES.html"
+source_date_epoch=${SOURCE_DATE_EPOCH:-$(git -C "$repo_root" log -1 --format=%ct)}
 
 cleanup() {
   rm -rf -- "$work_dir"
@@ -26,7 +27,14 @@ if [[ $(uname -s) != Darwin || $(uname -m) != arm64 ]]; then
   exit 1
 fi
 
-for tool in cargo iconutil codesign ditto plutil shasum; do
+[[ $source_date_epoch =~ ^[0-9]+$ ]] || {
+  printf 'SOURCE_DATE_EPOCH must be seconds since the Unix epoch: %s\n' "$source_date_epoch" >&2
+  exit 1
+}
+export SOURCE_DATE_EPOCH="$source_date_epoch"
+bundle_timestamp=$(TZ=UTC date -r "$source_date_epoch" '+%Y%m%d%H%M.%S')
+
+for tool in cargo date iconutil codesign ditto plutil shasum zip jq; do
   command -v "$tool" >/dev/null || {
     printf 'Required tool not found: %s\n' "$tool" >&2
     exit 1
@@ -39,7 +47,8 @@ cargo about --version | grep -q '0\.8\.2$' || {
 
 cd -- "$repo_root"
 mkdir -p -- "$dist_dir" "$app/Contents/MacOS" "$resources"
-MACOSX_DEPLOYMENT_TARGET="$minimum_macos" \
+rustflags="${RUSTFLAGS:-} --remap-path-prefix=$HOME=~ --remap-path-prefix=$repo_root=."
+MACOSX_DEPLOYMENT_TARGET="$minimum_macos" RUSTFLAGS="$rustflags" \
   cargo build --locked --release --target "$target" --package czi-viewer
 
 binary="$repo_root/target/$target/release/czi-viewer"
@@ -64,9 +73,14 @@ cp -- "$notices_path" "$resources/THIRD-PARTY-NOTICES.html"
 
 # This is intentionally not Developer ID signing or notarization.
 codesign --force --deep --sign - --timestamp=none "$app"
+# Normalize every bundle entry after signing so the archive has stable timestamps.
+find "$app" -exec touch -t "$bundle_timestamp" {} +
 
 rm -f -- "$zip_path" "$dist_dir/SHA256SUMS"
-ditto -c -k --keepParent "$app" "$zip_path"
+(
+  cd -- "$work_dir"
+  find "${product}.app" -print | LC_ALL=C sort | zip -X -q "$zip_path" -@
+)
 (
   cd -- "$dist_dir"
   shasum -a 256 "$(basename -- "$zip_path")" "$(basename -- "$sbom_path")" "$(basename -- "$notices_path")" > SHA256SUMS

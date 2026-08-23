@@ -31,7 +31,7 @@ fail() {
 [[ -f "$dist_dir/$sbom_name" ]] || fail "SBOM does not exist in $dist_dir"
 [[ -f "$dist_dir/$notices_name" ]] || fail "notices do not exist in $dist_dir"
 [[ -f "$dist_dir/SHA256SUMS" ]] || fail "SHA256SUMS does not exist in $dist_dir"
-for tool in codesign ditto lipo otool plutil shasum cmp; do
+for tool in codesign ditto lipo otool plutil shasum cmp grep jq; do
   command -v "$tool" >/dev/null || fail "required tool not found: $tool"
 done
 
@@ -42,6 +42,15 @@ actual_manifest=$(awk 'NF != 2 { exit 1 } { print $2 }' "$dist_dir/SHA256SUMS") 
   cd -- "$dist_dir"
   shasum -a 256 -c SHA256SUMS
 )
+normalized_sbom="$extract_dir/normalized-sbom.cdx.json"
+jq -S . "$dist_dir/$sbom_name" > "$normalized_sbom"
+cmp -s "$normalized_sbom" "$dist_dir/$sbom_name" || fail 'SBOM keys are not in stable order'
+if jq -e '.. | objects | select(has("serialNumber") or has("timestamp"))' "$dist_dir/$sbom_name" >/dev/null; then
+  fail 'SBOM contains a nondeterministic serialNumber or timestamp'
+fi
+if jq -e '.. | strings | select(test("/Users/|file:///|download_url=file:"))' "$dist_dir/$sbom_name" >/dev/null; then
+  fail 'SBOM contains an absolute builder path or local download URL'
+fi
 ditto -x -k "$archive" "$extract_dir"
 app="$extract_dir/${product}.app"
 binary="$app/Contents/MacOS/czi-viewer"
@@ -91,6 +100,9 @@ signature=$(codesign -dv --verbose=4 "$app" 2>&1)
 [[ $signature != *'Authority='* ]] || fail 'application unexpectedly has an identity certificate'
 
 [[ -z $(find "$app/Contents" -type l -print -quit) ]] || fail 'application contains a symlink'
+if grep -R -a -q '/Users/' "$app/Contents"; then
+  fail 'application contains an absolute builder path'
+fi
 expected_files=$(printf '%s\n' \
   '_CodeSignature/CodeResources' \
   'Info.plist' \
