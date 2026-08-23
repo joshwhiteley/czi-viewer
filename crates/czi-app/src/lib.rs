@@ -601,14 +601,14 @@ fn accepts_open_result(
 struct ViewRequest {
     source_generation: u64,
     view_generation: u64,
-    plane: PlaneSelector,
+    planes: Vec<PlaneSelector>,
     viewport: SpatialRect,
     prefetch_viewport: SpatialRect,
     target_downsample: f64,
     resident_tile_ids: Vec<TileId>,
 }
 
-type ViewRequestKey = (PlaneKey, SpatialRect, u64);
+type ViewRequestKey = (Vec<PlaneKey>, SpatialRect, u64);
 
 enum ViewSubmission {
     Sent,
@@ -1476,7 +1476,22 @@ fn process_view(
     if let Some(newer) = take_newer_command(commands, request) {
         return Some(newer);
     }
-    let query = match ViewQuery::new(request.plane, request.viewport, request.target_downsample)
+    for plane in &request.planes {
+        if let Some(interruption) = process_plane_view(commands, events, opened, request, *plane) {
+            return Some(interruption);
+        }
+    }
+    None
+}
+
+fn process_plane_view(
+    commands: &Receiver<WorkerCommand>,
+    events: &SyncSender<WorkerEvent>,
+    opened: &WorkerDataset,
+    request: &ViewRequest,
+    plane: PlaneSelector,
+) -> Option<ViewInterruption> {
+    let query = match ViewQuery::new(plane, request.viewport, request.target_downsample)
         .map_err(|error| error.to_string())
         .and_then(|view| opened.query.query(&view).map_err(|error| error.to_string()))
     {
@@ -1490,13 +1505,9 @@ fn process_view(
             return None;
         }
     };
-    let prefetch = match ViewQuery::new(
-        request.plane,
-        request.prefetch_viewport,
-        request.target_downsample,
-    )
-    .map_err(|error| error.to_string())
-    .and_then(|view| opened.query.query(&view).map_err(|error| error.to_string()))
+    let prefetch = match ViewQuery::new(plane, request.prefetch_viewport, request.target_downsample)
+        .map_err(|error| error.to_string())
+        .and_then(|view| opened.query.query(&view).map_err(|error| error.to_string()))
     {
         Ok(query) => query,
         Err(message) => {
@@ -1677,6 +1688,98 @@ enum OpenMode {
     #[default]
     Local,
     Ssh,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum DisplayMode {
+    #[default]
+    Single,
+    Composite,
+}
+
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord)]
+enum ChannelRole {
+    #[default]
+    Off,
+    Gray,
+    Red,
+    Green,
+    Blue,
+}
+
+impl ChannelRole {
+    const ALL: [Self; 5] = [Self::Off, Self::Gray, Self::Red, Self::Green, Self::Blue];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Gray => "Gray / Phase",
+            Self::Red => "Red",
+            Self::Green => "Green",
+            Self::Blue => "Blue",
+        }
+    }
+}
+
+fn blend_channel(base: [u8; 3], intensity: u8, role: ChannelRole) -> [u8; 3] {
+    if role == ChannelRole::Gray {
+        return [intensity; 3];
+    }
+    let overlay = match role {
+        ChannelRole::Red => [u8::MAX, 0, 0],
+        ChannelRole::Green => [0, u8::MAX, 0],
+        ChannelRole::Blue => [0, 0, u8::MAX],
+        ChannelRole::Off | ChannelRole::Gray => return base,
+    };
+    let alpha = u16::from(intensity);
+    let inverse = u16::from(u8::MAX - intensity);
+    std::array::from_fn(|index| {
+        let value = u16::from(overlay[index]) * alpha + u16::from(base[index]) * inverse;
+        u8::try_from(value / u16::from(u8::MAX)).expect("source-over channel fits u8")
+    })
+}
+
+fn default_channel_roles(
+    choices: &DimensionChoices,
+    summary: &MetadataSummary,
+) -> HashMap<i32, ChannelRole> {
+    let mut roles = HashMap::new();
+    for channel in &choices.values {
+        let label = channel_label(summary, *channel).to_ascii_lowercase();
+        let role = if ["phase", "brightfield", "bright field", "transmitted"]
+            .iter()
+            .any(|needle| label.contains(needle))
+        {
+            ChannelRole::Gray
+        } else if [
+            "hada",
+            "dapi",
+            "hoechst",
+            "af405",
+            "af 405",
+            "alexa fluor 405",
+            "alexa 405",
+        ]
+        .iter()
+        .any(|needle| label.contains(needle))
+        {
+            ChannelRole::Blue
+        } else if ["bodipy", "bod493", "fitc", "gfp"]
+            .iter()
+            .any(|needle| label.contains(needle))
+        {
+            ChannelRole::Green
+        } else {
+            ChannelRole::Off
+        };
+        roles.insert(*channel, role);
+    }
+    if !roles.values().any(|role| *role != ChannelRole::Off)
+        && let Some(first) = choices.values.first()
+    {
+        roles.insert(*first, ChannelRole::Gray);
+    }
+    roles
 }
 
 impl Status {
@@ -1871,7 +1974,11 @@ fn display_intensity(value: u16, levels: Levels) -> u8 {
     u8::try_from(scaled).expect("scaled grayscale intensity fits in u8")
 }
 
-fn texture_image(tile: &DecodedTile, levels: Levels) -> Result<egui::ColorImage, &'static str> {
+fn texture_image(
+    tile: &DecodedTile,
+    levels: Levels,
+    role: ChannelRole,
+) -> Result<egui::ColorImage, &'static str> {
     let width = usize::try_from(tile.width).map_err(|_| "tile width does not fit usize")?;
     let height = usize::try_from(tile.height).map_err(|_| "tile height does not fit usize")?;
     let pixel_count = width
@@ -1900,7 +2007,18 @@ fn texture_image(tile: &DecodedTile, levels: Levels) -> Result<egui::ColorImage,
         }
         _ => return Err("decoded pixel count does not match the tile dimensions"),
     }
-    Ok(egui::ColorImage::from_gray([width, height], &grayscale))
+    let pixels = grayscale
+        .into_iter()
+        .map(|value| match role {
+            ChannelRole::Off => egui::Color32::TRANSPARENT,
+            ChannelRole::Gray => egui::Color32::from_gray(value),
+            ChannelRole::Red | ChannelRole::Green | ChannelRole::Blue => {
+                let [red, green, blue] = blend_channel([0; 3], value, role);
+                egui::Color32::from_rgba_premultiplied(red, green, blue, value)
+            }
+        })
+        .collect();
+    Ok(egui::ColorImage::new([width, height], pixels))
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1908,6 +2026,10 @@ struct TextureKey {
     source_generation: u64,
     plane: PlaneKey,
     tile_id: TileId,
+}
+
+fn cache_key_is_active(key: TextureKey, source_generation: u64, planes: &[PlaneKey]) -> bool {
+    key.source_generation == source_generation && planes.contains(&key.plane)
 }
 
 struct TextureEntry {
@@ -1952,11 +2074,11 @@ impl TextureCache {
         self.evict_non_visible();
     }
 
-    fn begin_view(&mut self, source_generation: u64, plane: PlaneKey) -> Vec<TileId> {
+    fn begin_view(&mut self, source_generation: u64, planes: &[PlaneKey]) -> Vec<TileId> {
         self.protected = self
             .entries
             .keys()
-            .filter(|key| key.source_generation == source_generation && key.plane == plane)
+            .filter(|key| key.source_generation == source_generation && planes.contains(&key.plane))
             .copied()
             .collect();
         for entry in self.entries.values_mut() {
@@ -1970,7 +2092,7 @@ impl TextureCache {
         self.evict_non_visible();
         self.entries
             .keys()
-            .filter(|key| key.source_generation == source_generation && key.plane == plane)
+            .filter(|key| key.source_generation == source_generation && planes.contains(&key.plane))
             .map(|key| key.tile_id)
             .collect()
     }
@@ -2003,12 +2125,13 @@ impl TextureCache {
     }
 
     fn finish_view(&mut self, source_generation: u64, plane: PlaneKey, visible: &[TileId]) {
-        self.protected.clear();
+        self.protected
+            .retain(|key| key.source_generation != source_generation || key.plane != plane);
         let visible = visible.iter().copied().collect::<HashSet<_>>();
         for (key, entry) in &mut self.entries {
-            entry.visible = key.source_generation == source_generation
-                && key.plane == plane
-                && visible.contains(&key.tile_id);
+            if key.source_generation == source_generation && key.plane == plane {
+                entry.visible = visible.contains(&key.tile_id);
+            }
         }
         self.evict_non_visible();
     }
@@ -2037,11 +2160,15 @@ impl TextureCache {
         }
     }
 
-    fn current_counts(&self, source_generation: u64, plane: PlaneKey) -> (usize, usize, usize) {
+    fn current_counts_for_planes(
+        &self,
+        source_generation: u64,
+        planes: &[PlaneKey],
+    ) -> (usize, usize, usize) {
         let entries = self
             .entries
             .iter()
-            .filter(|(key, _)| key.source_generation == source_generation && key.plane == plane);
+            .filter(|(key, _)| cache_key_is_active(**key, source_generation, planes));
         let mut resident = 0;
         let mut visible = 0;
         let mut bytes: usize = 0;
@@ -2101,6 +2228,18 @@ impl PyramidDisplay {
         self.displayed = Some(scale);
         true
     }
+}
+
+fn record_finished_plane(
+    visible: &mut HashMap<PlaneKey, Vec<TileId>>,
+    pyramid: &mut PyramidDisplay,
+    view_generation: u64,
+    plane: PlaneKey,
+    scale: PyramidScale,
+    visible_tile_ids: Vec<TileId>,
+) {
+    let _ = pyramid.finish(view_generation, scale);
+    visible.insert(plane, visible_tile_ids);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2194,6 +2333,8 @@ pub struct ViewerApp {
     profile_editing: bool,
     authentication_focus_request: Option<u64>,
     inspector_tab: InspectorTab,
+    display_mode: DisplayMode,
+    channel_roles: HashMap<i32, ChannelRole>,
     metadata_filter: String,
     dataset: Option<DatasetInfo>,
     dataset_origin: Option<DatasetOrigin>,
@@ -2203,7 +2344,7 @@ pub struct ViewerApp {
     status: Status,
     cache: TextureCache,
     pending_tiles: Vec<PendingTile>,
-    visible_tile_ids: Vec<TileId>,
+    visible_tile_ids: HashMap<PlaneKey, Vec<TileId>>,
     pyramid_display: PyramidDisplay,
     levels: Levels,
     camera: Camera,
@@ -2248,6 +2389,8 @@ impl ViewerApp {
             profile_editing: false,
             authentication_focus_request: None,
             inspector_tab: InspectorTab::Display,
+            display_mode: DisplayMode::Single,
+            channel_roles: HashMap::new(),
             metadata_filter: String::new(),
             dataset: None,
             dataset_origin: None,
@@ -2257,7 +2400,7 @@ impl ViewerApp {
             status: Status::normal("Choose Local or SSH, then open a .czi file."),
             cache: TextureCache::new(TEXTURE_CACHE_LIMIT),
             pending_tiles: Vec::new(),
-            visible_tile_ids: Vec::new(),
+            visible_tile_ids: HashMap::new(),
             pyramid_display: PyramidDisplay::default(),
             levels: Levels::default_for(PixelType::Gray16),
             camera: Camera::default(),
@@ -2556,6 +2699,58 @@ impl ViewerApp {
         self.remote_selected_path = None;
     }
 
+    fn active_planes(&self) -> Vec<PlaneSelector> {
+        let Some(dataset) = self.dataset.as_ref() else {
+            return Vec::new();
+        };
+        if self.display_mode == DisplayMode::Single {
+            return dataset
+                .plane(self.selection)
+                .is_some()
+                .then_some(self.selection)
+                .into_iter()
+                .collect();
+        }
+        dataset
+            .c
+            .values
+            .iter()
+            .filter(|channel| {
+                self.channel_roles.get(channel).copied().unwrap_or_default() != ChannelRole::Off
+            })
+            .filter_map(|channel| {
+                let plane = PlaneSelector::new(
+                    *channel,
+                    self.selection.scene,
+                    self.selection.z,
+                    self.selection.t,
+                );
+                dataset.plane(plane).is_some().then_some(plane)
+            })
+            .collect()
+    }
+
+    fn role_for_plane(&self, plane: PlaneKey) -> ChannelRole {
+        if self.display_mode == DisplayMode::Single {
+            ChannelRole::Gray
+        } else {
+            self.channel_roles
+                .get(&plane.c)
+                .copied()
+                .unwrap_or_default()
+        }
+    }
+
+    fn active_cache_counts(&self, source_generation: u64) -> (usize, usize, usize) {
+        let planes = self
+            .active_planes()
+            .iter()
+            .map(|plane| plane.key())
+            .collect::<Vec<_>>();
+        self.cache
+            .current_counts_for_planes(source_generation, &planes)
+    }
+
     fn retire_embedded_authentication(&mut self) {
         self.authentication_focus_request = None;
         if let Some(authentication) = self.embedded_authentication.take() {
@@ -2571,10 +2766,14 @@ impl ViewerApp {
         }) else {
             return;
         };
-        let plane = self.selection;
+        let planes = self.active_planes();
+        if planes.is_empty() {
+            return;
+        }
         let target_downsample = (1.0 / self.camera.zoom).clamp(0.000_001, 1_000_000.0);
-        let request_key = (plane.key(), viewport, target_downsample.to_bits());
-        if self.last_request == Some(request_key) {
+        let plane_keys = planes.iter().map(|plane| plane.key()).collect::<Vec<_>>();
+        let request_key = (plane_keys.clone(), viewport, target_downsample.to_bits());
+        if self.last_request.as_ref() == Some(&request_key) {
             return;
         }
         let view_generation = self.generations.begin_view();
@@ -2582,17 +2781,17 @@ impl ViewerApp {
             .expect("indexed plane has at least one pyramid scale");
         self.pyramid_display
             .request(view_generation, requested_scale);
-        let resident_tile_ids = self.cache.begin_view(self.generations.source, plane.key());
+        let resident_tile_ids = self.cache.begin_view(self.generations.source, &plane_keys);
         let request = ViewRequest {
             source_generation: self.generations.source,
             view_generation,
-            plane,
+            planes,
             viewport,
             prefetch_viewport: prefetch_viewport(viewport, bounds),
             target_downsample,
             resident_tile_ids,
         };
-        self.last_request = Some(request_key);
+        self.last_request = Some(request_key.clone());
         if let Err(error) = record_view_submission(
             &mut self.pending_view,
             self.worker.try_send_view(request),
@@ -2760,29 +2959,50 @@ impl ViewerApp {
 
     fn show_display_inspector(&mut self, ui: &mut egui::Ui) {
         let before_selection = self.selection;
+        let before_mode = self.display_mode;
+        ui.horizontal(|ui| {
+            ui.label("Mode");
+            ui.selectable_value(&mut self.display_mode, DisplayMode::Single, "Single");
+            ui.selectable_value(&mut self.display_mode, DisplayMode::Composite, "Composite");
+        });
         let selection_changed = if let Some(dataset) = self.dataset.as_ref() {
             ui.weak(format!("{} indexed tile(s)", dataset.tile_count));
             ui.separator();
-            channel_selector(
-                ui,
-                &dataset.c,
-                &dataset.metadata_summary,
-                &mut self.selection.c,
-            ) | scene_selector(ui, &dataset.s, &mut self.selection.scene)
+            let channel_changed = if self.display_mode == DisplayMode::Single {
+                channel_selector(
+                    ui,
+                    &dataset.c,
+                    &dataset.metadata_summary,
+                    &mut self.selection.c,
+                )
+            } else {
+                composite_channel_assignments(
+                    ui,
+                    &dataset.c,
+                    &dataset.metadata_summary,
+                    &mut self.channel_roles,
+                )
+            };
+            channel_changed
+                | scene_selector(ui, &dataset.s, &mut self.selection.scene)
                 | selection_selector(ui, "Z", &dataset.z, &mut self.selection.z)
                 | selection_selector(ui, "T", &dataset.t, &mut self.selection.t)
         } else {
             ui.label("No dataset is open.");
             false
         };
-        if selection_changed {
+        if selection_changed || before_mode != self.display_mode {
             let changed = [
                 before_selection.c != self.selection.c,
                 before_selection.scene != self.selection.scene,
                 before_selection.z != self.selection.z,
                 before_selection.t != self.selection.t,
             ];
-            let preserve_channel_fov = selection_change_preserves_fov(changed);
+            let preserve_channel_fov = if changed.iter().any(|changed| *changed) {
+                selection_change_preserves_fov(changed)
+            } else {
+                true
+            };
             if let Some(dataset) = self.dataset.as_ref() {
                 let previous_bounds = dataset
                     .plane(before_selection)
@@ -2821,9 +3041,7 @@ impl ViewerApp {
             ui.label(format!("Displayed pyramid scale: {}×", format_scale(scale)));
         }
         if let Some(dataset) = self.dataset.as_ref() {
-            let (visible, resident, bytes) = self
-                .cache
-                .current_counts(self.generations.source, self.selection.key());
+            let (visible, resident, bytes) = self.active_cache_counts(self.generations.source);
             ui.label(format!(
                 "Visible: {visible} · Resident: {resident} · Cache: {}",
                 format_bytes(bytes)
@@ -3042,7 +3260,10 @@ impl ViewerApp {
             } if self
                 .generations
                 .accepts_view(source_generation, view_generation)
-                && plane == self.selection.key() =>
+                && self
+                    .active_planes()
+                    .iter()
+                    .any(|active| active.key() == plane) =>
             {
                 self.pending_tiles.push(PendingTile {
                     tile_id,
@@ -3065,16 +3286,22 @@ impl ViewerApp {
             } if self
                 .generations
                 .accepts_view(source_generation, view_generation)
-                && plane == self.selection.key() =>
+                && self
+                    .active_planes()
+                    .iter()
+                    .any(|active| active.key() == plane) =>
             {
-                if !self.pyramid_display.finish(view_generation, scale) {
-                    return;
-                }
-                self.visible_tile_ids = visible_tile_ids;
+                record_finished_plane(
+                    &mut self.visible_tile_ids,
+                    &mut self.pyramid_display,
+                    view_generation,
+                    plane,
+                    scale,
+                    visible_tile_ids,
+                );
                 self.cache
-                    .finish_view(source_generation, plane, &self.visible_tile_ids);
-                let (visible, resident, bytes) =
-                    self.cache.current_counts(source_generation, plane);
+                    .finish_view(source_generation, plane, &self.visible_tile_ids[&plane]);
+                let (visible, resident, bytes) = self.active_cache_counts(source_generation);
                 self.status = Status::normal(format!(
                     "Requested {}× · Displayed {}× · {} visible · {} resident · {} cache",
                     format_scale(
@@ -3120,6 +3347,7 @@ impl ViewerApp {
             return;
         }
         self.selection = info.default_selection();
+        self.channel_roles = default_channel_roles(&info.c, &info.metadata_summary);
         self.levels = Levels::default_for(info.pixel_type);
         self.status = Status::normal(format!(
             "Indexed {} tile(s); choose a plane or view the mosaic.",
@@ -3188,7 +3416,10 @@ impl ViewerApp {
             if !self
                 .generations
                 .accepts_view(pending.source_generation, pending.view_generation)
-                || pending.plane != self.selection.key()
+                || !self
+                    .active_planes()
+                    .iter()
+                    .any(|active| active.key() == pending.plane)
             {
                 continue;
             }
@@ -3204,7 +3435,11 @@ impl ViewerApp {
                 m_index: None,
                 paint_order: pending.paint_order,
             };
-            match texture_image(&pending.tile, self.levels) {
+            match texture_image(
+                &pending.tile,
+                self.levels,
+                self.role_for_plane(pending.plane),
+            ) {
                 Ok(image) => {
                     let bytes = image
                         .pixels
@@ -3574,6 +3809,7 @@ impl ViewerApp {
             title_response.rect,
             self.dataset.as_ref(),
             self.selection,
+            self.display_mode,
             self.pyramid_display,
         );
         let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::drag());
@@ -3586,7 +3822,15 @@ impl ViewerApp {
             freeze_snapshot_region(request, snapshot_region, self.ui_frame);
         }
         self.process_returned_screenshots();
-        painter.rect_filled(response.rect, 0.0, egui::Color32::from_gray(24));
+        painter.rect_filled(
+            response.rect,
+            0.0,
+            if self.display_mode == DisplayMode::Composite {
+                egui::Color32::BLACK
+            } else {
+                egui::Color32::from_gray(24)
+            },
+        );
 
         let Some(dataset) = self.dataset.as_ref() else {
             canvas_message(&painter, response.rect, "Open a CZI to view its mosaic.");
@@ -3633,31 +3877,40 @@ impl ViewerApp {
             self.request_view(viewport);
         }
 
-        for tile_id in &self.visible_tile_ids {
-            self.cache.touch(TextureKey {
-                source_generation: self.generations.source,
-                plane: self.selection.key(),
-                tile_id: *tile_id,
-            });
-        }
-        let mut visible = self
-            .visible_tile_ids
-            .iter()
-            .filter_map(|tile_id| {
+        let mut active = self.active_planes();
+        active.sort_by_key(|plane| self.role_for_plane(plane.key()));
+        let mut visible_keys = Vec::new();
+        for plane in active {
+            let role = self.role_for_plane(plane.key());
+            for tile_id in self
+                .visible_tile_ids
+                .get(&plane.key())
+                .into_iter()
+                .flatten()
+            {
                 let key = TextureKey {
                     source_generation: self.generations.source,
-                    plane: self.selection.key(),
+                    plane: plane.key(),
                     tile_id: *tile_id,
                 };
+                self.cache.touch(key);
+                visible_keys.push((role, key));
+            }
+        }
+        let mut visible = visible_keys
+            .iter()
+            .filter_map(|(role, key)| {
                 self.cache
                     .entries
-                    .get(&key)
-                    .map(|entry| (entry.paint_order, entry))
+                    .get(key)
+                    .map(|entry| (*role, key.plane.c, entry.paint_order, entry))
             })
             .collect::<Vec<_>>();
-        visible.sort_unstable_by_key(|(paint_order, _)| *paint_order);
+        visible.sort_unstable_by_key(|(role, channel, paint_order, _)| {
+            (*role, *channel, *paint_order)
+        });
         let has_visible = !visible.is_empty();
-        for (_, entry) in &visible {
+        for (_, _, _, entry) in &visible {
             let image_rect = egui::Rect::from_min_max(
                 self.camera.world_to_screen_xy(
                     (
@@ -3745,6 +3998,7 @@ fn draw_canvas_title(
     rect: egui::Rect,
     dataset: Option<&DatasetInfo>,
     selection: PlaneSelection,
+    display_mode: DisplayMode,
     pyramid: PyramidDisplay,
 ) {
     painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(20, 24, 29));
@@ -3757,11 +4011,16 @@ fn draw_canvas_title(
             let displayed = pyramid
                 .displayed
                 .map_or_else(|| String::from("—"), format_scale);
+            let channel = if display_mode == DisplayMode::Composite {
+                String::from("Composite")
+            } else {
+                channel_label(&dataset.metadata_summary, selection.c)
+            };
             format!(
                 "{}  ·  Scene {}  ·  {}  ·  Z {}  ·  T {}  ·  Requested {}×  ·  Displayed {}×",
                 source_filename(&dataset.source_label),
                 scene_label(selection.scene),
-                channel_label(&dataset.metadata_summary, selection.c),
+                channel,
                 selection.z,
                 selection.t,
                 requested,
@@ -4458,6 +4717,30 @@ fn channel_selector(
     *selected != before
 }
 
+fn composite_channel_assignments(
+    ui: &mut egui::Ui,
+    choices: &DimensionChoices,
+    summary: &MetadataSummary,
+    roles: &mut HashMap<i32, ChannelRole>,
+) -> bool {
+    let mut changed = false;
+    ui.heading("Channel assignments");
+    for channel in &choices.values {
+        ui.horizontal(|ui| {
+            ui.label(channel_label(summary, *channel));
+            let role = roles.entry(*channel).or_default();
+            egui::ComboBox::from_id_salt(("channel-role", channel))
+                .selected_text(role.label())
+                .show_ui(ui, |ui| {
+                    for choice in ChannelRole::ALL {
+                        changed |= ui.selectable_value(role, choice, choice.label()).changed();
+                    }
+                });
+        });
+    }
+    changed
+}
+
 fn channel_label(summary: &MetadataSummary, channel: i32) -> String {
     summary
         .channels
@@ -4688,7 +4971,7 @@ pub fn run() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use czi_core::{CompressionMode, DimensionEntry, DirectoryEntry, PyramidType};
+    use czi_core::{ChannelMetadata, CompressionMode, DimensionEntry, DirectoryEntry, PyramidType};
 
     fn dimension(code: DimensionCode, start: i32) -> DimensionEntry {
         DimensionEntry {
@@ -4781,6 +5064,89 @@ mod tests {
         let second_source = generations.begin_source();
         assert_ne!(first_source, second_source);
         assert!(!generations.accepts_view(first_source, second_view));
+    }
+
+    #[test]
+    fn channel_role_defaults_use_labels_and_sparse_channel_values() {
+        let choices = DimensionChoices {
+            present: true,
+            values: vec![2, 7, 11, 19, 23, 29],
+        };
+        let summary = MetadataSummary {
+            channels: vec![
+                ChannelMetadata {
+                    index: 2,
+                    id: None,
+                    label: String::from("Phase Contrast"),
+                },
+                ChannelMetadata {
+                    index: 7,
+                    id: None,
+                    label: String::from("HADA"),
+                },
+                ChannelMetadata {
+                    index: 11,
+                    id: None,
+                    label: String::from("BODIPY 493/503"),
+                },
+                ChannelMetadata {
+                    index: 23,
+                    id: None,
+                    label: String::from("AF405 (fluor Alexa Fluor 405)"),
+                },
+                ChannelMetadata {
+                    index: 29,
+                    id: None,
+                    label: String::from("Bod493 (fluor BODIPY FL)"),
+                },
+            ],
+            pixel_size: None,
+        };
+        let roles = default_channel_roles(&choices, &summary);
+        assert_eq!(roles[&2], ChannelRole::Gray);
+        assert_eq!(roles[&7], ChannelRole::Blue);
+        assert_eq!(roles[&11], ChannelRole::Green);
+        assert_eq!(roles[&19], ChannelRole::Off);
+        assert_eq!(roles[&23], ChannelRole::Blue);
+        assert_eq!(roles[&29], ChannelRole::Green);
+
+        let fallback = default_channel_roles(&choices, &MetadataSummary::default());
+        assert_eq!(fallback[&2], ChannelRole::Gray);
+        assert!(
+            choices.values[1..]
+                .iter()
+                .all(|channel| fallback[channel] == ChannelRole::Off)
+        );
+    }
+
+    #[test]
+    fn paper_blend_uses_gray_base_and_ordered_source_over_colors() {
+        let gray = blend_channel([0; 3], 64, ChannelRole::Gray);
+        assert_eq!(gray, [64; 3]);
+        let red = blend_channel(gray, 128, ChannelRole::Red);
+        assert_eq!(red, [159, 31, 31]);
+        let green = blend_channel(red, 128, ChannelRole::Green);
+        assert_eq!(green, [79, 143, 15]);
+        assert_eq!(blend_channel([0; 3], 200, ChannelRole::Blue), [0, 0, 200]);
+        assert_eq!(blend_channel(gray, 255, ChannelRole::Off), gray);
+    }
+
+    #[test]
+    fn role_textures_keep_one_tile_allocation_and_expected_alpha() {
+        let tile = DecodedTile {
+            width: 2,
+            height: 1,
+            pixels: DecodedPixels::Gray8(vec![0, 255]),
+        };
+        let image = texture_image(
+            &tile,
+            Levels::default_for(PixelType::Gray8),
+            ChannelRole::Blue,
+        )
+        .expect("blue texture");
+        assert_eq!(image.size, [2, 1]);
+        assert_eq!(image.pixels[0], egui::Color32::TRANSPARENT);
+        assert_eq!(image.pixels[1], egui::Color32::BLUE);
     }
 
     #[test]
@@ -4909,7 +5275,7 @@ mod tests {
         ViewRequest {
             source_generation: 1,
             view_generation,
-            plane: PlaneSelector::default(),
+            planes: vec![PlaneSelector::default()],
             viewport: SpatialRect::new(0, 0, 1, 1).expect("unit viewport"),
             prefetch_viewport: SpatialRect::new(0, 0, 1, 1).expect("unit prefetch viewport"),
             target_downsample: 1.0,
@@ -4951,7 +5317,7 @@ mod tests {
         third.viewport = SpatialRect::new(3, 0, 4, 1).expect("third viewport");
         let key = |request: &ViewRequest| {
             (
-                request.plane.key(),
+                request.planes.iter().map(|plane| plane.key()).collect(),
                 request.viewport,
                 request.target_downsample.to_bits(),
             )
@@ -4992,6 +5358,68 @@ mod tests {
     }
 
     #[test]
+    fn composite_request_and_cache_identity_include_sparse_plane_sets() {
+        let mut request = test_view_request(1);
+        request.planes = vec![
+            PlaneSelector::new(2, SceneId::Implicit, 0, 0),
+            PlaneSelector::new(9, SceneId::Implicit, 0, 0),
+        ];
+        let key = (
+            request
+                .planes
+                .iter()
+                .map(|plane| plane.key())
+                .collect::<Vec<_>>(),
+            request.viewport,
+            request.target_downsample.to_bits(),
+        );
+        assert_ne!(key.0[0], key.0[1]);
+        assert_ne!(
+            TextureKey {
+                source_generation: 1,
+                plane: key.0[0],
+                tile_id: TileId(4),
+            },
+            TextureKey {
+                source_generation: 1,
+                plane: key.0[1],
+                tile_id: TileId(4),
+            }
+        );
+        assert!(cache_key_is_active(
+            TextureKey {
+                source_generation: 1,
+                plane: key.0[1],
+                tile_id: TileId(4),
+            },
+            1,
+            &key.0,
+        ));
+        assert!(!cache_key_is_active(
+            TextureKey {
+                source_generation: 2,
+                plane: key.0[1],
+                tile_id: TileId(4),
+            },
+            1,
+            &key.0,
+        ));
+
+        let mut replacement = request.clone();
+        replacement.view_generation = 2;
+        replacement.planes.pop();
+        let mut pending = None;
+        replace_pending_view(&mut pending, request, key);
+        let replacement_key = (
+            replacement.planes.iter().map(|plane| plane.key()).collect(),
+            replacement.viewport,
+            replacement.target_downsample.to_bits(),
+        );
+        replace_pending_view(&mut pending, replacement, replacement_key.clone());
+        assert_eq!(pending.as_ref().map(|(_, key)| key), Some(&replacement_key));
+    }
+
+    #[test]
     fn prefetch_viewport_expands_and_clamps_to_plane_bounds() {
         let bounds = SpatialRect::new(0, 0, 1_000, 1_000).expect("bounds");
         let viewport = SpatialRect::new(900, 900, 1_000, 1_000).expect("viewport");
@@ -5028,6 +5456,29 @@ mod tests {
         assert_eq!(display.displayed, Some(two));
         assert!(display.finish(6, one));
         assert_eq!(display.displayed, Some(one));
+    }
+
+    #[test]
+    fn unequal_channel_scale_still_records_plane_completion() {
+        let one = PyramidScale::new(1, 1).expect("one scale");
+        let two = PyramidScale::new(2, 1).expect("two scale");
+        let plane = PlaneKey::new(7, SceneId::Implicit, 0, 0);
+        let mut display = PyramidDisplay::default();
+        display.request(9, one);
+        let mut visible = HashMap::new();
+
+        record_finished_plane(
+            &mut visible,
+            &mut display,
+            9,
+            plane,
+            two,
+            vec![TileId(3), TileId(8)],
+        );
+
+        assert_eq!(visible[&plane], vec![TileId(3), TileId(8)]);
+        assert_eq!(display.requested, Some(one));
+        assert_eq!(display.displayed, None);
     }
 
     #[test]
