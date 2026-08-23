@@ -65,7 +65,7 @@ Never use automatic `ssh-keyscan` output as proof of identity. A key received ov
 4. Enter your Tufts VPN username. The viewer keeps it only in memory for the current app process.
 5. Enter the SSH profile or `user@host` destination that supplies the SSH username. For the reviewed connection, use `jwhite22@login-prod.pax.tufts.edu`.
 6. Select **Connect**.
-7. Complete **Phase 1/2 · Tufts VPN authentication** in the in-app terminal. Enter passwords, Duo choices, and one-time responses only when OpenConnect requests them.
+7. Complete **Phase 1/2 · Tufts VPN authentication** in the in-app terminal. Enter passwords, Duo choices, and one-time responses only when OpenConnect requests them. If prompted for a second-factor method, type the requested choice, such as `PUSH`. The viewer does not select push automatically.
 8. Wait while the viewer validates an SSH identification banner through the local tunnel.
 9. Complete **Phase 2/2 · SSH authentication** when OpenSSH requests input.
 10. Browse and open remote CZI files normally.
@@ -76,7 +76,7 @@ There is no password, Duo, or one-time-code field. Terminal input goes directly 
 
 The mode uses these fixed network endpoints:
 
-- Gateway: `https://vpn.tufts.edu/duop`
+- Gateway: `https://vpn.tufts.edu/duo`
 - SSH target: `login-prod.pax.tufts.edu:22`
 - Local listener: `127.0.0.1` on an ephemeral port
 

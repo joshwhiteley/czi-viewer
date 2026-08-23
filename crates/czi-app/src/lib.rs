@@ -4388,6 +4388,7 @@ impl ViewerApp {
                                     .desired_width(f32::INFINITY),
                             );
                         });
+                        ui.weak(format!("VPN gateway: {}", tufts_vpn::GATEWAY));
                         ui.weak(format!("Fixed SSH route: {}", tufts_vpn::TARGET_HOST));
                         ui.colored_label(
                             egui::Color32::GOLD,

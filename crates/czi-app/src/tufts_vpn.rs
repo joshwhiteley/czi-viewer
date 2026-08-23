@@ -13,7 +13,7 @@ mod macos {
     pub const EXEC_MODE: &str = "--czi-tufts-vpn-pty-exec";
     pub const TARGET_HOST: &str = "login-prod.pax.tufts.edu";
     pub const TARGET_PORT: u16 = 22;
-    pub const GATEWAY: &str = "https://vpn.tufts.edu/duop";
+    pub const GATEWAY: &str = "https://vpn.tufts.edu/duo";
     const SCRIPT_MODE_ENV: &str = "CZI_TUFTS_VPN_SCRIPT_MODE";
     const SCRIPT_PAIR_ENV: &str = "CZI_TUFTS_VPN_TOOL_PAIR";
     const SCRIPT_PORT_ENV: &str = "CZI_TUFTS_VPN_LOCAL_PORT";
@@ -581,7 +581,7 @@ mod macos {
                     OsStr::new("--script"),
                     helper.as_os_str(),
                     OsStr::new("--protocol=anyconnect"),
-                    OsStr::new(GATEWAY),
+                    OsStr::new("https://vpn.tufts.edu/duo"),
                 ]
             );
             validate_openconnect_exec_argv(TOOL_PAIRS[0], &argv[2..]).unwrap();
