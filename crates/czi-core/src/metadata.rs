@@ -307,12 +307,13 @@ fn build_node(
         }
         counts.attribute_bytes = counts.attribute_bytes.saturating_add(bytes);
         let attribute_name = local_name(attribute.key.as_ref());
-        let value = attribute
-            .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
-            .map_or_else(
-                |_| decode_text(attribute.value.as_ref()),
-                std::borrow::Cow::into_owned,
-            );
+        let value = normalized_attribute_value(
+            &attribute,
+            reader,
+            attribute.value.as_ref().len(),
+            diagnostics,
+            false,
+        );
         attributes.push(MetadataAttribute {
             name: attribute_name,
             value,
@@ -434,11 +435,108 @@ fn invalid_reference_diagnostic(
     let preview = String::from_utf8_lossy(&reference[..reference.len().min(64)]);
     let suffix = if reference.len() > 64 { "…" } else { "" };
     let message = format!("{prefix} '&{preview}{suffix};' was preserved literally.");
-    if summary {
+    if summary
+        && !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.starts_with(prefix))
+    {
         summary_diagnostic_once(diagnostics, message);
-    } else if !diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.message.starts_with(prefix))
+    } else if !summary
+        && !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.starts_with(prefix))
+    {
+        diagnostics.push(MetadataDiagnostic { message });
+    }
+}
+
+fn normalized_attribute_value(
+    attribute: &quick_xml::events::attributes::Attribute<'_>,
+    reader: &Reader<&[u8]>,
+    max_bytes: usize,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+    summary: bool,
+) -> String {
+    if let Ok(value) =
+        attribute.decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+    {
+        value.into_owned()
+    } else {
+        invalid_attribute_reference_diagnostic(diagnostics, attribute.value.as_ref(), summary);
+        decode_attribute_value_bounded(attribute.value.as_ref(), max_bytes)
+    }
+}
+
+fn decode_attribute_value_bounded(value: &[u8], max_bytes: usize) -> String {
+    let mut output = String::new();
+    let mut offset = 0;
+    while offset < value.len() && output.len() < max_bytes {
+        let Some(relative_ampersand) = value[offset..].iter().position(|byte| *byte == b'&') else {
+            push_lossy_bounded(&mut output, &value[offset..], max_bytes);
+            break;
+        };
+        let ampersand = offset + relative_ampersand;
+        push_lossy_bounded(&mut output, &value[offset..ampersand], max_bytes);
+        let Some(relative_semicolon) = value[ampersand + 1..].iter().position(|byte| *byte == b';')
+        else {
+            push_lossy_bounded(&mut output, &value[ampersand..], max_bytes);
+            break;
+        };
+        let semicolon = ampersand + 1 + relative_semicolon;
+        if let Some(reference) = decode_xml_reference(&value[ampersand + 1..semicolon]) {
+            let mut decoded = String::new();
+            reference.push_to(&mut decoded);
+            push_lossy_bounded(&mut output, decoded.as_bytes(), max_bytes);
+        } else {
+            push_lossy_bounded(&mut output, &value[ampersand..=semicolon], max_bytes);
+        }
+        offset = semicolon + 1;
+    }
+    output
+}
+
+fn push_lossy_bounded(output: &mut String, bytes: &[u8], max_bytes: usize) {
+    let remaining = max_bytes.saturating_sub(output.len());
+    if remaining == 0 {
+        return;
+    }
+    let value = String::from_utf8_lossy(bytes);
+    let end = value
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= remaining)
+        .last()
+        .unwrap_or(0);
+    if value.len() <= remaining {
+        output.push_str(&value);
+    } else {
+        output.push_str(&value[..end]);
+    }
+}
+
+fn invalid_attribute_reference_diagnostic(
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+    value: &[u8],
+    summary: bool,
+) {
+    let prefix = if summary {
+        "Invalid metadata summary XML attribute/reference"
+    } else {
+        "Invalid metadata XML attribute/reference"
+    };
+    let preview = String::from_utf8_lossy(&value[..value.len().min(64)]);
+    let suffix = if value.len() > 64 { "…" } else { "" };
+    let message = format!("{prefix} value '{preview}{suffix}' was preserved literally.");
+    if summary
+        && !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.starts_with(prefix))
+    {
+        summary_diagnostic_once(diagnostics, message);
+    } else if !summary
+        && !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.starts_with(prefix))
     {
         diagnostics.push(MetadataDiagnostic { message });
     }
@@ -868,12 +966,13 @@ fn summary_attribute(
         if !name.eq_ignore_ascii_case(wanted) {
             continue;
         }
-        let value = attribute
-            .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
-            .map_or_else(
-                |_| decode_text(attribute.value.as_ref()),
-                std::borrow::Cow::into_owned,
-            );
+        let value = normalized_attribute_value(
+            &attribute,
+            reader,
+            limits.max_summary_value_bytes.saturating_add(1),
+            diagnostics,
+            true,
+        );
         if value.len() > limits.max_summary_value_bytes {
             summary_value_limit_diagnostic(diagnostics, limits.max_summary_value_bytes);
             return None;
@@ -1358,6 +1457,50 @@ mod tests {
                 y_um: 0.5
             })
         );
+    }
+
+    #[test]
+    fn numeric_and_predefined_xml_references_normalize_in_attributes() {
+        let document = parse(
+            r#"<ImageDocument><Metadata><Information><Image><Dimensions><Channels><Channel Name="H&#38;E / H&#x26;E &amp; stain"/></Channels></Dimensions></Image></Information></Metadata></ImageDocument>"#,
+        );
+        let channel = &document.root.as_ref().expect("tree root").children[0].children[0].children
+            [0]
+        .children[0]
+            .children[0]
+            .children[0];
+        assert_eq!(channel.attributes[0].value, "H&E / H&E & stain");
+        assert_eq!(document.summary.channels[0].label, "H&E / H&E & stain");
+        assert!(
+            !document
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("attribute/reference"))
+        );
+    }
+
+    #[test]
+    fn invalid_xml_reference_in_attribute_is_preserved_and_diagnosed() {
+        let document = parse(
+            r#"<ImageDocument><Metadata><Information><Image><Dimensions><Channels><Channel Name="H&#0;E"/></Channels></Dimensions></Image></Information></Metadata></ImageDocument>"#,
+        );
+        let channel = &document.root.as_ref().expect("tree root").children[0].children[0].children
+            [0]
+        .children[0]
+            .children[0]
+            .children[0];
+        assert_eq!(channel.attributes[0].value, "H&#0;E");
+        assert_eq!(document.summary.channels[0].label, "H&#0;E");
+        assert!(document.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Invalid metadata XML attribute/reference")
+        }));
+        assert!(document.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Invalid metadata summary XML attribute/reference")
+        }));
     }
 
     #[test]
