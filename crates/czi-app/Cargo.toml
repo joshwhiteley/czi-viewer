@@ -1,9 +1,21 @@
 [package]
 name = "czi-viewer"
 version = "0.1.0"
+description = "Native macOS viewer for CZI microscopy images"
+homepage = "https://github.com/joshwhiteley/czi-viewer"
+repository = "https://github.com/joshwhiteley/czi-viewer"
+keywords = ["czi", "microscopy", "macos"]
+categories = ["science"]
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+
+[package.metadata.macos-preview]
+product-name = "CZI Viewer"
+bundle-identifier = "io.github.joshwhiteley.czi-viewer"
+target = "aarch64-apple-darwin"
+minimum-system-version = "11.0"
+signing = "ad-hoc"
 
 [dependencies]
 czi-core = { path = "../czi-core" }

@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>CZI Viewer third-party notices</title>
+<style>
+  body { font-family: -apple-system, sans-serif; margin: 2rem; max-width: 60rem; }
+  pre { white-space: pre-wrap; }
+</style>
+<h1>CZI Viewer third-party notices</h1>
+<p>This file lists Rust dependencies included in the Apple Silicon preview and their license texts.</p>
+<h2>License overview</h2>
+<ul>
+{{#each overview}}
+  <li><a href="#{{id}}">{{name}}</a> ({{count}} packages)</li>
+{{/each}}
+</ul>
+{{#each licenses}}
+<section>
+  <h2 id="{{id}}">{{name}}</h2>
+  <h3>Used by</h3>
+  <ul>
+  {{#each used_by}}
+    <li>{{crate.name}} {{crate.version}}</li>
+  {{/each}}
+  </ul>
+  <pre>{{text}}</pre>
+</section>
+{{/each}}

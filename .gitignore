@@ -1,4 +1,5 @@
 /target/
+/dist/
 .DS_Store
 
 # Local CZI data and machine-specific fixture configuration.
