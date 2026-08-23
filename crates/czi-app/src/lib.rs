@@ -4,6 +4,7 @@
     clippy::cast_precision_loss
 )]
 
+mod basic;
 mod tufts_vpn;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -550,6 +551,7 @@ struct DatasetInfo {
     z: DimensionChoices,
     t: DimensionChoices,
     planes: Vec<PlaneInfo>,
+    basic_verified_scales: HashMap<PlaneKey, Vec<PyramidScale>>,
     pixel_type: PixelType,
     metadata: MetadataDocument,
     metadata_summary: MetadataSummary,
@@ -592,11 +594,13 @@ impl DatasetInfo {
         Self {
             source_label,
             tile_count: tiles.len(),
-            c: dimension_choices(tiles, DimensionCode::C),
+            c: query_dimension_choices(tiles, DimensionCode::C, &query.axis_choices().c),
             s: scene_choices(query),
-            z: dimension_choices(tiles, DimensionCode::Z),
-            t: dimension_choices(tiles, DimensionCode::T),
+            z: query_dimension_choices(tiles, DimensionCode::Z, &query.axis_choices().z),
+            t: query_dimension_choices(tiles, DimensionCode::T, &query.axis_choices().t),
             planes: query.planes().cloned().collect(),
+            basic_verified_scales: basic::verified_scales(dataset.index(), query)
+                .expect("a valid tile query has verifiable native scales"),
             pixel_type,
             metadata,
             metadata_summary,
@@ -652,6 +656,8 @@ type PlaneSelection = PlaneSelector;
 struct Generations {
     source: u64,
     view: u64,
+    basic_fit: u64,
+    basic_toggle: u64,
     browse: u64,
     connection: u64,
 }
@@ -660,6 +666,8 @@ impl Generations {
     fn begin_source(&mut self) -> u64 {
         self.source = self.source.wrapping_add(1);
         self.view = self.view.wrapping_add(1);
+        self.basic_fit = self.basic_fit.wrapping_add(1);
+        self.basic_toggle = self.basic_toggle.wrapping_add(1);
         self.source
     }
 
@@ -674,6 +682,20 @@ impl Generations {
 
     fn accepts_view(&self, source: u64, view: u64) -> bool {
         self.accepts_source(source) && view == self.view
+    }
+
+    fn begin_basic_fit(&mut self) -> u64 {
+        self.basic_fit = self.basic_fit.wrapping_add(1);
+        self.basic_fit
+    }
+
+    fn accepts_basic_fit(&self, source: u64, basic_fit: u64) -> bool {
+        self.accepts_source(source) && self.basic_fit == basic_fit
+    }
+
+    fn begin_basic_toggle(&mut self) -> u64 {
+        self.basic_toggle = self.basic_toggle.wrapping_add(1);
+        self.basic_toggle
     }
 
     fn begin_browse(&mut self) -> u64 {
@@ -713,6 +735,7 @@ struct ViewRequest {
     viewport: SpatialRect,
     prefetch_viewport: SpatialRect,
     target_downsample: f64,
+    forced_scales: HashMap<PlaneKey, PyramidScale>,
     resident_tile_ids: Vec<TileId>,
 }
 
@@ -740,7 +763,18 @@ enum WorkerCommand {
     ClearBrowse,
     ClearDataset,
     View(ViewRequest),
+    BasicStart(BasicRequest),
+    BasicCancel,
     Shutdown,
+}
+
+#[derive(Clone)]
+struct BasicRequest {
+    helper: PathBuf,
+    channels: Vec<basic::ChannelSpec>,
+    source_generation: u64,
+    fit_generation: u64,
+    cancelled: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Default)]
@@ -1003,11 +1037,75 @@ enum WorkerEvent {
         source_generation: u64,
         view_generation: u64,
     },
+    BasicProgress {
+        channel: i32,
+        sampled: usize,
+        total: usize,
+        source_generation: u64,
+        fit_generation: u64,
+    },
+    BasicFitting {
+        totals: Vec<(i32, usize)>,
+        source_generation: u64,
+        fit_generation: u64,
+    },
+    BasicReady {
+        profiles: basic::ProfileSet,
+        source_generation: u64,
+        fit_generation: u64,
+    },
+    BasicFailed {
+        message: String,
+        source_generation: u64,
+        fit_generation: u64,
+    },
 }
 
 struct WorkerDataset {
     dataset: CziDataset,
     query: TileQueryIndex,
+}
+
+struct BasicSampleTask {
+    channel: usize,
+    tile_id: TileId,
+}
+
+struct BasicSamplingJob {
+    request: BasicRequest,
+    temp: Option<basic::TempRequest>,
+    tasks: VecDeque<BasicSampleTask>,
+    sampled: Vec<usize>,
+    totals: Vec<usize>,
+    cancelled: Arc<AtomicBool>,
+}
+
+struct BasicFitHandle {
+    cancelled: Arc<AtomicBool>,
+    join: JoinHandle<()>,
+}
+
+#[derive(Clone, Default)]
+struct BasicCancellationSlot {
+    current: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+}
+
+impl BasicCancellationSlot {
+    fn replace(&self, cancelled: &Arc<AtomicBool>) {
+        if let Ok(mut current) = self.current.lock() {
+            if let Some(previous) = current.replace(Arc::clone(cancelled)) {
+                previous.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    fn cancel_active(&self) {
+        if let Ok(current) = self.current.lock()
+            && let Some(cancelled) = current.as_ref()
+        {
+            cancelled.store(true, Ordering::Release);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1092,6 +1190,7 @@ struct DatasetWorker {
     events: Option<Receiver<WorkerEvent>>,
     embedded_cancellation: EmbeddedCancellationSlot,
     vpn_cancellation: VpnCancellationSlot,
+    basic_cancellation: BasicCancellationSlot,
     join: Option<JoinHandle<()>>,
 }
 
@@ -1103,6 +1202,8 @@ impl DatasetWorker {
         let worker_embedded_cancellation = embedded_cancellation.clone();
         let vpn_cancellation = VpnCancellationSlot::default();
         let worker_vpn_cancellation = vpn_cancellation.clone();
+        let basic_cancellation = BasicCancellationSlot::default();
+        let worker_basic_cancellation = basic_cancellation.clone();
         let join = thread::Builder::new()
             .name(String::from("czi-dataset-worker"))
             .spawn(move || {
@@ -1111,6 +1212,7 @@ impl DatasetWorker {
                     &event_tx,
                     &worker_embedded_cancellation,
                     &worker_vpn_cancellation,
+                    &worker_basic_cancellation,
                 );
             })
             .expect("start CZI dataset worker");
@@ -1119,6 +1221,7 @@ impl DatasetWorker {
             events: Some(events),
             embedded_cancellation,
             vpn_cancellation,
+            basic_cancellation,
             join: Some(join),
         }
     }
@@ -1144,6 +1247,7 @@ impl DatasetWorker {
         }
         self.embedded_cancellation.cancel_active();
         self.vpn_cancellation.cancel_active();
+        self.basic_cancellation.cancel_active();
         self.events.take();
         let commands = self.commands.take();
         if let Some(commands) = &commands {
@@ -1212,15 +1316,39 @@ fn worker_loop(
     events: &SyncSender<WorkerEvent>,
     embedded_cancellation: &EmbeddedCancellationSlot,
     vpn_cancellation: &VpnCancellationSlot,
+    basic_cancellation: &BasicCancellationSlot,
 ) {
     let mut dataset = None;
     let mut browse_session = None;
     let mut vpn_session = None;
     let mut active_source_generation = 0;
     let mut pending_commands = VecDeque::new();
+    let mut basic_sampling: Option<BasicSamplingJob> = None;
+    let mut basic_fits: Vec<BasicFitHandle> = Vec::new();
     loop {
+        reap_basic_fits(&mut basic_fits);
         let command = match pending_commands.pop_front() {
             Some(command) => command,
+            None if basic_sampling.is_some() => match commands.try_recv() {
+                Ok(command) => command,
+                Err(TryRecvError::Empty) => {
+                    let outcome = process_basic_sample_step(
+                        events,
+                        dataset.as_ref(),
+                        basic_sampling.as_mut().expect("sampling job is present"),
+                    );
+                    match outcome {
+                        BasicSampleOutcome::Continue => {}
+                        BasicSampleOutcome::Fitting(handle) => {
+                            basic_sampling = None;
+                            basic_fits.push(handle);
+                        }
+                        BasicSampleOutcome::Finished => basic_sampling = None,
+                    }
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => break,
+            },
             None => match commands.recv() {
                 Ok(command) => command,
                 Err(_) => break,
@@ -1232,6 +1360,7 @@ fn worker_loop(
                 source_generation,
                 connection_generation,
             } => {
+                cancel_basic_jobs(&mut basic_sampling, &basic_fits);
                 active_source_generation = source_generation;
                 let remote = matches!(&locator, DatasetLocator::Remote { .. });
                 let connection = EmbeddedConnectionContext {
@@ -1306,6 +1435,7 @@ fn worker_loop(
                 vpn_session = None;
             }
             WorkerCommand::ClearDataset => {
+                cancel_basic_jobs(&mut basic_sampling, &basic_fits);
                 dataset = None;
                 active_source_generation = 0;
             }
@@ -1341,7 +1471,247 @@ fn worker_loop(
                     break;
                 }
             }
-            WorkerCommand::Shutdown => break,
+            WorkerCommand::BasicStart(request) => {
+                cancel_basic_jobs(&mut basic_sampling, &basic_fits);
+                if request.cancelled.load(Ordering::Acquire) {
+                    continue;
+                }
+                if request.source_generation != active_source_generation {
+                    let _ = events.send(WorkerEvent::BasicFailed {
+                        message: String::from("dataset was superseded before BaSiC sampling"),
+                        source_generation: request.source_generation,
+                        fit_generation: request.fit_generation,
+                    });
+                } else if let Some(opened) = dataset.as_ref() {
+                    match start_basic_sampling(opened, request.clone()) {
+                        Ok(job) => {
+                            basic_cancellation.replace(&job.cancelled);
+                            basic_sampling = Some(job);
+                        }
+                        Err(message) => {
+                            let _ = events.send(WorkerEvent::BasicFailed {
+                                message,
+                                source_generation: request.source_generation,
+                                fit_generation: request.fit_generation,
+                            });
+                        }
+                    }
+                } else {
+                    let _ = events.send(WorkerEvent::BasicFailed {
+                        message: String::from("no dataset is open"),
+                        source_generation: request.source_generation,
+                        fit_generation: request.fit_generation,
+                    });
+                }
+            }
+            WorkerCommand::BasicCancel => {
+                cancel_basic_jobs(&mut basic_sampling, &basic_fits);
+            }
+            WorkerCommand::Shutdown => {
+                cancel_basic_jobs(&mut basic_sampling, &basic_fits);
+                break;
+            }
+        }
+    }
+    cancel_basic_jobs(&mut basic_sampling, &basic_fits);
+    for fit in basic_fits {
+        let _ = fit.join.join();
+    }
+}
+
+enum BasicSampleOutcome {
+    Continue,
+    Fitting(BasicFitHandle),
+    Finished,
+}
+
+fn start_basic_sampling(
+    opened: &WorkerDataset,
+    request: BasicRequest,
+) -> Result<BasicSamplingJob, String> {
+    if request.cancelled.load(Ordering::Acquire) {
+        return Err(String::from("BaSiC preparation cancelled."));
+    }
+    let plan = basic::plan_samples(opened.dataset.index(), &opened.query, &request.channels)?;
+    if request.cancelled.load(Ordering::Acquire) {
+        return Err(String::from("BaSiC preparation cancelled."));
+    }
+    let temp = basic::TempRequest::create(&plan)?;
+    let totals = plan
+        .channels
+        .iter()
+        .map(|channel| channel.candidates.len())
+        .collect::<Vec<_>>();
+    let mut queues = plan
+        .channels
+        .iter()
+        .enumerate()
+        .map(|(channel, plan)| {
+            plan.candidates
+                .iter()
+                .map(|candidate| BasicSampleTask {
+                    channel,
+                    tile_id: candidate.tile_id,
+                })
+                .collect::<VecDeque<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut tasks = VecDeque::new();
+    loop {
+        let mut added = false;
+        for queue in &mut queues {
+            if let Some(task) = queue.pop_front() {
+                tasks.push_back(task);
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    let channel_count = totals.len();
+    let cancelled = Arc::clone(&request.cancelled);
+    Ok(BasicSamplingJob {
+        request,
+        temp: Some(temp),
+        tasks,
+        sampled: vec![0; channel_count],
+        totals,
+        cancelled,
+    })
+}
+
+fn process_basic_sample_step(
+    events: &SyncSender<WorkerEvent>,
+    opened: Option<&WorkerDataset>,
+    job: &mut BasicSamplingJob,
+) -> BasicSampleOutcome {
+    if job.cancelled.load(Ordering::Acquire) {
+        return BasicSampleOutcome::Finished;
+    }
+    let Some(opened) = opened else {
+        return send_basic_sample_failure(events, job, "dataset closed during BaSiC sampling");
+    };
+    if let Some(task) = job.tasks.pop_front() {
+        let sample = opened
+            .dataset
+            .decoded_tile(task.tile_id.index())
+            .map_err(|error| format!("BaSiC sample tile {}: {error}", task.tile_id))
+            .and_then(|tile| basic::downsample_tile(&tile))
+            .and_then(|pixels| {
+                job.temp
+                    .as_ref()
+                    .ok_or_else(|| String::from("BaSiC request directory is unavailable."))?
+                    .append_sample(task.channel, &pixels)
+            });
+        if let Err(message) = sample {
+            return send_basic_sample_failure(events, job, &message);
+        }
+        job.sampled[task.channel] += 1;
+        let _ = events.try_send(WorkerEvent::BasicProgress {
+            channel: job.request.channels[task.channel].c_index,
+            sampled: job.sampled[task.channel],
+            total: job.totals[task.channel],
+            source_generation: job.request.source_generation,
+            fit_generation: job.request.fit_generation,
+        });
+        return BasicSampleOutcome::Continue;
+    }
+    if let Err(message) = job
+        .temp
+        .as_ref()
+        .ok_or_else(|| String::from("BaSiC request directory is unavailable."))
+        .and_then(basic::TempRequest::write_manifest)
+    {
+        return send_basic_sample_failure(events, job, &message);
+    }
+    if events
+        .send(WorkerEvent::BasicFitting {
+            totals: job
+                .request
+                .channels
+                .iter()
+                .zip(&job.totals)
+                .map(|(channel, total)| (channel.c_index, *total))
+                .collect(),
+            source_generation: job.request.source_generation,
+            fit_generation: job.request.fit_generation,
+        })
+        .is_err()
+    {
+        return BasicSampleOutcome::Finished;
+    }
+    let helper = job.request.helper.clone();
+    let source_generation = job.request.source_generation;
+    let fit_generation = job.request.fit_generation;
+    let cancelled = Arc::clone(&job.cancelled);
+    let worker_cancelled = Arc::clone(&cancelled);
+    let helper_events = events.clone();
+    let temp = job
+        .temp
+        .take()
+        .expect("sampling job owns its request directory until fitting");
+    let join = thread::Builder::new()
+        .name(String::from("czi-basic-helper"))
+        .spawn(move || {
+            let result = basic::run_helper(&helper, &temp, &worker_cancelled);
+            if worker_cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            let event = match result {
+                Ok(profiles) => WorkerEvent::BasicReady {
+                    profiles,
+                    source_generation,
+                    fit_generation,
+                },
+                Err(message) => WorkerEvent::BasicFailed {
+                    message,
+                    source_generation,
+                    fit_generation,
+                },
+            };
+            let _ = helper_events.send(event);
+        });
+    match join {
+        Ok(join) => BasicSampleOutcome::Fitting(BasicFitHandle { cancelled, join }),
+        Err(error) => send_basic_sample_failure(
+            events,
+            job,
+            &format!("Could not start BaSiC helper worker: {error}"),
+        ),
+    }
+}
+
+fn send_basic_sample_failure(
+    events: &SyncSender<WorkerEvent>,
+    job: &BasicSamplingJob,
+    message: &str,
+) -> BasicSampleOutcome {
+    let _ = events.send(WorkerEvent::BasicFailed {
+        message: sanitize_error(message),
+        source_generation: job.request.source_generation,
+        fit_generation: job.request.fit_generation,
+    });
+    BasicSampleOutcome::Finished
+}
+
+fn cancel_basic_jobs(sampling: &mut Option<BasicSamplingJob>, fits: &[BasicFitHandle]) {
+    if let Some(job) = sampling.take() {
+        job.cancelled.store(true, Ordering::Release);
+    }
+    for fit in fits {
+        fit.cancelled.store(true, Ordering::Release);
+    }
+}
+
+fn reap_basic_fits(fits: &mut Vec<BasicFitHandle>) {
+    let mut index = 0;
+    while index < fits.len() {
+        if fits[index].join.is_finished() {
+            let fit = fits.swap_remove(index);
+            let _ = fit.join.join();
+        } else {
+            index += 1;
         }
     }
 }
@@ -1819,7 +2189,12 @@ fn take_newer_command(
     loop {
         match commands.try_recv() {
             Ok(WorkerCommand::View(request)) => latest_view = Some(request),
-            Ok(command @ (WorkerCommand::Browse { .. } | WorkerCommand::ClearBrowse)) => {
+            Ok(
+                command @ (WorkerCommand::Browse { .. }
+                | WorkerCommand::ClearBrowse
+                | WorkerCommand::BasicStart(_)
+                | WorkerCommand::BasicCancel),
+            ) => {
                 return Some(ViewInterruption {
                     command,
                     resume: Some(latest_view.unwrap_or_else(|| current_view.clone())),
@@ -1915,10 +2290,7 @@ fn process_plane_view(
     plane: PlaneSelector,
     prefetch_limit: usize,
 ) -> PlaneViewOutcome {
-    let query = match ViewQuery::new(plane, request.viewport, request.target_downsample)
-        .map_err(|error| error.to_string())
-        .and_then(|view| opened.query.query(&view).map_err(|error| error.to_string()))
-    {
+    let query = match worker_view_query(opened, request, plane, request.viewport) {
         Ok(query) => query,
         Err(message) => {
             let _ = events.send(WorkerEvent::ViewFailed {
@@ -1929,10 +2301,7 @@ fn process_plane_view(
             return PlaneViewOutcome::Failed;
         }
     };
-    let prefetch = match ViewQuery::new(plane, request.prefetch_viewport, request.target_downsample)
-        .map_err(|error| error.to_string())
-        .and_then(|view| opened.query.query(&view).map_err(|error| error.to_string()))
-    {
+    let prefetch = match worker_view_query(opened, request, plane, request.prefetch_viewport) {
         Ok(query) => query,
         Err(message) => {
             let _ = events.send(WorkerEvent::ViewFailed {
@@ -1990,6 +2359,24 @@ fn process_plane_view(
     PlaneViewOutcome::Complete(PlanePrefetch {
         hits: prefetch_decode,
     })
+}
+
+fn worker_view_query(
+    opened: &WorkerDataset,
+    request: &ViewRequest,
+    plane: PlaneSelector,
+    viewport: SpatialRect,
+) -> Result<czi_core::ViewQueryResult, String> {
+    if let Some(scale) = request.forced_scales.get(&plane.key()) {
+        opened
+            .query
+            .query_at_scale(plane, viewport, *scale)
+            .map_err(|error| error.to_string())
+    } else {
+        ViewQuery::new(plane, viewport, request.target_downsample)
+            .map_err(|error| error.to_string())
+            .and_then(|view| opened.query.query(&view).map_err(|error| error.to_string()))
+    }
 }
 
 fn prefetch_quota(index: usize, plane_count: usize, limit: usize) -> usize {
@@ -2098,6 +2485,19 @@ fn dimension_choices(tiles: &[TileIndex], code: DimensionCode) -> DimensionChoic
     values.dedup();
     let present = !values.is_empty();
     if !present {
+        values.push(0);
+    }
+    DimensionChoices { present, values }
+}
+
+fn query_dimension_choices(
+    tiles: &[TileIndex],
+    code: DimensionCode,
+    query_values: &[i32],
+) -> DimensionChoices {
+    let present = dimension_choices(tiles, code).present;
+    let mut values = query_values.to_vec();
+    if values.is_empty() {
         values.push(0);
     }
     DimensionChoices { present, values }
@@ -2302,6 +2702,44 @@ impl Status {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum BasicPhase {
+    #[default]
+    Idle,
+    Sampling,
+    Fitting,
+    Ready,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Default)]
+struct BasicPreviewState {
+    phase: BasicPhase,
+    profiles: Option<basic::ProfileSet>,
+    progress: HashMap<i32, (usize, usize)>,
+    error: Option<String>,
+    on: bool,
+}
+
+impl BasicPreviewState {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn is_busy(&self) -> bool {
+        matches!(self.phase, BasicPhase::Sampling | BasicPhase::Fitting)
+    }
+
+    fn ready_for(&self, channels: &[i32]) -> bool {
+        self.phase == BasicPhase::Ready
+            && self
+                .profiles
+                .as_ref()
+                .is_some_and(|profiles| profiles.is_ready_for(channels))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Levels {
     black: u16,
@@ -2482,6 +2920,7 @@ fn texture_image(
     tile: &DecodedTile,
     levels: Levels,
     role: ChannelRole,
+    basic_profile: Option<&basic::ChannelProfile>,
 ) -> Result<egui::ColorImage, &'static str> {
     let width = usize::try_from(tile.width).map_err(|_| "tile width does not fit usize")?;
     let height = usize::try_from(tile.height).map_err(|_| "tile height does not fit usize")?;
@@ -2494,20 +2933,39 @@ fn texture_image(
         .map_err(|_| "cannot allocate display grayscale buffer")?;
     match &tile.pixels {
         DecodedPixels::Gray8(values) if values.len() == pixel_count => {
-            grayscale.extend(
-                values
-                    .iter()
-                    .copied()
-                    .map(|value| display_intensity(u16::from(value), levels)),
-            );
+            grayscale.extend(values.iter().copied().enumerate().map(|(index, value)| {
+                let raw = u16::from(value);
+                let corrected = basic_profile
+                    .filter(|profile| profile.pixel_max == u16::from(u8::MAX))
+                    .map_or(raw, |profile| {
+                        basic::correct_value(
+                            raw,
+                            index % width,
+                            index / width,
+                            width,
+                            height,
+                            profile,
+                        )
+                    });
+                display_intensity(corrected, levels)
+            }));
         }
         DecodedPixels::Gray16(values) if values.len() == pixel_count => {
-            grayscale.extend(
-                values
-                    .iter()
-                    .copied()
-                    .map(|value| display_intensity(value, levels)),
-            );
+            grayscale.extend(values.iter().copied().enumerate().map(|(index, raw)| {
+                let corrected = basic_profile
+                    .filter(|profile| profile.pixel_max == u16::MAX)
+                    .map_or(raw, |profile| {
+                        basic::correct_value(
+                            raw,
+                            index % width,
+                            index / width,
+                            width,
+                            height,
+                            profile,
+                        )
+                    });
+                display_intensity(corrected, levels)
+            }));
         }
         _ => return Err("decoded pixel count does not match the tile dimensions"),
     }
@@ -2967,6 +3425,7 @@ pub struct ViewerApp {
     visible_tile_ids: HashMap<PlaneKey, Vec<TileId>>,
     pyramid_display: PyramidDisplay,
     levels: Levels,
+    basic_preview: BasicPreviewState,
     camera: Camera,
     fit_pending: bool,
     last_request: Option<ViewRequestKey>,
@@ -3025,6 +3484,7 @@ impl ViewerApp {
             visible_tile_ids: HashMap::new(),
             pyramid_display: PyramidDisplay::default(),
             levels: Levels::default_for(PixelType::Gray16),
+            basic_preview: BasicPreviewState::default(),
             camera: Camera::default(),
             fit_pending: false,
             last_request: None,
@@ -3118,6 +3578,7 @@ impl ViewerApp {
         {
             return;
         }
+        self.worker.basic_cancellation.cancel_active();
         self.generations.begin_source();
         self.dataset = None;
         self.dataset_origin = None;
@@ -3129,6 +3590,7 @@ impl ViewerApp {
         self.pyramid_display.clear();
         self.clear_pending_view();
         self.fit_pending = false;
+        self.basic_preview.reset();
         if let Err(error) = self.worker.send(WorkerCommand::ClearDataset) {
             self.status = Status::error(error);
         }
@@ -3237,6 +3699,7 @@ impl ViewerApp {
             DatasetLocator::Remote { connection, .. } => self.prepare_remote_connection(connection),
             DatasetLocator::Local(_) => self.generations.connection,
         };
+        self.worker.basic_cancellation.cancel_active();
         let source_label = locator.display_label();
         let source_generation = self.generations.begin_source();
         self.dataset = None;
@@ -3248,6 +3711,7 @@ impl ViewerApp {
         self.pyramid_display.clear();
         self.clear_pending_view();
         self.fit_pending = false;
+        self.basic_preview.reset();
         self.status = Status::normal(format!("Opening {source_label}…"));
         let pending = (locator.clone(), source_generation);
         if let Err(error) = self.worker.send(WorkerCommand::Open {
@@ -3448,6 +3912,117 @@ impl ViewerApp {
         }
     }
 
+    fn basic_channel_specs(&self) -> Vec<basic::ChannelSpec> {
+        let Some(dataset) = self.dataset.as_ref() else {
+            return Vec::new();
+        };
+        let mut phase_assigned = false;
+        dataset
+            .c
+            .values
+            .iter()
+            .enumerate()
+            .map(|(ordinal, channel)| {
+                let name = dataset
+                    .metadata_summary
+                    .channels
+                    .iter()
+                    .find(|metadata| metadata.index == *channel)
+                    .map_or_else(
+                        || format!("Channel {channel}"),
+                        |metadata| basic_channel_name(&metadata.label, *channel),
+                    );
+                let normalized = bounded_lowercase(&name, 256);
+                let is_phase = !phase_assigned
+                    && ["phase", "brightfield", "bright field", "transmitted"]
+                        .iter()
+                        .any(|needle| normalized.contains(needle));
+                phase_assigned |= is_phase;
+                basic::ChannelSpec {
+                    id: format!("channel-{ordinal}"),
+                    c_index: *channel,
+                    name,
+                    is_phase,
+                }
+            })
+            .collect()
+    }
+
+    fn prepare_basic_preview(&mut self) {
+        if self.dataset.is_none() {
+            self.basic_preview.error = Some(String::from("Open a CZI first."));
+            self.basic_preview.phase = BasicPhase::Failed;
+            return;
+        }
+        let helper = match basic::helper_from_env() {
+            Ok(helper) => helper,
+            Err(error) => {
+                self.basic_preview.error = Some(error);
+                self.basic_preview.phase = BasicPhase::Failed;
+                return;
+            }
+        };
+        self.worker.basic_cancellation.cancel_active();
+        if self.basic_preview.on {
+            self.set_basic_preview_enabled(false);
+        }
+        let fit_generation = self.generations.begin_basic_fit();
+        self.basic_preview = BasicPreviewState {
+            phase: BasicPhase::Sampling,
+            ..BasicPreviewState::default()
+        };
+        let request = BasicRequest {
+            helper,
+            channels: self.basic_channel_specs(),
+            source_generation: self.generations.source,
+            fit_generation,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        self.worker.basic_cancellation.replace(&request.cancelled);
+        if let Err(error) = self.worker.send(WorkerCommand::BasicStart(request)) {
+            self.worker.basic_cancellation.cancel_active();
+            self.basic_preview.phase = BasicPhase::Failed;
+            self.basic_preview.error = Some(error);
+        }
+    }
+
+    fn cancel_basic_preview(&mut self) {
+        self.worker.basic_cancellation.cancel_active();
+        self.generations.begin_basic_fit();
+        let _ = self.worker.send(WorkerCommand::BasicCancel);
+        self.basic_preview.profiles = None;
+        self.basic_preview.progress.clear();
+        self.basic_preview.error = None;
+        self.basic_preview.phase = BasicPhase::Cancelled;
+        if self.basic_preview.on {
+            self.set_basic_preview_enabled(false);
+        }
+    }
+
+    fn set_basic_preview_enabled(&mut self, enabled: bool) {
+        let channels = self
+            .dataset
+            .as_ref()
+            .map_or_else(Vec::new, |dataset| dataset.c.values.clone());
+        let enabled = enabled && self.basic_preview.ready_for(&channels);
+        if self.basic_preview.on == enabled {
+            return;
+        }
+        self.basic_preview.on = enabled;
+        self.generations.begin_basic_toggle();
+        self.cache.clear();
+        self.pending_tiles.clear();
+        self.invalidate_view();
+    }
+
+    fn basic_profile(&self, channel: i32) -> Option<&basic::ChannelProfile> {
+        self.basic_preview
+            .on
+            .then_some(())
+            .and(self.basic_preview.profiles.as_ref())
+            .and_then(|profiles| profiles.channels.get(&channel))
+    }
+
     fn active_cache_counts(&self, source_generation: u64) -> (usize, usize, usize) {
         let planes = self
             .active_planes()
@@ -3484,13 +4059,37 @@ impl ViewerApp {
             return;
         }
         let view_generation = self.generations.begin_view();
+        let forced_scales = if self.basic_preview.on {
+            planes
+                .iter()
+                .filter_map(|plane| {
+                    let info = self.dataset.as_ref()?.plane(*plane)?;
+                    let verified = self
+                        .dataset
+                        .as_ref()?
+                        .basic_verified_scales
+                        .get(&plane.key())?;
+                    basic::select_verified_scale(&info.scales, verified, target_downsample)
+                        .map(|scale| (plane.key(), scale))
+                })
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
+        };
         let requested_scales = planes
             .iter()
             .filter_map(|plane| {
-                self.dataset
-                    .as_ref()
-                    .and_then(|dataset| dataset.plane(*plane))
-                    .and_then(|info| select_requested_scale(&info.scales, target_downsample))
+                forced_scales
+                    .get(&plane.key())
+                    .copied()
+                    .or_else(|| {
+                        self.dataset
+                            .as_ref()
+                            .and_then(|dataset| dataset.plane(*plane))
+                            .and_then(|info| {
+                                select_requested_scale(&info.scales, target_downsample)
+                            })
+                    })
                     .map(|scale| (plane.key(), scale))
             })
             .collect::<HashMap<_, _>>();
@@ -3504,6 +4103,7 @@ impl ViewerApp {
             viewport,
             prefetch_viewport: prefetch_viewport(viewport, bounds),
             target_downsample,
+            forced_scales,
             resident_tile_ids,
         };
         self.last_request = Some(request_key.clone());
@@ -3758,6 +4358,7 @@ impl ViewerApp {
             self.invalidate_view();
         }
         show_pyramid_summary(ui, &self.pyramid_display);
+        self.show_basic_preview(ui);
         if let Some(dataset) = self.dataset.as_ref() {
             let (visible, resident, bytes) = self.active_cache_counts(self.generations.source);
             ui.label(format!(
@@ -3772,6 +4373,111 @@ impl ViewerApp {
                     plane.world_bounds.max_x,
                     plane.world_bounds.max_y
                 ));
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn show_basic_preview(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.heading("BaSiC preview");
+        ui.weak("Reversible display preview only. The CZI is never modified.");
+        let channels = self
+            .dataset
+            .as_ref()
+            .map_or_else(Vec::new, |dataset| dataset.c.values.clone());
+        let ready = self.basic_preview.ready_for(&channels);
+        let mut prepare = false;
+        let mut cancel = false;
+        ui.horizontal(|ui| {
+            if self.basic_preview.is_busy() {
+                cancel = ui.button("Cancel").clicked();
+            } else {
+                let label = if ready {
+                    "Refit"
+                } else {
+                    "Prepare BaSiC Preview"
+                };
+                prepare = ui
+                    .add_enabled(self.dataset.is_some(), egui::Button::new(label))
+                    .clicked();
+            }
+        });
+        let mut requested_on = self.basic_preview.on;
+        ui.add_enabled_ui(ready, |ui| {
+            ui.horizontal(|ui| {
+                ui.strong("BaSiC Preview");
+                ui.selectable_value(&mut requested_on, false, "Off");
+                ui.selectable_value(&mut requested_on, true, "On");
+            });
+        });
+        if requested_on != self.basic_preview.on {
+            self.set_basic_preview_enabled(requested_on);
+        }
+        if prepare {
+            self.prepare_basic_preview();
+        }
+        if cancel {
+            self.cancel_basic_preview();
+        }
+        match self.basic_preview.phase {
+            BasicPhase::Idle => {
+                ui.weak("Not prepared.");
+            }
+            BasicPhase::Sampling => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Sampling detector tiles…");
+                });
+            }
+            BasicPhase::Fitting => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Fitting with helper…");
+                });
+            }
+            BasicPhase::Ready => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(112, 210, 154),
+                    "All sparse channels ready. Darkfield is off.",
+                );
+            }
+            BasicPhase::Failed => {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    self.basic_preview
+                        .error
+                        .as_deref()
+                        .unwrap_or("BaSiC preparation failed."),
+                );
+            }
+            BasicPhase::Cancelled => {
+                ui.weak("Preparation cancelled.");
+            }
+        }
+        if let Some(dataset) = self.dataset.as_ref() {
+            for channel in &dataset.c.values {
+                let label = channel_label(&dataset.metadata_summary, *channel);
+                let detail = self.basic_preview.progress.get(channel).map_or_else(
+                    || {
+                        if ready {
+                            String::from("ready")
+                        } else if self.basic_preview.phase == BasicPhase::Failed {
+                            String::from("failed")
+                        } else {
+                            String::from("waiting")
+                        }
+                    },
+                    |(sampled, total)| {
+                        let warning = if *total < basic::WARN_SAMPLES_PER_CHANNEL {
+                            " · low-sample warning"
+                        } else {
+                            ""
+                        };
+                        format!("{sampled}/{total}{warning}")
+                    },
+                );
+                ui.weak(format!("{label}: {detail}"));
             }
         }
     }
@@ -4105,6 +4811,72 @@ impl ViewerApp {
             {
                 self.status = Status::error(message);
             }
+            WorkerEvent::BasicProgress {
+                channel,
+                sampled,
+                total,
+                source_generation,
+                fit_generation,
+            } if self
+                .generations
+                .accepts_basic_fit(source_generation, fit_generation) =>
+            {
+                self.basic_preview.phase = BasicPhase::Sampling;
+                self.basic_preview
+                    .progress
+                    .insert(channel, (sampled, total));
+            }
+            WorkerEvent::BasicFitting {
+                totals,
+                source_generation,
+                fit_generation,
+            } if self
+                .generations
+                .accepts_basic_fit(source_generation, fit_generation) =>
+            {
+                self.basic_preview.phase = BasicPhase::Fitting;
+                self.basic_preview.progress = totals
+                    .into_iter()
+                    .map(|(channel, total)| (channel, (total, total)))
+                    .collect();
+            }
+            WorkerEvent::BasicReady {
+                profiles,
+                source_generation,
+                fit_generation,
+            } if self
+                .generations
+                .accepts_basic_fit(source_generation, fit_generation) =>
+            {
+                let channels = self
+                    .dataset
+                    .as_ref()
+                    .map_or_else(Vec::new, |dataset| dataset.c.values.clone());
+                if profiles.is_ready_for(&channels) {
+                    self.basic_preview.profiles = Some(profiles);
+                    self.basic_preview.error = None;
+                    self.basic_preview.phase = BasicPhase::Ready;
+                } else {
+                    self.basic_preview.profiles = None;
+                    self.basic_preview.phase = BasicPhase::Failed;
+                    self.basic_preview.error = Some(String::from(
+                        "BaSiC helper did not return a valid profile for every sparse channel.",
+                    ));
+                }
+            }
+            WorkerEvent::BasicFailed {
+                message,
+                source_generation,
+                fit_generation,
+            } if self
+                .generations
+                .accepts_basic_fit(source_generation, fit_generation) =>
+            {
+                self.basic_preview.on = false;
+                self.basic_preview.profiles = None;
+                self.basic_preview.phase = BasicPhase::Failed;
+                self.basic_preview.error = Some(sanitize_error(message));
+            }
             WorkerEvent::VpnAuthenticationStarted { .. }
             | WorkerEvent::VpnReady { .. }
             | WorkerEvent::VpnFailed { .. }
@@ -4117,7 +4889,11 @@ impl ViewerApp {
             | WorkerEvent::RemotePathsFailed { .. }
             | WorkerEvent::TileLoaded { .. }
             | WorkerEvent::ViewFinished { .. }
-            | WorkerEvent::ViewFailed { .. } => {}
+            | WorkerEvent::ViewFailed { .. }
+            | WorkerEvent::BasicProgress { .. }
+            | WorkerEvent::BasicFitting { .. }
+            | WorkerEvent::BasicReady { .. }
+            | WorkerEvent::BasicFailed { .. } => {}
         }
     }
 
@@ -4144,6 +4920,7 @@ impl ViewerApp {
         self.pending_tiles.clear();
         self.visible_tile_ids.clear();
         self.fit_pending = true;
+        self.basic_preview.reset();
         self.invalidate_view();
     }
 
@@ -4214,10 +4991,12 @@ impl ViewerApp {
                 m_index: None,
                 paint_order: pending.paint_order,
             };
+            let basic_profile = self.basic_profile(pending.plane.c).cloned();
             match texture_image(
                 &pending.tile,
                 self.levels,
                 self.role_for_plane(pending.plane),
+                basic_profile.as_ref(),
             ) {
                 Ok(image) => {
                     let bytes = image
@@ -4654,11 +5433,12 @@ impl ViewerApp {
             }
             ui.weak("Wheel: zoom at cursor · Drag: pan · logical world coordinates");
         });
-        let title_height = if self.display_mode == DisplayMode::Composite {
-            44.0
-        } else {
-            26.0
-        };
+        let title_height =
+            26.0 + if self.display_mode == DisplayMode::Composite {
+                18.0
+            } else {
+                0.0
+            } + if self.basic_preview.on { 18.0 } else { 0.0 };
         let (title_response, title_painter) = ui.allocate_painter(
             egui::vec2(ui.available_width(), title_height),
             egui::Sense::hover(),
@@ -4675,6 +5455,7 @@ impl ViewerApp {
             &self.channel_roles,
             &title_planes,
             &self.pyramid_display,
+            self.basic_preview.on,
         );
         draw_canvas_title(&title_painter, title_response.rect, title);
         let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::drag());
@@ -4875,7 +5656,7 @@ fn show_pyramid_summary(ui: &mut egui::Ui, pyramid: &PyramidDisplay) {
 
 fn draw_canvas_title(painter: &egui::Painter, rect: egui::Rect, title: CanvasTitle) {
     painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(20, 24, 29));
-    let first_position = if title.legend.is_some() {
+    let first_position = if title.legend.is_some() || title.annotation.is_some() {
         egui::pos2(rect.left() + 8.0, rect.top() + 13.0)
     } else {
         rect.left_center() + egui::vec2(8.0, 0.0)
@@ -4907,12 +5688,24 @@ fn draw_canvas_title(painter: &egui::Painter, rect: egui::Rect, title: CanvasTit
             );
         }
     }
+    if let Some(annotation) = title.annotation {
+        let y = if title.had_legend { 49.0 } else { 31.0 };
+        painter.text(
+            egui::pos2(rect.left() + 8.0, rect.top() + y),
+            egui::Align2::LEFT_CENTER,
+            annotation,
+            egui::FontId::proportional(12.0),
+            egui::Color32::GOLD,
+        );
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct CanvasTitle {
     primary: String,
     legend: Option<String>,
+    annotation: Option<&'static str>,
+    had_legend: bool,
 }
 
 fn format_canvas_title(
@@ -4922,11 +5715,14 @@ fn format_canvas_title(
     channel_roles: &HashMap<i32, ChannelRole>,
     active_planes: &[PlaneKey],
     pyramid: &PyramidDisplay,
+    basic_on: bool,
 ) -> CanvasTitle {
     let Some(dataset) = dataset else {
         return CanvasTitle {
             primary: String::from("No CZI loaded"),
             legend: None,
+            annotation: None,
+            had_legend: false,
         };
     };
     format_loaded_canvas_title(
@@ -4937,9 +5733,11 @@ fn format_canvas_title(
         channel_roles,
         active_planes,
         pyramid,
+        basic_on,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn format_loaded_canvas_title(
     source_label: &str,
     summary: &MetadataSummary,
@@ -4948,6 +5746,7 @@ fn format_loaded_canvas_title(
     channel_roles: &HashMap<i32, ChannelRole>,
     active_planes: &[PlaneKey],
     pyramid: &PyramidDisplay,
+    basic_on: bool,
 ) -> CanvasTitle {
     let filename = truncate_chars(source_filename_ref(source_label), MAX_TITLE_FILENAME_CHARS);
     let requested = format_scale_summary(pyramid.requested_summary());
@@ -4987,7 +5786,14 @@ fn format_loaded_canvas_title(
             )
         )
     });
-    CanvasTitle { primary, legend }
+    let had_legend = legend.is_some();
+    CanvasTitle {
+        primary,
+        legend,
+        annotation: basic_on
+            .then_some("BaSiC preview · darkfield off · not quantitatively validated"),
+        had_legend,
+    }
 }
 
 fn composite_legend(
@@ -5843,6 +6649,25 @@ fn channel_label(summary: &MetadataSummary, channel: i32) -> String {
         )
 }
 
+fn basic_channel_name(name: &str, channel: i32) -> String {
+    let cleaned = name
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let bounded = cleaned.trim().chars().take(128).collect::<String>();
+    if bounded.is_empty() {
+        format!("Channel {channel}")
+    } else {
+        bounded
+    }
+}
+
 fn metadata_tree(ui: &mut egui::Ui, node: &czi_core::MetadataNode, filter: &str, depth: usize) {
     if !metadata_matches(node, filter) {
         return;
@@ -6175,6 +7000,51 @@ mod tests {
     }
 
     #[test]
+    fn basic_fit_and_toggle_generations_reject_stale_results() {
+        let mut generations = Generations::default();
+        let source = generations.begin_source();
+        let first_fit = generations.begin_basic_fit();
+        assert!(generations.accepts_basic_fit(source, first_fit));
+        let second_fit = generations.begin_basic_fit();
+        assert!(!generations.accepts_basic_fit(source, first_fit));
+        assert!(generations.accepts_basic_fit(source, second_fit));
+
+        let first_toggle = generations.begin_basic_toggle();
+        let second_toggle = generations.begin_basic_toggle();
+        assert_ne!(first_toggle, second_toggle);
+
+        generations.begin_source();
+        assert!(!generations.accepts_basic_fit(source, second_fit));
+    }
+
+    #[test]
+    fn cancelled_queued_basic_start_carries_a_sticky_token() {
+        let (sender, receiver) = mpsc::sync_channel(2);
+        sender
+            .send(WorkerCommand::ClearBrowse)
+            .expect("first command");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let slot = BasicCancellationSlot::default();
+        slot.replace(&cancelled);
+        sender
+            .send(WorkerCommand::BasicStart(BasicRequest {
+                helper: PathBuf::from("/helper"),
+                channels: Vec::new(),
+                source_generation: 1,
+                fit_generation: 1,
+                cancelled: Arc::clone(&cancelled),
+            }))
+            .expect("queued start");
+        slot.cancel_active();
+        assert!(matches!(receiver.recv(), Ok(WorkerCommand::ClearBrowse)));
+        let WorkerCommand::BasicStart(request) = receiver.recv().expect("queued BaSiC start")
+        else {
+            panic!("expected BaSiC start");
+        };
+        assert!(request.cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn channel_role_defaults_use_labels_and_sparse_channel_values() {
         let choices = DimensionChoices {
             present: true,
@@ -6355,11 +7225,31 @@ mod tests {
             &roles,
             &[plane],
             &pyramid,
+            false,
         );
 
         assert!(title.primary.chars().count() <= MAX_CANVAS_TITLE_CHARS);
         assert!(!title.primary.contains("AF405=Blue"));
         assert_eq!(title.legend.as_deref(), Some("Channels: AF405=Blue"));
+    }
+
+    #[test]
+    fn corrected_canvas_title_always_has_bounded_validation_annotation() {
+        let title = format_loaded_canvas_title(
+            "/data/image.czi",
+            &MetadataSummary::default(),
+            PlaneSelector::new(0, SceneId::Implicit, 0, 0),
+            DisplayMode::Single,
+            &HashMap::new(),
+            &[PlaneKey::new(0, SceneId::Implicit, 0, 0)],
+            &PyramidDisplay::default(),
+            true,
+        );
+        assert_eq!(
+            title.annotation,
+            Some("BaSiC preview · darkfield off · not quantitatively validated")
+        );
+        assert!(title.annotation.unwrap().chars().count() < MAX_CANVAS_TITLE_CHARS);
     }
 
     #[test]
@@ -6421,11 +7311,57 @@ mod tests {
             &tile,
             Levels::default_for(PixelType::Gray8),
             ChannelRole::Blue,
+            None,
         )
         .expect("blue texture");
         assert_eq!(image.size, [2, 1]);
         assert_eq!(image.pixels[0], egui::Color32::TRANSPARENT);
         assert_eq!(image.pixels[1], egui::Color32::BLUE);
+    }
+
+    #[test]
+    fn basic_texture_correction_precedes_levels_for_gray8_and_gray16() {
+        let profile = |pixel_max| basic::ChannelProfile {
+            id: String::from("c0"),
+            c_index: 0,
+            pixel_max,
+            gain: Arc::new(vec![2.0; (basic::GRID_WIDTH * basic::GRID_HEIGHT) as usize]),
+            support: Arc::new(vec![1; (basic::GRID_WIDTH * basic::GRID_HEIGHT) as usize]),
+        };
+        let gray8 = texture_image(
+            &DecodedTile {
+                width: 1,
+                height: 1,
+                pixels: DecodedPixels::Gray8(vec![100]),
+            },
+            Levels::default_for(PixelType::Gray8),
+            ChannelRole::Gray,
+            Some(&profile(u16::from(u8::MAX))),
+        )
+        .expect("Gray8 correction");
+        assert_eq!(gray8.pixels, vec![egui::Color32::from_gray(50)]);
+
+        let gray16 = texture_image(
+            &DecodedTile {
+                width: 1,
+                height: 1,
+                pixels: DecodedPixels::Gray16(vec![51_400]),
+            },
+            Levels::default_for(PixelType::Gray16),
+            ChannelRole::Gray,
+            Some(&profile(u16::MAX)),
+        )
+        .expect("Gray16 correction");
+        assert_eq!(gray16.pixels, vec![egui::Color32::from_gray(100)]);
+    }
+
+    #[test]
+    fn basic_channel_names_are_protocol_safe_and_unicode_bounded() {
+        assert_eq!(basic_channel_name("Phase\nContrast", 2), "Phase Contrast");
+        assert_eq!(basic_channel_name("\n\t", 7), "Channel 7");
+        let bounded = basic_channel_name(&"蛍".repeat(200), 1);
+        assert_eq!(bounded.chars().count(), 128);
+        assert!(bounded.chars().all(|character| !character.is_control()));
     }
 
     #[test]
@@ -6583,6 +7519,7 @@ mod tests {
             viewport: SpatialRect::new(0, 0, 1, 1).expect("unit viewport"),
             prefetch_viewport: SpatialRect::new(0, 0, 1, 1).expect("unit prefetch viewport"),
             target_downsample: 1.0,
+            forced_scales: HashMap::new(),
             resident_tile_ids: Vec::new(),
         }
     }
@@ -7435,12 +8372,15 @@ mod tests {
         let worker_cancellation = embedded_cancellation.clone();
         let vpn_cancellation = VpnCancellationSlot::default();
         let worker_vpn_cancellation = vpn_cancellation.clone();
+        let basic_cancellation = BasicCancellationSlot::default();
+        let worker_basic_cancellation = basic_cancellation.clone();
         let join = thread::spawn(move || {
             worker_loop(
                 &command_rx,
                 &event_tx,
                 &worker_cancellation,
                 &worker_vpn_cancellation,
+                &worker_basic_cancellation,
             );
         });
         commands
@@ -7455,6 +8395,7 @@ mod tests {
             events: Some(events),
             embedded_cancellation,
             vpn_cancellation,
+            basic_cancellation,
             join: Some(join),
         };
         worker.shutdown();

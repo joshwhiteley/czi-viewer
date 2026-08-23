@@ -17,5 +17,6 @@ This project implements CZI behavior from public documentation, independently ob
 - ZEISS libCZI repository: <https://github.com/ZEISS/libczi>
 - `czi-rs` public API and permissively licensed source: <https://github.com/keejkrej/czi-rs>
 - OpenSSH protocol documentation: <https://github.com/openssh/openssh-portable/tree/master>
+- BaSiC publication: Peng et al., “A BaSiC tool for background and shading correction of optical microscopy images,” *Nature Communications* 8, 14836 (2017), <https://doi.org/10.1038/ncomms14836>
 
 A source review does not imply that source was copied. Implementation commits must cite project tests or the relevant public reference when format behavior is not obvious.

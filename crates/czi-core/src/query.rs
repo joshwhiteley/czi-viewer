@@ -548,6 +548,12 @@ pub enum TileQueryError {
     /// No plane matching a selector exists.
     #[error("no indexed plane matches {selector}")]
     MissingPlane { selector: PlaneSelector },
+    /// A requested exact pyramid scale is not indexed for the selected plane.
+    #[error("plane {selector} has no indexed pyramid scale {scale:?}")]
+    MissingScale {
+        selector: PlaneSelector,
+        scale: PyramidScale,
+    },
 }
 
 impl fmt::Display for PlaneSelector {
@@ -683,6 +689,32 @@ impl TileQueryIndex {
                 selector: query.plane,
             })?;
         let scale = choose_scale(&info.scales, query.target_downsample);
+        self.query_at_scale(query.plane, query.viewport, scale)
+    }
+
+    /// Query one exact plane at one exact indexed pyramid scale.
+    ///
+    /// This remains geometry-only and is useful when a caller has independently verified that
+    /// a pyramid representation preserves a required per-tile coordinate system.
+    pub fn query_at_scale(
+        &self,
+        plane: PlaneSelector,
+        viewport: SpatialRect,
+        scale: PyramidScale,
+    ) -> Result<ViewQueryResult, TileQueryError> {
+        let plane = plane.key();
+        let info = self
+            .planes
+            .get(&plane)
+            .ok_or(TileQueryError::MissingPlane {
+                selector: plane.into(),
+            })?;
+        if !info.scales.contains(&scale) {
+            return Err(TileQueryError::MissingScale {
+                selector: plane.into(),
+                scale,
+            });
+        }
         let mut hits = self
             .levels
             .get(&(plane, scale))
@@ -690,18 +722,15 @@ impl TileQueryIndex {
             .flatten()
             .filter_map(|tile_id| {
                 let tile = self.tiles[tile_id.0];
-                query
-                    .viewport
-                    .intersects(tile.logical_rect)
-                    .then_some(TileHit {
-                        tile_id: *tile_id,
-                        plane: tile.plane,
-                        logical_rect: tile.logical_rect,
-                        physical_stored_size: tile.physical_stored_size,
-                        scale: tile.scale,
-                        m_index: tile.m_index,
-                        paint_order: 0,
-                    })
+                viewport.intersects(tile.logical_rect).then_some(TileHit {
+                    tile_id: *tile_id,
+                    plane: tile.plane,
+                    logical_rect: tile.logical_rect,
+                    physical_stored_size: tile.physical_stored_size,
+                    scale: tile.scale,
+                    m_index: tile.m_index,
+                    paint_order: 0,
+                })
             })
             .collect::<Vec<_>>();
         hits.sort_unstable_by_key(|hit| {
@@ -1007,6 +1036,23 @@ mod tests {
             query.select_scale(selector, 0.5).unwrap(),
             PyramidScale::new(1, 1).unwrap()
         );
+        let exact = query
+            .query_at_scale(
+                selector,
+                SpatialRect::new(0, 0, 100, 100).unwrap(),
+                PyramidScale::new(4, 1).unwrap(),
+            )
+            .expect("exact level");
+        assert_eq!(exact.scale, PyramidScale::new(4, 1).unwrap());
+        assert_eq!(exact.hits[0].tile_id, TileId(0));
+        assert!(matches!(
+            query.query_at_scale(
+                selector,
+                SpatialRect::new(0, 0, 100, 100).unwrap(),
+                PyramidScale::new(3, 1).unwrap(),
+            ),
+            Err(TileQueryError::MissingScale { .. })
+        ));
     }
 
     #[test]

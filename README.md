@@ -2,7 +2,7 @@
 
 A macOS-first, pure-Rust desktop viewer for local and remote ZEISS CZI microscopy images.
 
-The viewer displays tiled and pyramidal CZI mosaics with sparse C/S/Z/T selection, organized metadata, channel labels, display levels, pan, zoom, scale bars, and annotated PNG snapshots. It supports local files and read-only remote files over the system OpenSSH SFTP subsystem. Uncompressed Gray8 and Gray16 pixels are supported; compressed codecs are not yet supported.
+The viewer displays tiled and pyramidal CZI mosaics with sparse C/S/Z/T selection, organized metadata, channel labels, display levels, pan, zoom, scale bars, annotated PNG snapshots, and an optional reversible BaSiC flat-field preview. It supports local files and read-only remote files over the system OpenSSH SFTP subsystem. Uncompressed Gray8 and Gray16 pixels are supported; compressed codecs are not yet supported.
 
 ## Principles
 
@@ -57,9 +57,17 @@ The left **Dataset** panel has **Display** and **Metadata** tabs. Display names 
 
 The compact strip above the canvas identifies the source file, Scene, named Channel, Z/T, and requested and displayed pyramid scales. The lower-left scale bar uses CZI X/Y physical calibration in micrometers when available; otherwise it reports logical pixels.
 
+### Optional BaSiC preview
+
+BaSiC fitting uses a separately installed helper executable. Set `CZI_BASIC_HELPER` to its absolute path before launching the viewer. Open a local or SSH CZI, then click **Prepare BaSiC Preview** in **Display**. Preparation samples every sparse C channel on the background dataset worker, yields to visible viewport requests between tiles, and can be cancelled. The resulting profiles exist only in memory. **BaSiC Preview** remains **Off** until every channel has a valid profile.
+
+Turning the preview **On** clears the rendered texture cache and reloads the bounded visible viewport without changing the display range or field of view. Correction is flat-field only; unsupported profile pixels remain raw. Corrected PNG snapshots include `BaSiC preview · darkfield off · not quantitatively validated`. The viewer does not export corrected CZI/TIFF files or persist profiles. See [BaSiC preview and helper protocol](docs/basic-preview.md).
+
 Click **Save PNG** in the canvas toolbar to export only the annotated title strip and canvas. Side panels and controls are excluded. The viewer crops the native egui screenshot at the current display scale, then writes and encodes PNG on a background Rust thread. It saves to `~/Desktop` when it exists, otherwise the current working directory. Filenames are sanitized and include a Unix timestamp; collisions receive a numeric suffix.
 
 Direct SSH does not launch a shell, parse prompts, automate Terminal, prefill commands, use `SSH_ASKPASS`, or retain credentials, passwords, or one-time codes. OpenSSH stdin/stdout carry only binary SFTP packets; authentication output stays on the PTY. Optional Tufts VPN mode gives OpenConnect a fixed, private helper command for ocproxy; no username, password, path, prompt text, or other user input enters that command. Closing the viewer stops its SSH and VPN process groups. The viewer never writes to the remote host.
+
+The optional BaSiC helper is also launched without a shell. It receives only the fixed `--request-dir` flag and one app-owned temporary request-directory value, with an empty environment. It never receives a CZI path, SSH profile, credential, SFTP session, or remote handle. The temporary directory contains only downsampled pixels and is removed after fitting or cancellation.
 
 ## Development and tests
 
