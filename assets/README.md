@@ -1,6 +1,14 @@
 # Demo assets
 
-`hero-placeholder.svg` is temporary neutral artwork. It is clearly labeled as a placeholder and is not an application screenshot. Replace it with a real demo recording when one is approved.
+`czi-viewer-demo.gif` is an original capture of CZI Viewer displaying the project-owned synthetic file produced by:
+
+```sh
+cargo run -p czi-core --example generate_demo_czi -- test-data/demo.czi
+```
+
+The capture contains no private microscopy data, remote host, account, credential, or source CZI path. The top file-selection bar is excluded from every frame. The GIF uses a slow crop and zoom over the real application window; it does not simulate channel changes or analysis results.
+
+The recording and synthetic input are part of this repository and are available under the repository's `MIT OR Apache-2.0` license.
 
 ## Privacy and licensing rules
 
@@ -11,7 +19,7 @@
 - Record the source, license, creator, and approval in the pull request that adds a media file.
 - Do not imply ZEISS endorsement or use ZEISS marks beyond necessary factual text.
 
-## 8–12 second demo storyboard
+## Future extended demo storyboard
 
 Use `cargo run -p czi-core --example generate_demo_czi -- test-data/demo.czi` to create the ignored, synthetic input.
 
@@ -22,4 +30,4 @@ Use `cargo run -p czi-core --example generate_demo_czi -- test-data/demo.czi` to
 | 5–8 s | Open **Metadata** or change to **Green**. | Three safe synthetic channel names are visible. |
 | 8–11 s | Select **Save PNG**. | The annotated canvas export action is visible. |
 
-Keep the recording short, use a clean local session, and label the file with its source and license in the PR.
+Keep any replacement recording short, use a clean local session, and label the file with its source and license in the PR.

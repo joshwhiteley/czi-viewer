@@ -3,15 +3,15 @@
 [![CI](https://github.com/joshwhiteley/czi-viewer/actions/workflows/ci.yml/badge.svg)](https://github.com/joshwhiteley/czi-viewer/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
-> **Apple Silicon preview (unsigned):** Download the latest preview from [Releases](https://github.com/joshwhiteley/czi-viewer/releases). macOS will require the usual unsigned-app confirmation.
+> **Apple Silicon preview (unsigned):** Download the DMG from [Releases](https://github.com/joshwhiteley/czi-viewer/releases), drag **CZI Viewer** to Applications, then use Finder's unsigned-app confirmation on first launch.
 
 Open large CZI mosaics, inspect channels and metadata, and save an annotated view without loading the whole image.
 
 ## Demo
 
-[![Neutral demo placeholder: recording coming soon; not an app screenshot](assets/hero-placeholder.svg)](assets/README.md)
+[![CZI Viewer displaying a synthetic tiled CZI mosaic](assets/czi-viewer-demo.gif)](assets/czi-viewer-demo.gif)
 
-*Demo recording coming soon. This is a neutral storyboard, not an application screenshot. See the [demo plan and asset rules](assets/README.md).*
+*Real CZI Viewer capture using only the repository's synthetic three-channel demo CZI. [Asset provenance and privacy details](assets/README.md).*
 
 ## Open, explore, export
 
