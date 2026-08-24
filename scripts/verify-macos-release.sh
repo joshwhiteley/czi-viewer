@@ -142,7 +142,11 @@ expected_files=$(printf '%s\n' \
   'Resources/LICENSE-MIT' \
   'Resources/THIRD-PARTY-NOTICES.html')
 actual_files=$(find "$app/Contents" -type f -print | sed "s#^$app/Contents/##" | sort)
-[[ $actual_files == "$expected_files" ]] || fail 'application contains an unexpected or missing file'
+if [[ $actual_files != "$expected_files" ]]; then
+  printf 'Expected bundle files:\n%s\n' "$expected_files" >&2
+  printf 'Actual bundle files:\n%s\n' "$actual_files" >&2
+  fail 'application contains an unexpected or missing file'
+fi
 
 standalone_app="$dist_dir/${product}.app"
 [[ -d "$standalone_app" ]] || fail "standalone application bundle does not exist in $dist_dir"
