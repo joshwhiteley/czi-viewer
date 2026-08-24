@@ -26,7 +26,7 @@ The metadata parser is schema-tolerant and bounded. Metadata failure is diagnost
 
 Direct SSH does not launch a shell, parse prompts, automate Terminal, prefill commands, use `SSH_ASKPASS`, or retain credentials, passwords, or one-time codes. OpenSSH stdin and stdout carry binary SFTP packets; authentication output stays on the PTY. Remote paths are SFTP packets, not OpenSSH command-line text. Read [Embedded SSH](embedded-ssh.md) for the full connection and host-key boundary.
 
-The optional BaSiC helper starts without a shell, with an empty environment, a fixed `--request-dir` flag, and one app-owned temporary directory. It receives downsampled pixels only; it never receives a CZI path, SSH profile, credentials, SFTP session, or remote handle. See [BaSiC preview](basic-preview.md).
+The bundled BaSiCPy helper starts automatically after a CZI opens. It runs without a shell, with an empty environment, a fixed `--request-dir` flag, and one app-owned temporary directory. It receives downsampled pixels only; it never receives a CZI path, SSH profile, credentials, SFTP session, or remote handle. See [BaSiC preview](basic-preview.md).
 
 [AnyConnect VPN mode](anyconnect-vpn.md) has a narrow external-tool boundary. The viewer does not bundle, link, or distribute OpenConnect or ocproxy. [Dependency policy](dependency-policy.md) defines the wider shipped-code and licensing rules.
 

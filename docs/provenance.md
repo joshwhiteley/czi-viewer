@@ -20,3 +20,5 @@ This project implements CZI behavior from public documentation, independently ob
 - BaSiC publication: Peng et al., “A BaSiC tool for background and shading correction of optical microscopy images,” *Nature Communications* 8, 14836 (2017), <https://doi.org/10.1038/ncomms14836>
 
 A source review does not imply that source was copied. Implementation commits must cite project tests or the relevant public reference when format behavior is not obvious.
+
+The bundled pixel-only helper in `packaging/basic-helper/helper.py` is project-owned code adapted from the CZI viewer helper developed in the maintainer's `deciphaer-image-segmentation` project. It does not contain libCZI, aicspylibczi, CZI parsing, or source-file access. Its BaSiC fitting behavior uses the separately licensed BaSiCPy package and the bounded protocol documented in [BaSiC preview](basic-preview.md).

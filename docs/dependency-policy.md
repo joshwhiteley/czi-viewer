@@ -1,6 +1,6 @@
 # Dependency policy
 
-The distributed application must not contain C or C++ code. System macOS frameworks and the Rust bindings needed to call them are allowed, but vendored or dynamically linked C/C++ libraries are not.
+The primary viewer and CZI/SSH implementation remain Rust. The only bundled native-code exception is the isolated BaSiCPy helper described below. System macOS frameworks and the Rust bindings needed to call them are also allowed.
 
 ## Allowed licenses
 
@@ -16,11 +16,15 @@ Dependencies normally require one of these licenses:
 - OFL-1.1
 - Ubuntu-font-1.0
 
-Other permissive licenses require explicit review. GPL, LGPL, AGPL, SSPL, and proprietary runtime dependencies are not allowed in the distributed application.
+Other permissive licenses require explicit review. GPL, LGPL, AGPL, SSPL, and proprietary runtime dependencies are not allowed unless a focused exception below documents why redistribution is permitted and how notices/source obligations are met.
 
-The optional AnyConnect VPN integration has one narrow external-tool exception. A user may separately install OpenConnect (LGPL-2.1-only) and ocproxy (BSD-3-Clause). The viewer invokes them only as absolute-path executables from a fixed matching Homebrew pair. They are not linked, bundled, copied, or distributed with the viewer and are not part of its Rust dependency graph. This exception does not permit other LGPL dependencies or distributed native code. The shipped application remains pure Rust.
+The optional AnyConnect VPN integration has one narrow external-tool exception. A user may separately install OpenConnect (LGPL-2.1-only) and ocproxy (BSD-3-Clause). The viewer invokes them only as absolute-path executables from a fixed matching Homebrew pair. They are not linked, bundled, copied, or distributed with the viewer and are not part of its Rust dependency graph. This exception does not permit other LGPL dependencies or distributed native code. The VPN path remains external to the shipped application.
 
-The optional BaSiC preview has a second external-tool boundary. A user may separately install and configure a helper with `CZI_BASIC_HELPER`. The viewer requires an absolute executable path and invokes it without a shell. The helper is not linked, bundled, copied, or distributed with the viewer and is not part of the Rust dependency graph. It receives only an app-owned temporary directory of downsampled samples. Helper selection, installation, licensing, and numerical validation remain the operator's responsibility.
+The BaSiC preview has a reviewed bundled-helper exception. Release builds freeze Python 3.11, BaSiCPy, PyTorch, NumPy, SciPy, scikit-image, and their pinned transitive dependencies into an isolated Apple Silicon helper. This directory contains native C, C++, and Fortran libraries and is not linked into the Rust viewer. The viewer invokes one frozen executable without a shell and passes only an app-owned temporary directory of downsampled samples. It never passes a source path, remote handle, or credential.
+
+The Python environment is hash-locked, receives a separate CycloneDX SBOM, and includes complete generated license notices. MPL components remain file-scoped. The PyInstaller bootloader is distributed under GPL-2.0 with the upstream bootloader exception that permits distributing the generated executable without applying the GPL to the bundled application; PyInstaller and its build hooks are also reported in the build-environment notices and SBOM. This exception does not permit GPL code without an equivalent reviewed distribution exception elsewhere in the app.
+
+A custom protocol-compatible helper remains an Advanced override for testing or specialized deployments. Its licensing and numerical validation remain the operator's responsibility.
 
 The eframe `default_fonts` feature embeds font assets under OFL-1.1 and Ubuntu-font-1.0. These two font licenses are allowed only for those bundled assets.
 

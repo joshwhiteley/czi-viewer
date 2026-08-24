@@ -38,11 +38,13 @@ One authenticated, read-only SFTP session handles browsing, opening, and range r
 
 For authentication behavior, browser safety limits, and host-key handling, see [Embedded SSH](embedded-ssh.md). [AnyConnect VPN mode](anyconnect-vpn.md) is an optional macOS-only route configured with a validated HTTPS gateway and SSH `user@host` destination; it requires separately installed tools and an independently verified host key.
 
-## Optional BaSiC preview
+## BaSiC preview
 
-BaSiC is a reversible display preview. It does not modify a CZI, persist a fitted profile, or export a corrected CZI or TIFF. Set `CZI_BASIC_HELPER` to an absolute helper path before launch, then select **Prepare BaSiC Preview** in **Display**. The profiles remain in memory and the toggle remains off until every sparse channel has a valid profile.
+BaSiC is a reversible display preview. It does not modify a CZI, persist a fitted profile, or export a corrected CZI or TIFF. Opening a CZI automatically fits every sparse channel from every supported native acquisition position with the bundled BaSiCPy helper. The toggle remains off until the complete profile set is ready.
 
-The preview reloads only the bounded visible viewport and preserves the display range and field of view. Corrected PNGs state that the result is not quantitatively validated. See [BaSiC preview and helper protocol](basic-preview.md) for setup, limits, and the protocol.
+The collapsed **Advanced** section can select a custom protocol-compatible helper for testing or specialized deployments. Normal viewing requires no Python installation or helper selection.
+
+The preview reloads only the bounded visible viewport and preserves the display range and field of view. Corrected PNGs state that the result is not quantitatively validated. See [BaSiC preview and helper protocol](basic-preview.md) for limits, packaging, and the protocol.
 
 ## Make safe demo data
 

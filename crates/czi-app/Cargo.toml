@@ -14,7 +14,7 @@ rust-version.workspace = true
 product-name = "CZI Viewer"
 bundle-identifier = "io.github.joshwhiteley.czi-viewer"
 target = "aarch64-apple-darwin"
-minimum-system-version = "11.0"
+minimum-system-version = "12.3"
 signing = "ad-hoc"
 
 [dependencies]

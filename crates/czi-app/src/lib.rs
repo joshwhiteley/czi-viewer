@@ -4296,9 +4296,8 @@ impl ViewerApp {
         }
         let helper = basic::helper_from_env()
             .or_else(|| self.chosen_helper_path.clone())
-            .ok_or_else(|| {
-                String::from("Choose a BaSiC helper, or set CZI_BASIC_HELPER to an absolute path.")
-            });
+            .or_else(basic::bundled_helper_path)
+            .ok_or_else(|| String::from("The bundled BaSiC helper is unavailable."));
         let helper = match helper {
             Ok(helper) => helper,
             Err(error) => {
@@ -4730,43 +4729,48 @@ impl ViewerApp {
     fn show_basic_preview(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.heading("BaSiC preview");
-        ui.weak("Reversible display preview only. The CZI is never modified.");
-        ui.horizontal(|ui| {
-            let choose = ui
-                .add_enabled(
-                    !self.native_choosers.helper_pending(),
-                    egui::Button::new("Choose helper…"),
-                )
-                .clicked();
-            if choose && let Err(error) = self.native_choosers.choose_helper() {
-                self.helper_settings_error = Some(error);
+        ui.weak(
+            "Automatically fitted from the full supported CZI acquisition. Reversible display preview only; the CZI is never modified.",
+        );
+        ui.collapsing("Advanced", |ui| {
+            ui.weak("Override the bundled BaSiCPy helper for testing or custom deployments.");
+            ui.horizontal(|ui| {
+                let choose = ui
+                    .add_enabled(
+                        !self.native_choosers.helper_pending(),
+                        egui::Button::new("Choose custom helper…"),
+                    )
+                    .clicked();
+                if choose && let Err(error) = self.native_choosers.choose_helper() {
+                    self.helper_settings_error = Some(error);
+                }
+                if ui
+                    .add_enabled(
+                        self.chosen_helper_path.is_some(),
+                        egui::Button::new("Use bundled helper"),
+                    )
+                    .clicked()
+                {
+                    self.clear_chosen_helper();
+                }
+                if self.native_choosers.helper_pending() {
+                    ui.spinner();
+                }
+            });
+            if let Some(environment) = basic::helper_from_env() {
+                ui.weak(format!(
+                    "Helper: {} (CZI_BASIC_HELPER override)",
+                    environment.display()
+                ));
+            } else if let Some(chosen) = &self.chosen_helper_path {
+                ui.weak(format!("Custom helper: {}", chosen.display()));
+            } else {
+                ui.weak("Using the bundled BaSiCPy helper.");
             }
-            if ui
-                .add_enabled(
-                    self.chosen_helper_path.is_some(),
-                    egui::Button::new("Clear"),
-                )
-                .clicked()
-            {
-                self.clear_chosen_helper();
-            }
-            if self.native_choosers.helper_pending() {
-                ui.spinner();
+            if let Some(error) = &self.helper_settings_error {
+                ui.colored_label(egui::Color32::LIGHT_RED, error);
             }
         });
-        if let Some(environment) = basic::helper_from_env() {
-            ui.weak(format!(
-                "Helper: {} (CZI_BASIC_HELPER override)",
-                environment.display()
-            ));
-        } else if let Some(chosen) = &self.chosen_helper_path {
-            ui.weak(format!("Helper: {}", chosen.display()));
-        } else {
-            ui.weak("No helper chosen.");
-        }
-        if let Some(error) = &self.helper_settings_error {
-            ui.colored_label(egui::Color32::LIGHT_RED, error);
-        }
         let ready = self.basic_preview.ready_for(self.dataset.as_ref());
         let mut prepare = false;
         let mut cancel = false;
@@ -4774,11 +4778,7 @@ impl ViewerApp {
             if self.basic_preview.is_busy() {
                 cancel = ui.button("Cancel").clicked();
             } else {
-                let label = if ready {
-                    "Refit"
-                } else {
-                    "Prepare BaSiC Preview"
-                };
+                let label = if ready { "Refit" } else { "Retry fit" };
                 prepare = ui
                     .add_enabled(self.dataset.is_some(), egui::Button::new(label))
                     .clicked();
@@ -4803,7 +4803,7 @@ impl ViewerApp {
         }
         match self.basic_preview.phase {
             BasicPhase::Idle => {
-                ui.weak("Not prepared.");
+                ui.weak("Open a CZI to fit its profile automatically.");
             }
             BasicPhase::Sampling => {
                 ui.horizontal(|ui| {
@@ -5365,6 +5365,7 @@ impl ViewerApp {
         self.fit_pending = true;
         self.basic_preview.reset();
         self.invalidate_view();
+        self.prepare_basic_preview();
     }
 
     fn handle_remote_paths(

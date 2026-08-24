@@ -372,6 +372,18 @@ pub(crate) fn helper_from_env() -> Option<PathBuf> {
     std::env::var_os("CZI_BASIC_HELPER").map(PathBuf::from)
 }
 
+pub(crate) fn bundled_helper_path() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let contents = executable.parent()?.parent()?;
+    Some(
+        contents
+            .join("Resources")
+            .join("BaSiC")
+            .join("czi-basic-viewer-helper")
+            .join("czi-basic-viewer-helper"),
+    )
+}
+
 pub(crate) fn run_helper(
     helper: &Path,
     request: &TempRequest,
@@ -1508,9 +1520,9 @@ mod tests {
         if std::env::var_os("CZI_RUN_FIXTURES").is_none() {
             return;
         }
-        let path = std::env::var_os("CZI_HADA_FIXTURE").map_or_else(
-            || PathBuf::from("/Users/josh/Downloads/czi-tests/tf_HADA_BOD_d1_bridge_060225-02.czi"),
-            PathBuf::from,
+        let path = PathBuf::from(
+            std::env::var_os("CZI_HADA_FIXTURE")
+                .expect("CZI_HADA_FIXTURE must name the private HADA fixture"),
         );
         assert!(path.is_file(), "missing HADA fixture: {}", path.display());
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));

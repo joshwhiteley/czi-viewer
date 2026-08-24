@@ -431,7 +431,6 @@ fn index_local_fixtures_without_pixel_allocation() {
     let fixtures = [
         (
             "CZI_HADA_FIXTURE",
-            "/Users/josh/Downloads/czi-tests/tf_HADA_BOD_d1_bridge_060225-02.czi",
             12_731_678_336_u64,
             2_700_usize,
             12_usize,
@@ -439,24 +438,19 @@ fn index_local_fixtures_without_pixel_allocation() {
         ),
         (
             "CZI_PLATE_FIXTURE",
-            "/Users/josh/Downloads/ts_04042026_Bb_plate1_rep1_ML-01 (1).czi",
             32_498_112_u64,
             3_usize,
             1_usize,
             3_usize,
         ),
     ];
-    for (
-        environment,
-        default_path,
-        expected_length,
-        expected_tiles,
-        expected_scenes,
-        expected_channels,
-    ) in fixtures
+    for (environment, expected_length, expected_tiles, expected_scenes, expected_channels) in
+        fixtures
     {
-        let path = std::env::var_os(environment)
-            .map_or_else(|| PathBuf::from(default_path), PathBuf::from);
+        let Some(path) = std::env::var_os(environment).map(PathBuf::from) else {
+            eprintln!("skipping fixture because {environment} is not set");
+            continue;
+        };
         if !path.exists() {
             eprintln!("skipping missing fixture {}", path.display());
             continue;
@@ -497,10 +491,10 @@ fn decodes_one_tile_from_local_plate_fixture() {
     if std::env::var_os("CZI_RUN_FIXTURES").is_none() {
         return;
     }
-    let path = std::env::var_os("CZI_PLATE_FIXTURE").map_or_else(
-        || PathBuf::from("/Users/josh/Downloads/ts_04042026_Bb_plate1_rep1_ML-01 (1).czi"),
-        PathBuf::from,
-    );
+    let Some(path) = std::env::var_os("CZI_PLATE_FIXTURE").map(PathBuf::from) else {
+        eprintln!("skipping fixture because CZI_PLATE_FIXTURE is not set");
+        return;
+    };
     if !path.exists() {
         eprintln!("skipping missing fixture {}", path.display());
         return;
@@ -523,10 +517,10 @@ fn opening_hada_uses_bounded_source_reads() {
     if std::env::var_os("CZI_RUN_FIXTURES").is_none() {
         return;
     }
-    let path = std::env::var_os("CZI_HADA_FIXTURE").map_or_else(
-        || PathBuf::from("/Users/josh/Downloads/czi-tests/tf_HADA_BOD_d1_bridge_060225-02.czi"),
-        PathBuf::from,
-    );
+    let Some(path) = std::env::var_os("CZI_HADA_FIXTURE").map(PathBuf::from) else {
+        eprintln!("skipping fixture because CZI_HADA_FIXTURE is not set");
+        return;
+    };
     if !path.exists() {
         eprintln!("skipping missing fixture {}", path.display());
         return;

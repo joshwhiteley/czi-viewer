@@ -1,0 +1,8 @@
+basicpy==2.0.0
+numpy==1.26.4
+scipy==1.12.0
+scikit-image==0.26.0
+torch==2.2.2
+pyinstaller==6.18.0
+pip-licenses==5.0.0
+cyclonedx-bom==7.3.1

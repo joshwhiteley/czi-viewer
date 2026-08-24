@@ -85,9 +85,9 @@ impl RandomAccessSource for CountingSource {
 }
 
 fn hada_path() -> PathBuf {
-    std::env::var_os("CZI_HADA_FIXTURE").map_or_else(
-        || PathBuf::from("/Users/josh/Downloads/czi-tests/tf_HADA_BOD_d1_bridge_060225-02.czi"),
-        PathBuf::from,
+    PathBuf::from(
+        std::env::var_os("CZI_HADA_FIXTURE")
+            .expect("CZI_HADA_FIXTURE must name the private HADA fixture"),
     )
 }
 

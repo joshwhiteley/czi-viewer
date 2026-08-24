@@ -1,10 +1,10 @@
 # macOS preview distribution
 
-The repository builds one distributable product: **CZI Viewer** for Apple Silicon (`aarch64-apple-darwin`). The application bundle identifier is `io.github.joshwhiteley.czi-viewer`. The minimum supported macOS version is 11.0.
+The repository builds one distributable product: **CZI Viewer** for Apple Silicon (`aarch64-apple-darwin`). The application bundle identifier is `io.github.joshwhiteley.czi-viewer`. The minimum supported macOS version is 12.3 because of the bundled scientific Python wheels.
 
 ## Build a preview
 
-Run this on an Apple Silicon Mac with Xcode command-line tools, Rust 1.88.0, `cargo-about` 0.8.2, `cargo-cyclonedx` 0.5.9, and `jq` installed:
+Run this on an Apple Silicon Mac with Xcode command-line tools, Rust 1.88.0, uv 0.11.13, `cargo-about` 0.8.2, `cargo-cyclonedx` 0.5.9, and `jq` installed:
 
 ```sh
 cargo install cargo-about --version 0.8.2 --locked
@@ -13,7 +13,7 @@ scripts/package-macos.sh
 scripts/verify-macos-release.sh
 ```
 
-The package script builds `czi-viewer` with `cargo build --locked --release --target aarch64-apple-darwin`, sets `MACOSX_DEPLOYMENT_TARGET=11.0`, and creates an ad-hoc signed `CZI Viewer.app`. It includes the executable, project licenses, third-party notices, SBOM, and a temporary repository-owned neutral icon. It does not include Python, BaSiCPy, OpenConnect, ocproxy, or SSH.
+The package script builds `czi-viewer` with `cargo build --locked --release --target aarch64-apple-darwin`, sets `MACOSX_DEPLOYMENT_TARGET=12.3`, freezes the hash-locked BaSiCPy helper, and creates an ad-hoc signed `CZI Viewer.app`. It includes the Rust executable, Python 3.11/BaSiCPy helper, project licenses, Rust and Python notices/SBOMs, and a temporary repository-owned neutral icon. It does not include OpenConnect, ocproxy, or SSH.
 
 Outputs are ignored under `dist/`:
 
@@ -22,11 +22,13 @@ Outputs are ignored under `dist/`:
 - `CZI-Viewer-<version>-aarch64-apple-darwin-preview.zip`
 - `CZI-Viewer-<version>-aarch64-apple-darwin-preview-sbom.cdx.json`
 - `CZI-Viewer-<version>-aarch64-apple-darwin-preview-THIRD-PARTY-NOTICES.html`
+- `CZI-Viewer-<version>-aarch64-apple-darwin-preview-basic-helper-sbom.cdx.json`
+- `CZI-Viewer-<version>-aarch64-apple-darwin-preview-BASIC-THIRD-PARTY-NOTICES.html`
 - `SHA256SUMS`
 
-The DMG presents `CZI Viewer.app` next to an Applications shortcut for normal drag-to-Applications installation. The ZIP remains the reproducible archive and the standalone `.app` is available for local testing.
+The DMG presents `CZI Viewer.app` next to an Applications shortcut for normal drag-to-Applications installation. The standalone `.app` is available for local testing. The frozen Python environment makes release archives substantially larger than the earlier Rust-only preview.
 
-`verify-macos-release.sh` validates both the DMG and ZIP, the plist, exact `arm64` architecture, 11.0 binary deployment target, system-only dynamic libraries, strict ad-hoc code signature, exact bundle contents, archive extraction, and every listed SHA-256 checksum. It also confirms that the embedded SBOM and notices match their checksummed standalone files.
+`verify-macos-release.sh` validates both the DMG and ZIP, the plist, exact `arm64` architecture, the 12.3 deployment ceiling for bundled Mach-O files, strict ad-hoc code signatures, helper symlink confinement, bundle contents, archive extraction, and every listed SHA-256 checksum. It also confirms that both embedded SBOMs and notice sets match their checksummed standalone files.
 
 Before extracting a downloaded preview, validate its release files:
 

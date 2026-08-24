@@ -31,7 +31,7 @@ The generated CZI is deterministic, synthetic, and ignored. `crates/czi-core/tes
 
 ## Project boundaries
 
-The distributed app must remain pure Rust: it does not ship C or C++ code, and source CZI files are never modified in place. Read the [dependency policy](dependency-policy.md) before adding a dependency or external integration.
+The viewer, CZI parser, renderer, and SSH transport remain Rust. The release also contains the isolated, reviewed BaSiCPy scientific helper described in the [dependency policy](dependency-policy.md). Source CZI files are never modified in place. Read the policy before adding a dependency or external integration.
 
 CZI behavior is implemented from public references, observed fixtures, and interoperability checks. Follow the [provenance rules](provenance.md): do not copy GPL/LGPL implementation code, specifications, tests, or non-redistributable fixtures.
 

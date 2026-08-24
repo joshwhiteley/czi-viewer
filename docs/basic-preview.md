@@ -2,15 +2,19 @@
 
 The BaSiC feature is a reversible display preview. It never modifies the CZI, writes to an SSH source, exports a corrected CZI/TIFF, or stores a fitted profile after the viewer session.
 
-## Configure the helper
+## Automatic fitting and helper selection
 
-Install a compatible helper separately, then click **Choose helper…** in the BaSiC preview panel. The viewer validates and stores only its canonical absolute executable path in a private, bounded settings file under macOS Application Support. **Clear** removes that choice. You can instead provide an environment override:
+The packaged app includes a frozen BaSiCPy helper and starts profile preparation automatically after each CZI opens. It fits every sparse channel from every supported acquisition position in that CZI. The profile remains session-only and the display toggle stays off until every channel is ready.
+
+The **Advanced** section can select a compatible custom helper. The viewer validates and stores only its canonical absolute executable path in a private, bounded settings file under macOS Application Support. **Use bundled helper** removes that override. Developers can instead provide an environment override:
 
 ```sh
 CZI_BASIC_HELPER=/absolute/path/to/basic-helper cargo run --release -p czi-viewer
 ```
 
-The viewer uses `std::process::Command` directly. It does not use a shell. The child receives the fixed `--request-dir` flag and one value: an app-owned absolute temporary request directory. Its environment is cleared. The child receives no CZI path, SSH profile, credential, remote path, SFTP session, or source handle. The directory is removed after success, failure, or cooperative cancellation.
+The viewer uses `std::process::Command` directly. It does not use a shell. The bundled or custom child receives the fixed `--request-dir` flag and one value: an app-owned absolute temporary request directory. Its environment is cleared. The child receives no CZI path, SSH profile, credential, remote path, SFTP session, or source handle. The directory is removed after success, failure, or cooperative cancellation.
+
+Release builds freeze Python 3.11, BaSiCPy 2.0.0, PyTorch 2.2.2, NumPy 1.26.4, SciPy 1.12.0, and scikit-image 0.26.0 from a hash-locked Apple Silicon wheel set. The helper is ad-hoc signed with the app. Separate Python notices and a CycloneDX SBOM are included in each release.
 
 ## Protocol v1
 
@@ -77,7 +81,7 @@ Local and Shared SFTP sources use the same read-only dataset worker. Local sampl
 
 The UI reports positions per channel, total tile reads, native/pyramid representation counts, estimated decoded bytes, and whether sampling is waiting for viewport work. Sample files are app-owned temporary data, source access remains read-only, and fitted profiles remain session-only.
 
-Detector/pyramid mapping verification is deferred until **Prepare BaSiC Preview**, so opening a dataset has no unconditional BaSiC planning cost. Planning polls the same cancellation token between planes and scales. A single in-memory geometry query or sort is not preemptible and can briefly delay queued viewport work before tile sampling begins. Source and fit generations reject late progress and results after cancel, refit, or source replacement.
+Detector/pyramid mapping verification begins automatically after the dataset opens. Planning polls the same cancellation token between planes and scales. A single in-memory geometry query or sort is not preemptible and can briefly delay queued viewport work before tile sampling begins. Viewport requests preempt sampling between bounded steps. Source and fit generations reject late progress and results after cancel, refit, or source replacement.
 
 ## Preview correction
 
