@@ -37,6 +37,18 @@ gh attestation verify CZI-Viewer-<version>-aarch64-apple-darwin-preview.dmg --re
 
 The attestation command applies to artifacts produced on GitHub.com. Run it from the directory containing the downloaded release files.
 
+## Publish a preview
+
+Update the version in `crates/czi-app/Cargo.toml` and `Cargo.lock`, commit the change to `main`, then run:
+
+```sh
+scripts/release-preview.sh --publish
+```
+
+The script requires a clean `main` branch. It builds and verifies the app locally, pushes `main`, and pushes an annotated `preview-v<version>` tag. The tag triggers `.github/workflows/preview.yml`, which rebuilds the artifacts on GitHub's Apple Silicon runner and creates the prerelease. A version can be published only once; increment it before the next release.
+
+To build the same release locally without pushing or tagging, omit `--publish`.
+
 ## Preview security posture
 
 These are ad-hoc signed preview builds. They are not Developer ID signed and are not notarized. Gatekeeper will warn or block the first launch. Users who trust the source can Control-click the app in Finder and select **Open**, or select **Open Anyway** in **System Settings → Privacy & Security**.
