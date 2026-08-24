@@ -36,6 +36,7 @@ jobs:
         with:
           subject-path: |
             dist/*.zip
+            dist/*.dmg
             dist/*.cdx.json
             dist/*NOTICES.html
             dist/SHA256SUMS

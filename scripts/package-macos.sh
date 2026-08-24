@@ -13,6 +13,8 @@ work_dir=$(mktemp -d "${TMPDIR:-/tmp}/czi-viewer-package.XXXXXX")
 app="$work_dir/${product}.app"
 resources="$app/Contents/Resources"
 zip_path="$dist_dir/${artifact_stem}.zip"
+dmg_path="$dist_dir/${artifact_stem}.dmg"
+standalone_app="$dist_dir/${product}.app"
 sbom_path="$dist_dir/${artifact_stem}-sbom.cdx.json"
 notices_path="$dist_dir/${artifact_stem}-THIRD-PARTY-NOTICES.html"
 source_date_epoch=${SOURCE_DATE_EPOCH:-$(git -C "$repo_root" log -1 --format=%ct)}
@@ -34,7 +36,7 @@ fi
 export SOURCE_DATE_EPOCH="$source_date_epoch"
 bundle_timestamp=$(TZ=UTC date -r "$source_date_epoch" '+%Y%m%d%H%M.%S')
 
-for tool in cargo date iconutil codesign ditto plutil shasum zip jq; do
+for tool in cargo date iconutil codesign ditto hdiutil plutil shasum zip jq; do
   command -v "$tool" >/dev/null || {
     printf 'Required tool not found: %s\n' "$tool" >&2
     exit 1
@@ -76,16 +78,33 @@ codesign --force --deep --sign - --timestamp=none "$app"
 # Normalize every bundle entry after signing so the archive has stable timestamps.
 find "$app" -exec touch -t "$bundle_timestamp" {} +
 
-rm -f -- "$zip_path" "$dist_dir/SHA256SUMS"
+rm -rf -- "$standalone_app"
+ditto "$app" "$standalone_app"
+
+rm -f -- "$zip_path" "$dmg_path" "$dist_dir/SHA256SUMS"
 (
   cd -- "$work_dir"
   find "${product}.app" -print | LC_ALL=C sort | zip -X -q "$zip_path" -@
 )
+
+dmg_staging="$work_dir/dmg"
+mkdir -p -- "$dmg_staging"
+ditto "$app" "$dmg_staging/${product}.app"
+ln -s /Applications "$dmg_staging/Applications"
+hdiutil create -quiet -ov -volname "$product" -srcfolder "$dmg_staging" -format UDZO "$dmg_path"
+
 (
   cd -- "$dist_dir"
-  shasum -a 256 "$(basename -- "$zip_path")" "$(basename -- "$sbom_path")" "$(basename -- "$notices_path")" > SHA256SUMS
+  shasum -a 256 \
+    "$(basename -- "$zip_path")" \
+    "$(basename -- "$dmg_path")" \
+    "$(basename -- "$sbom_path")" \
+    "$(basename -- "$notices_path")" > SHA256SUMS
 )
 
 "$repo_root/scripts/verify-macos-release.sh" "$zip_path"
+"$repo_root/scripts/verify-macos-release.sh" "$dmg_path"
 printf 'Wrote %s\n' "$zip_path"
+printf 'Wrote %s\n' "$dmg_path"
+printf 'Wrote %s\n' "$standalone_app"
 printf 'Wrote %s\n' "$dist_dir/SHA256SUMS"

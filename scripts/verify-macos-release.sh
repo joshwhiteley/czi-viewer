@@ -7,7 +7,12 @@ product='CZI Viewer'
 target='aarch64-apple-darwin'
 minimum_macos='11.0'
 version=$(awk -F '"' '/^version = / { print $2; exit }' "$repo_root/crates/czi-app/Cargo.toml")
-archive=${1:-"$repo_root/dist/CZI-Viewer-${version}-${target}-preview.zip"}
+if (( $# == 0 )); then
+  "$0" "$repo_root/dist/CZI-Viewer-${version}-${target}-preview.zip"
+  "$0" "$repo_root/dist/CZI-Viewer-${version}-${target}-preview.dmg"
+  exit 0
+fi
+archive=$1
 dist_dir=$(CDPATH= cd -- "$(dirname -- "$archive")" && pwd)
 archive="$dist_dir/$(basename -- "$archive")"
 archive_name=$(basename -- "$archive")
@@ -15,9 +20,14 @@ artifact_stem="CZI-Viewer-${version}-${target}-preview"
 sbom_name="${artifact_stem}-sbom.cdx.json"
 notices_name="${artifact_stem}-THIRD-PARTY-NOTICES.html"
 extract_dir=$(mktemp -d "${TMPDIR:-/tmp}/czi-viewer-verify.XXXXXX")
+mount_dir=$(mktemp -d "${TMPDIR:-/tmp}/czi-viewer-mount.XXXXXX")
+mounted=0
 
 cleanup() {
-  rm -rf -- "$extract_dir"
+  if (( mounted )); then
+    hdiutil detach "$mount_dir" -quiet || true
+  fi
+  rm -rf -- "$extract_dir" "$mount_dir"
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -31,11 +41,13 @@ fail() {
 [[ -f "$dist_dir/$sbom_name" ]] || fail "SBOM does not exist in $dist_dir"
 [[ -f "$dist_dir/$notices_name" ]] || fail "notices do not exist in $dist_dir"
 [[ -f "$dist_dir/SHA256SUMS" ]] || fail "SHA256SUMS does not exist in $dist_dir"
-for tool in codesign ditto lipo otool plutil shasum cmp grep jq; do
+for tool in codesign diff ditto hdiutil lipo otool plutil readlink shasum cmp grep jq; do
   command -v "$tool" >/dev/null || fail "required tool not found: $tool"
 done
 
-expected_manifest=$(printf '%s\n%s\n%s' "$archive_name" "$sbom_name" "$notices_name")
+zip_name="${artifact_stem}.zip"
+dmg_name="${artifact_stem}.dmg"
+expected_manifest=$(printf '%s\n%s\n%s\n%s' "$zip_name" "$dmg_name" "$sbom_name" "$notices_name")
 actual_manifest=$(awk 'NF != 2 { exit 1 } { print $2 }' "$dist_dir/SHA256SUMS") || fail 'SHA256SUMS has an invalid line'
 [[ $actual_manifest == "$expected_manifest" ]] || fail 'SHA256SUMS does not exactly cover this preview archive, SBOM, and notices'
 (
@@ -51,7 +63,24 @@ fi
 if jq -e '.. | strings | select(test("/Users/|file:///|download_url=file:"))' "$dist_dir/$sbom_name" >/dev/null; then
   fail 'SBOM contains an absolute builder path or local download URL'
 fi
-ditto -x -k "$archive" "$extract_dir"
+case "$archive" in
+  *.zip)
+    ditto -x -k "$archive" "$extract_dir"
+    ;;
+  *.dmg)
+    hdiutil attach -quiet -readonly -nobrowse -noautoopen -mountpoint "$mount_dir" "$archive"
+    mounted=1
+    [[ -L "$mount_dir/Applications" ]] || fail 'DMG is missing its Applications shortcut'
+    [[ $(readlink "$mount_dir/Applications") == /Applications ]] || fail 'DMG Applications shortcut has the wrong target'
+    [[ -d "$mount_dir/${product}.app" ]] || fail 'DMG is missing the application bundle'
+    ditto "$mount_dir/${product}.app" "$extract_dir/${product}.app"
+    hdiutil detach "$mount_dir" -quiet
+    mounted=0
+    ;;
+  *)
+    fail "unsupported archive type: $archive_name"
+    ;;
+esac
 app="$extract_dir/${product}.app"
 binary="$app/Contents/MacOS/czi-viewer"
 plist="$app/Contents/Info.plist"
@@ -114,5 +143,9 @@ expected_files=$(printf '%s\n' \
   'Resources/THIRD-PARTY-NOTICES.html')
 actual_files=$(find "$app/Contents" -type f -print | sed "s#^$app/Contents/##" | sort)
 [[ $actual_files == "$expected_files" ]] || fail 'application contains an unexpected or missing file'
+
+standalone_app="$dist_dir/${product}.app"
+[[ -d "$standalone_app" ]] || fail "standalone application bundle does not exist in $dist_dir"
+diff -qr "$app" "$standalone_app" >/dev/null || fail 'standalone application bundle differs from the archived app'
 
 printf 'Verified %s\n' "$archive"

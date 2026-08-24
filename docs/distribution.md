@@ -17,18 +17,22 @@ The package script builds `czi-viewer` with `cargo build --locked --release --ta
 
 Outputs are ignored under `dist/`:
 
+- `CZI Viewer.app`
+- `CZI-Viewer-<version>-aarch64-apple-darwin-preview.dmg`
 - `CZI-Viewer-<version>-aarch64-apple-darwin-preview.zip`
 - `CZI-Viewer-<version>-aarch64-apple-darwin-preview-sbom.cdx.json`
 - `CZI-Viewer-<version>-aarch64-apple-darwin-preview-THIRD-PARTY-NOTICES.html`
 - `SHA256SUMS`
 
-`verify-macos-release.sh` validates the plist, exact `arm64` architecture, 11.0 binary deployment target, system-only dynamic libraries, strict ad-hoc code signature, exact bundle contents, ZIP extraction, and every listed SHA-256 checksum. It also confirms that the embedded SBOM and notices match their checksummed standalone files.
+The DMG presents `CZI Viewer.app` next to an Applications shortcut for normal drag-to-Applications installation. The ZIP remains the reproducible archive and the standalone `.app` is available for local testing.
+
+`verify-macos-release.sh` validates both the DMG and ZIP, the plist, exact `arm64` architecture, 11.0 binary deployment target, system-only dynamic libraries, strict ad-hoc code signature, exact bundle contents, archive extraction, and every listed SHA-256 checksum. It also confirms that the embedded SBOM and notices match their checksummed standalone files.
 
 Before extracting a downloaded preview, validate its release files:
 
 ```sh
 shasum -a 256 -c SHA256SUMS
-gh attestation verify CZI-Viewer-<version>-aarch64-apple-darwin-preview.zip --repo joshwhiteley/czi-viewer
+gh attestation verify CZI-Viewer-<version>-aarch64-apple-darwin-preview.dmg --repo joshwhiteley/czi-viewer
 ```
 
 The attestation command applies to artifacts produced on GitHub.com. Run it from the directory containing the downloaded release files.
@@ -41,4 +45,4 @@ Do not describe this preview as notarized or generally trusted by Gatekeeper.
 
 ## CI releases
 
-`.github/workflows/preview.yml` runs manually and for `preview-*` tags. It uploads the ZIP, checksums, SBOM, and notices as an artifact, and requests GitHub artifact attestations on GitHub.com. Only a `push` of a preview tag creates a prerelease; manual runs never write repository contents.
+`.github/workflows/preview.yml` runs manually and for `preview-*` tags. It uploads the DMG, ZIP, standalone app, checksums, SBOM, and notices as an artifact, and requests GitHub artifact attestations for file artifacts on GitHub.com. Only a `push` of a preview tag creates a prerelease; manual runs never write repository contents.
