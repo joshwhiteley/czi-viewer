@@ -42,7 +42,7 @@ Open large CZI mosaics, inspect channels and metadata, and save an annotated vie
 - [User guide](docs/user-guide.md) — opening, viewing, remote access, export, and the synthetic demo file.
 - [Format support](docs/format-support.md) — supported CZI subset and metadata behavior.
 - [Development](docs/development.md) and [architecture](docs/architecture.md) — build, tests, safety boundaries, and design.
-- [Embedded SSH](docs/embedded-ssh.md), [BaSiC preview](docs/basic-preview.md), and [Tufts VPN](docs/tufts-vpn.md) — optional connection and preview details.
+- [Embedded SSH](docs/embedded-ssh.md), [BaSiC preview](docs/basic-preview.md), and [AnyConnect VPN](docs/anyconnect-vpn.md) — optional connection and preview details.
 - [Distribution](docs/distribution.md), [dependency policy](docs/dependency-policy.md), and [implementation provenance](docs/provenance.md).
 
 Maintainers can build and publish the current version with `scripts/release-preview.sh --publish`; see [distribution](docs/distribution.md) for the release checks.

@@ -13,7 +13,7 @@ Use the in-app browser to open a remote CZI through an existing OpenSSH profile.
 
 The viewer opens one read-only SFTP session after authentication. Browsing, opening, and reading the selected CZI use that session. They do not prompt again. Change the profile or select **Reconnect** when you need a new session.
 
-For the optional viewer-managed connection to `login-prod.pax.tufts.edu`, see [Tufts VPN mode](tufts-vpn.md). It takes separate VPN username and SSH profile values, establishes one local ocproxy endpoint, then reuses the same embedded SSH and persistent SFTP transport described here.
+For an optional viewer-managed connection through a Cisco AnyConnect-compatible VPN, see [AnyConnect VPN mode](anyconnect-vpn.md). It takes a VPN username, HTTPS gateway, and exact SSH `user@host` route, establishes one local ocproxy endpoint, then reuses the same embedded SSH and persistent SFTP transport described here.
 
 ## Authentication console
 
@@ -32,4 +32,4 @@ The browser resolves Home through SFTP, reads one directory at a time, scans at 
 
 If embedded SSH cannot authenticate, correct the profile or SSH configuration and select **Reconnect**. The app does not provide a Terminal fallback workflow.
 
-The embedded transport honors its validated connection configuration. Direct SSH keeps the normal interactive argument vector and `StrictHostKeyChecking=ask` behavior unchanged. Tufts VPN mode adds command-line overrides for `HostName=127.0.0.1`, the private local port, `HostKeyAlias=login-prod.pax.tufts.edu`, `ProxyCommand=none`, `ProxyJump=none`, and `StrictHostKeyChecking=yes` before the destination. It requires an existing verified host key and never offers a first-use trust prompt. This preserves known-host verification for the real server while preventing a configured proxy from bypassing the local endpoint.
+The embedded transport honors its validated connection configuration. Direct SSH keeps the normal interactive argument vector and `StrictHostKeyChecking=ask` behavior unchanged. AnyConnect VPN mode adds command-line overrides for `HostName=127.0.0.1`, the private local port, `HostKeyAlias=<ssh-host>`, `ProxyCommand=none`, `ProxyJump=none`, and `StrictHostKeyChecking=yes` before the destination. It requires an existing verified host key and never offers a first-use trust prompt. This preserves known-host verification for the real server while preventing a configured proxy from bypassing the local endpoint.

@@ -35,4 +35,4 @@ The distributed app must remain pure Rust: it does not ship C or C++ code, and s
 
 CZI behavior is implemented from public references, observed fixtures, and interoperability checks. Follow the [provenance rules](provenance.md): do not copy GPL/LGPL implementation code, specifications, tests, or non-redistributable fixtures.
 
-For component boundaries and bounded I/O behavior, see [architecture](architecture.md). Optional feature details belong in their focused documents: [embedded SSH](embedded-ssh.md), [BaSiC preview](basic-preview.md), and [Tufts VPN](tufts-vpn.md).
+For component boundaries and bounded I/O behavior, see [architecture](architecture.md). Optional feature details belong in their focused documents: [embedded SSH](embedded-ssh.md), [BaSiC preview](basic-preview.md), and [AnyConnect VPN](anyconnect-vpn.md).

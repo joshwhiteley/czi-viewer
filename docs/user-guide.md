@@ -36,7 +36,7 @@ Choose **SSH**, keep **Direct SSH**, enter an existing OpenSSH profile or host a
 
 One authenticated, read-only SFTP session handles browsing, opening, and range reads. The viewer does not mount a filesystem or download the full CZI. Change the profile or select **Reconnect** to create a session. The browser stays available while a file is open; use **Hide remote browser** for more canvas room.
 
-For authentication behavior, browser safety limits, and host-key handling, see [Embedded SSH](embedded-ssh.md). [Tufts VPN mode](tufts-vpn.md) is an optional macOS-only route for its fixed reviewed target; it requires separately installed tools and an independently verified host key.
+For authentication behavior, browser safety limits, and host-key handling, see [Embedded SSH](embedded-ssh.md). [AnyConnect VPN mode](anyconnect-vpn.md) is an optional macOS-only route configured with a validated HTTPS gateway and SSH `user@host` destination; it requires separately installed tools and an independently verified host key.
 
 ## Optional BaSiC preview
 

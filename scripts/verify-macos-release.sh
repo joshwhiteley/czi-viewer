@@ -140,8 +140,8 @@ expected_files=$(printf '%s\n' \
   'Resources/CZIViewer.icns' \
   'Resources/LICENSE-APACHE' \
   'Resources/LICENSE-MIT' \
-  'Resources/THIRD-PARTY-NOTICES.html')
-actual_files=$(find "$app/Contents" -type f -print | sed "s#^$app/Contents/##" | sort)
+  'Resources/THIRD-PARTY-NOTICES.html' | LC_ALL=C sort)
+actual_files=$(find "$app/Contents" -type f -print | sed "s#^$app/Contents/##" | LC_ALL=C sort)
 if [[ $actual_files != "$expected_files" ]]; then
   printf 'Expected bundle files:\n%s\n' "$expected_files" >&2
   printf 'Actual bundle files:\n%s\n' "$actual_files" >&2

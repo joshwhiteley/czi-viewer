@@ -4,10 +4,10 @@
     clippy::cast_precision_loss
 )]
 
+mod anyconnect_vpn;
 mod basic;
 mod chooser;
 mod settings;
-mod tufts_vpn;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -75,19 +75,26 @@ impl SceneChoices {
 enum RemoteConnectionMode {
     #[default]
     DirectSsh,
-    TuftsVpn,
+    AnyConnectVpn,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RemoteConnectionIdentity {
-    DirectSsh { profile: String },
-    TuftsVpn { username: String, profile: String },
+    DirectSsh {
+        profile: String,
+    },
+    AnyConnectVpn {
+        username: String,
+        gateway: String,
+        profile: String,
+        target_host: String,
+    },
 }
 
 impl RemoteConnectionIdentity {
     fn profile(&self) -> &str {
         match self {
-            Self::DirectSsh { profile } | Self::TuftsVpn { profile, .. } => profile,
+            Self::DirectSsh { profile } | Self::AnyConnectVpn { profile, .. } => profile,
         }
     }
 }
@@ -792,7 +799,7 @@ enum ConsolePumpCommand {
 
 enum AuthenticationConsole {
     Ssh(SshConsole),
-    Vpn(tufts_vpn::VpnConsole),
+    Vpn(anyconnect_vpn::VpnConsole),
 }
 
 impl AuthenticationConsole {
@@ -1195,7 +1202,7 @@ struct ConnectedSftpSession {
 struct WorkerVpnSession {
     connection: RemoteConnectionIdentity,
     generation: u64,
-    process: tufts_vpn::VpnProcess,
+    process: anyconnect_vpn::VpnProcess,
 }
 
 struct EmbeddedConnectionContext<'a> {
@@ -2203,7 +2210,13 @@ fn ensure_remote_connection(
     vpn_session: &mut Option<WorkerVpnSession>,
     connection: &EmbeddedConnectionContext<'_>,
 ) -> Result<OpenSshConfig, String> {
-    let RemoteConnectionIdentity::TuftsVpn { username, .. } = requested else {
+    let RemoteConnectionIdentity::AnyConnectVpn {
+        username,
+        gateway,
+        profile,
+        target_host,
+    } = requested
+    else {
         *vpn_session = None;
         connection.vpn_cancellation.clear(connection.generation);
         return Ok(OpenSshConfig::new());
@@ -2212,13 +2225,19 @@ fn ensure_remote_connection(
         && existing.connection == *requested
         && existing.generation == connection.generation
     {
-        return vpn_open_ssh_config(existing.process.port()).map_err(sanitize_error);
+        return vpn_open_ssh_config(existing.process.port(), target_host).map_err(sanitize_error);
     }
 
     *vpn_session = None;
-    let username = tufts_vpn::VpnUsername::new(username.clone()).map_err(sanitize_error)?;
+    let username = anyconnect_vpn::VpnUsername::new(username.clone()).map_err(sanitize_error)?;
+    let gateway = anyconnect_vpn::VpnGateway::new(gateway.clone()).map_err(sanitize_error)?;
+    let route = anyconnect_vpn::SshRoute::new(profile.clone()).map_err(sanitize_error)?;
+    if route.host() != target_host {
+        return Err(String::from("AnyConnect SSH route identity changed"));
+    }
     let executor = std::env::current_exe().map_err(sanitize_error)?;
-    let (mut process, console) = tufts_vpn::start(&username, &executor).map_err(sanitize_error)?;
+    let (mut process, console) =
+        anyconnect_vpn::start(&username, &gateway, &route, &executor).map_err(sanitize_error)?;
     let cancellation = process.cancellation();
     connection
         .vpn_cancellation
@@ -2237,7 +2256,7 @@ fn ensure_remote_connection(
     {
         return Err(String::from("viewer event receiver closed"));
     }
-    if let Err(error) = process.wait_until_ready(tufts_vpn::READY_TIMEOUT) {
+    if let Err(error) = process.wait_until_ready(anyconnect_vpn::READY_TIMEOUT) {
         connection.vpn_cancellation.clear(connection.generation);
         let message = sanitize_error(error);
         let _ = connection.events.send(WorkerEvent::VpnFailed {
@@ -2255,7 +2274,7 @@ fn ensure_remote_connection(
     {
         return Err(String::from("viewer event receiver closed"));
     }
-    let config = vpn_open_ssh_config(process.port()).map_err(sanitize_error)?;
+    let config = vpn_open_ssh_config(process.port(), target_host).map_err(sanitize_error)?;
     *vpn_session = Some(WorkerVpnSession {
         connection: requested.clone(),
         generation: connection.generation,
@@ -2264,8 +2283,11 @@ fn ensure_remote_connection(
     Ok(config)
 }
 
-fn vpn_open_ssh_config(port: u16) -> Result<OpenSshConfig, czi_ssh::OpenSshConfigError> {
-    let alias = HostKeyAlias::new(tufts_vpn::TARGET_HOST)?;
+fn vpn_open_ssh_config(
+    port: u16,
+    target_host: &str,
+) -> Result<OpenSshConfig, czi_ssh::OpenSshConfigError> {
+    let alias = HostKeyAlias::new(target_host)?;
     let endpoint = LoopbackEndpoint::new(port, alias)?;
     Ok(OpenSshConfig::new().with_loopback_endpoint(endpoint))
 }
@@ -3570,19 +3592,19 @@ enum SnapshotWriteResult {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AuthenticationPhase {
-    TuftsVpn,
+    AnyConnectVpn,
     Ssh,
 }
 
 enum RemoteCancellation {
-    TuftsVpn(czi_ssh_darwin::Cancellation),
+    AnyConnectVpn(czi_ssh_darwin::Cancellation),
     Ssh(EmbeddedSshCancellation),
 }
 
 impl RemoteCancellation {
     fn cancel(&self) {
         match self {
-            Self::TuftsVpn(cancellation) => {
+            Self::AnyConnectVpn(cancellation) => {
                 let _ = cancellation.cancel();
             }
             Self::Ssh(cancellation) => {
@@ -3627,6 +3649,7 @@ pub struct ViewerApp {
     remote_connection_mode: RemoteConnectionMode,
     ssh_profile_input: String,
     vpn_username_input: String,
+    vpn_gateway_input: String,
     remote_path_input: String,
     remote_browser_path_input: String,
     remote_browse_directory: Option<String>,
@@ -3691,6 +3714,7 @@ impl ViewerApp {
             remote_connection_mode: RemoteConnectionMode::default(),
             ssh_profile_input: String::new(),
             vpn_username_input: String::new(),
+            vpn_gateway_input: String::new(),
             remote_path_input: String::new(),
             remote_browser_path_input: String::new(),
             remote_browse_directory: None,
@@ -3837,15 +3861,20 @@ impl ViewerApp {
                     profile: profile.to_owned(),
                 })
             }
-            RemoteConnectionMode::TuftsVpn => {
+            RemoteConnectionMode::AnyConnectVpn => {
                 let username = self.vpn_username_input.trim();
-                tufts_vpn::VpnUsername::new(username.to_owned())
+                anyconnect_vpn::VpnUsername::new(username.to_owned())
                     .map_err(|error| error.to_string())?;
-                let profile = self.ssh_profile_input.trim();
-                SshProfile::new(profile.to_owned()).map_err(|error| error.to_string())?;
-                Ok(RemoteConnectionIdentity::TuftsVpn {
+                let gateway =
+                    anyconnect_vpn::VpnGateway::new(self.vpn_gateway_input.trim().to_owned())
+                        .map_err(|error| error.to_string())?;
+                let route = anyconnect_vpn::SshRoute::new(self.ssh_profile_input.trim().to_owned())
+                    .map_err(|error| error.to_string())?;
+                Ok(RemoteConnectionIdentity::AnyConnectVpn {
                     username: username.to_owned(),
-                    profile: profile.to_owned(),
+                    gateway: gateway.as_str().to_owned(),
+                    profile: route.profile().to_owned(),
+                    target_host: route.host().to_owned(),
                 })
             }
         }
@@ -4957,23 +4986,23 @@ impl ViewerApp {
                 self.retired_consoles.clear();
                 self.embedded_authentication = Some(EmbeddedAuthentication {
                     connection,
-                    phase: AuthenticationPhase::TuftsVpn,
+                    phase: AuthenticationPhase::AnyConnectVpn,
                     console,
-                    cancellation: RemoteCancellation::TuftsVpn(cancellation),
+                    cancellation: RemoteCancellation::AnyConnectVpn(cancellation),
                     generation: connection_generation,
                     status: AuthenticationStatus::Connecting,
                 });
                 self.remote_browser_visibility = RemoteBrowserVisibility::Open;
                 self.profile_editing = false;
                 self.authentication_focus_request = Some(connection_generation);
-                self.status = Status::normal("Phase 1/2 · Tufts VPN authentication.");
+                self.status = Status::normal("Phase 1/2 · AnyConnect VPN authentication.");
             }
             WorkerEvent::VpnReady {
                 connection_generation,
             } if self.generations.accepts_connection(connection_generation) => {
                 if let Some(authentication) = self.embedded_authentication.as_mut()
                     && authentication.generation == connection_generation
-                    && authentication.phase == AuthenticationPhase::TuftsVpn
+                    && authentication.phase == AuthenticationPhase::AnyConnectVpn
                 {
                     authentication.console.clear_transcript();
                     authentication.status = AuthenticationStatus::Authenticated;
@@ -4987,7 +5016,7 @@ impl ViewerApp {
             } if self.generations.accepts_connection(connection_generation) => {
                 if let Some(authentication) = self.embedded_authentication.as_mut()
                     && authentication.generation == connection_generation
-                    && authentication.phase == AuthenticationPhase::TuftsVpn
+                    && authentication.phase == AuthenticationPhase::AnyConnectVpn
                 {
                     authentication.status = AuthenticationStatus::Failed;
                 }
@@ -5018,7 +5047,7 @@ impl ViewerApp {
                         self.embedded_authentication
                             .as_ref()
                             .map(|authentication| &authentication.connection),
-                        Some(RemoteConnectionIdentity::TuftsVpn { .. })
+                        Some(RemoteConnectionIdentity::AnyConnectVpn { .. })
                     ) {
                         "Phase 2/2 · SSH authentication."
                     } else {
@@ -5503,7 +5532,7 @@ impl ViewerApp {
         let connecting = authentication_status == Some(AuthenticationStatus::Connecting)
             || authentication
                 == Some((
-                    AuthenticationPhase::TuftsVpn,
+                    AuthenticationPhase::AnyConnectVpn,
                     AuthenticationStatus::Authenticated,
                 ));
         let failed = authentication_status == Some(AuthenticationStatus::Failed);
@@ -5545,8 +5574,8 @@ impl ViewerApp {
                         );
                         ui.selectable_value(
                             &mut self.remote_connection_mode,
-                            RemoteConnectionMode::TuftsVpn,
-                            "Tufts VPN",
+                            RemoteConnectionMode::AnyConnectVpn,
+                            "AnyConnect VPN",
                         );
                     });
                 });
@@ -5562,34 +5591,34 @@ impl ViewerApp {
                             );
                         });
                     }
-                    RemoteConnectionMode::TuftsVpn => {
+                    RemoteConnectionMode::AnyConnectVpn => {
                         ui.horizontal(|ui| {
-                            ui.label("VPN username");
+                            ui.label("VPN Username");
                             ui.add_enabled(
                                 !profile_locked,
                                 egui::TextEdit::singleline(&mut self.vpn_username_input)
-                                    .hint_text("Tufts VPN username")
+                                    .hint_text("<VPN Username>")
                                     .desired_width(f32::INFINITY),
                             );
                         });
                         ui.horizontal(|ui| {
-                            ui.label("SSH profile");
+                            ui.label("VPN Gateway");
                             ui.add_enabled(
                                 !profile_locked,
-                                egui::TextEdit::singleline(&mut self.ssh_profile_input)
-                                    .hint_text("jwhite22@login-prod.pax.tufts.edu")
+                                egui::TextEdit::singleline(&mut self.vpn_gateway_input)
+                                    .hint_text("https://vpn.university.edu/group")
                                     .desired_width(f32::INFINITY),
                             );
                         });
-                        ui.weak(format!("VPN gateway: {}", tufts_vpn::GATEWAY));
-                        ui.weak(format!("Fixed SSH route: {}", tufts_vpn::TARGET_HOST));
-                        ui.colored_label(
-                            egui::Color32::GOLD,
-                            "Requires a pre-verified known_hosts entry; first-use trust is disabled.",
-                        );
-                        ui.weak(
-                            "Verify the fingerprint through a trusted Tufts source before connecting. Never auto-keyscan.",
-                        );
+                        ui.horizontal(|ui| {
+                            ui.label("SSH Profile");
+                            ui.add_enabled(
+                                !profile_locked,
+                                egui::TextEdit::singleline(&mut self.ssh_profile_input)
+                                    .hint_text("<SSH route: user@login.university.edu>")
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
                     }
                 }
                 ui.horizontal(|ui| {
@@ -5620,8 +5649,16 @@ impl ViewerApp {
                     if connecting {
                         ui.spinner();
                     }
-                    ui.weak("Read-only SFTP. Authentication input stays in the terminal below.");
                 });
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "Read-only SFTP. Authentication input stays in the terminal below.",
+                        )
+                        .weak(),
+                    )
+                    .wrap(),
+                );
             });
         if self.remote_connection_mode != mode_before {
             self.begin_profile_change();
@@ -5634,7 +5671,9 @@ impl ViewerApp {
                 .show(ui, |ui| {
                     let phase = self.embedded_authentication.as_ref().map(|authentication| {
                         match authentication.phase {
-                            AuthenticationPhase::TuftsVpn => "Phase 1/2 · Tufts VPN authentication",
+                            AuthenticationPhase::AnyConnectVpn => {
+                                "Phase 1/2 · AnyConnect VPN authentication"
+                            }
                             AuthenticationPhase::Ssh => "SSH authentication",
                         }
                     });
@@ -5663,8 +5702,8 @@ impl ViewerApp {
                 RemoteConnectionMode::DirectSsh => {
                     "Enter an SSH profile, then select Connect to browse remote CZI files."
                 }
-                RemoteConnectionMode::TuftsVpn => {
-                    "Enter the VPN username and SSH profile, then select Connect."
+                RemoteConnectionMode::AnyConnectVpn => {
+                    "Enter the VPN username, gateway, and SSH profile, then select Connect."
                 }
             });
             return;
@@ -7296,7 +7335,7 @@ fn level_selector(ui: &mut egui::Ui, pixel_type: PixelType, levels: &mut Levels)
     *levels != before
 }
 
-pub use tufts_vpn::run_executor_if_requested as run_tufts_vpn_executor_if_requested;
+pub use anyconnect_vpn::run_executor_if_requested as run_anyconnect_vpn_executor_if_requested;
 
 /// Run the macOS-native local viewer.
 ///
@@ -7949,7 +7988,7 @@ mod tests {
         assert!(remote_browser_connected(None, true));
         assert!(!remote_browser_connected(
             Some((
-                AuthenticationPhase::TuftsVpn,
+                AuthenticationPhase::AnyConnectVpn,
                 AuthenticationStatus::Authenticated,
             )),
             false
@@ -8641,24 +8680,44 @@ mod tests {
 
     #[test]
     fn authenticated_remote_browse_reuses_only_the_matching_session() {
+        fn vpn_identity(username: &str, gateway: &str, profile: &str) -> RemoteConnectionIdentity {
+            let route = anyconnect_vpn::SshRoute::new(profile).unwrap();
+            RemoteConnectionIdentity::AnyConnectVpn {
+                username: username.into(),
+                gateway: anyconnect_vpn::VpnGateway::new(gateway)
+                    .unwrap()
+                    .as_str()
+                    .into(),
+                profile: route.profile().into(),
+                target_host: route.host().into(),
+            }
+        }
         let direct = RemoteConnectionIdentity::DirectSsh {
             profile: String::from("lab-czi"),
         };
         let other = RemoteConnectionIdentity::DirectSsh {
             profile: String::from("other-host"),
         };
-        let vpn = RemoteConnectionIdentity::TuftsVpn {
-            username: String::from("jdoe"),
-            profile: String::from("jwhite22@login-prod.pax.tufts.edu"),
-        };
-        let vpn_other_username = RemoteConnectionIdentity::TuftsVpn {
-            username: String::from("other-vpn-user"),
-            profile: String::from("jwhite22@login-prod.pax.tufts.edu"),
-        };
-        let vpn_other_profile = RemoteConnectionIdentity::TuftsVpn {
-            username: String::from("jdoe"),
-            profile: String::from("other-ssh-user@login-prod.pax.tufts.edu"),
-        };
+        let vpn = vpn_identity(
+            "jdoe",
+            "https://vpn.example.edu/group",
+            "researcher@login.example.edu",
+        );
+        let vpn_other_username = vpn_identity(
+            "other-vpn-user",
+            "https://vpn.example.edu/group",
+            "researcher@login.example.edu",
+        );
+        let vpn_other_profile = vpn_identity(
+            "jdoe",
+            "https://vpn.example.edu/group",
+            "other@login.example.edu",
+        );
+        let vpn_other_gateway = vpn_identity(
+            "jdoe",
+            "https://other-vpn.example.edu/group",
+            "researcher@login.example.edu",
+        );
         assert!(reuses_remote_connection(
             &direct,
             7,
@@ -8703,7 +8762,13 @@ mod tests {
             None,
             Some((&vpn_other_profile, 7)),
         ));
-        assert_eq!(vpn.profile(), "jwhite22@login-prod.pax.tufts.edu");
+        assert!(!reuses_remote_connection(
+            &vpn,
+            7,
+            None,
+            Some((&vpn_other_gateway, 7)),
+        ));
+        assert_eq!(vpn.profile(), "researcher@login.example.edu");
     }
 
     #[test]
@@ -8712,9 +8777,11 @@ mod tests {
         let direct = RemoteConnectionIdentity::DirectSsh {
             profile: String::from("lab-czi"),
         };
-        let vpn = RemoteConnectionIdentity::TuftsVpn {
+        let vpn = RemoteConnectionIdentity::AnyConnectVpn {
             username: String::from("jdoe"),
-            profile: String::from("jwhite22@login-prod.pax.tufts.edu"),
+            gateway: String::from("https://vpn.example.edu/group"),
+            profile: String::from("researcher@login.example.edu"),
+            target_host: String::from("login.example.edu"),
         };
         assert!(matches_worker_remote_session(
             RemoteSessionKey {
@@ -8753,7 +8820,7 @@ mod tests {
             },
             RemoteSessionKey {
                 connection: &vpn,
-                profile: "jwhite22@login-prod.pax.tufts.edu",
+                profile: "researcher@login.example.edu",
                 config: &config,
                 generation: 7,
             },
@@ -8831,12 +8898,13 @@ mod tests {
     }
 
     #[test]
-    fn fixed_tufts_config_uses_loopback_without_changing_ssh_identity() {
-        let config = vpn_open_ssh_config(41_337).expect("fixed Tufts SSH config");
+    fn anyconnect_config_uses_loopback_without_changing_ssh_identity() {
+        let config = vpn_open_ssh_config(41_337, "login.example.edu")
+            .expect("validated AnyConnect SSH config");
         let endpoint = config.loopback_endpoint().expect("loopback endpoint");
         assert_eq!(endpoint.port(), 41_337);
-        assert_eq!(endpoint.host_key_alias().as_str(), tufts_vpn::TARGET_HOST);
-        let ssh_profile = "jwhite22@login-prod.pax.tufts.edu";
+        assert_eq!(endpoint.host_key_alias().as_str(), "login.example.edu");
+        let ssh_profile = "researcher@login.example.edu";
         let argv = config
             .embedded_sftp_argv(&SshProfile::new(ssh_profile).unwrap())
             .into_iter()

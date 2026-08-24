@@ -8,7 +8,7 @@ CZI Viewer keeps image access sparse and bounded. It does not expose a dense ful
 - **Geometry query index** builds from tile metadata only. It selects exact sparse C/S/Z/T planes and pyramid scales, then returns viewport tile hits without reading payloads.
 - **`czi-app`** requests visible tiles, composes them for display, and keeps the prior coarser pyramid level until a requested level is complete. It warms a clamped 12% border around the viewport for the next pan.
 - **Sources** provide local random access and read-only SFTP random access. An opened remote CZI uses a 1 MiB block cache with a 256 MiB budget.
-- **`czi-ssh`** owns the embedded OpenSSH/SFTP transport. The optional macOS Tufts VPN bridge is isolated in `czi-ssh-darwin`.
+- **`czi-ssh`** owns the embedded OpenSSH/SFTP transport. The optional macOS AnyConnect VPN bridge is isolated in `czi-ssh-darwin`.
 
 ## Opening a dataset
 
@@ -28,7 +28,7 @@ Direct SSH does not launch a shell, parse prompts, automate Terminal, prefill co
 
 The optional BaSiC helper starts without a shell, with an empty environment, a fixed `--request-dir` flag, and one app-owned temporary directory. It receives downsampled pixels only; it never receives a CZI path, SSH profile, credentials, SFTP session, or remote handle. See [BaSiC preview](basic-preview.md).
 
-[Tufts VPN mode](tufts-vpn.md) has a narrow external-tool boundary. The viewer does not bundle, link, or distribute OpenConnect or ocproxy. [Dependency policy](dependency-policy.md) defines the wider shipped-code and licensing rules.
+[AnyConnect VPN mode](anyconnect-vpn.md) has a narrow external-tool boundary. The viewer does not bundle, link, or distribute OpenConnect or ocproxy. [Dependency policy](dependency-policy.md) defines the wider shipped-code and licensing rules.
 
 ## Test strategy
 

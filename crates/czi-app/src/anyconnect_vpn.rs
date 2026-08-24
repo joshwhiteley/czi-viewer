@@ -10,14 +10,14 @@ mod macos {
     use std::process::Command;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    pub const EXEC_MODE: &str = "--czi-tufts-vpn-pty-exec";
-    pub const TARGET_HOST: &str = "login-prod.pax.tufts.edu";
+    pub const EXEC_MODE: &str = "--czi-anyconnect-vpn-pty-exec";
     pub const TARGET_PORT: u16 = 22;
-    pub const GATEWAY: &str = "https://vpn.tufts.edu/duo";
-    const SCRIPT_MODE_ENV: &str = "CZI_TUFTS_VPN_SCRIPT_MODE";
-    const SCRIPT_PAIR_ENV: &str = "CZI_TUFTS_VPN_TOOL_PAIR";
-    const SCRIPT_PORT_ENV: &str = "CZI_TUFTS_VPN_LOCAL_PORT";
-    const SCRIPT_PATH_ENV: &str = "CZI_TUFTS_VPN_SCRIPT_PATH";
+    const SCRIPT_MODE_ENV: &str = "CZI_ANYCONNECT_VPN_SCRIPT_MODE";
+    const SCRIPT_PAIR_ENV: &str = "CZI_ANYCONNECT_VPN_TOOL_PAIR";
+    const SCRIPT_PORT_ENV: &str = "CZI_ANYCONNECT_VPN_LOCAL_PORT";
+    const SCRIPT_PATH_ENV: &str = "CZI_ANYCONNECT_VPN_SCRIPT_PATH";
+    const SCRIPT_GATEWAY_ENV: &str = "CZI_ANYCONNECT_VPN_GATEWAY";
+    const SCRIPT_TARGET_HOST_ENV: &str = "CZI_ANYCONNECT_VPN_TARGET_HOST";
     const SSH_BANNER_LIMIT: usize = 1_024;
     const SSH_BANNER_READ_TIMEOUT: Duration = Duration::from_millis(500);
     pub const READY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -59,7 +59,7 @@ mod macos {
         pub fn new(value: impl Into<String>) -> io::Result<Self> {
             let value = value.into();
             if value.is_empty() {
-                return Err(invalid_input("Enter your Tufts VPN username."));
+                return Err(invalid_input("Enter your VPN username."));
             }
             if value.len() > 255
                 || !value.bytes().all(|byte| {
@@ -67,7 +67,7 @@ mod macos {
                 })
             {
                 return Err(invalid_input(
-                    "Tufts VPN username must use only letters, digits, '.', '_', '@', or '-'.",
+                    "VPN username must use only letters, digits, '.', '_', '@', or '-'.",
                 ));
             }
             Ok(Self(value))
@@ -75,6 +75,74 @@ mod macos {
 
         pub fn as_str(&self) -> &str {
             &self.0
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct VpnGateway(String);
+
+    impl VpnGateway {
+        pub fn new(value: impl Into<String>) -> io::Result<Self> {
+            let value = value.into();
+            if value.is_empty() || value.len() > 2_048 || !value.is_ascii() {
+                return Err(invalid_input("Enter a valid HTTPS VPN gateway URL."));
+            }
+            let parsed = url::Url::parse(&value)
+                .map_err(|_| invalid_input("Enter a valid HTTPS VPN gateway URL."))?;
+            if parsed.scheme() != "https"
+                || parsed.host_str().is_none()
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.fragment().is_some()
+            {
+                return Err(invalid_input(
+                    "VPN gateway must be an HTTPS URL without credentials or a fragment.",
+                ));
+            }
+            Ok(Self(parsed.to_string()))
+        }
+
+        pub fn as_str(&self) -> &str {
+            &self.0
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct SshRoute {
+        profile: String,
+        host: String,
+    }
+
+    impl SshRoute {
+        pub fn new(value: impl Into<String>) -> io::Result<Self> {
+            let value = value.into();
+            let mut parts = value.split('@');
+            let user = parts.next().unwrap_or_default();
+            let host = parts.next().unwrap_or_default();
+            if parts.next().is_some()
+                || user.is_empty()
+                || user.len() > 64
+                || !user
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            {
+                return Err(invalid_input("SSH profile must use the form user@host."));
+            }
+            let host = host.to_ascii_lowercase();
+            czi_ssh::HostKeyAlias::new(host.clone())
+                .map_err(|_| invalid_input("SSH route host must be a valid DNS name."))?;
+            Ok(Self {
+                profile: format!("{user}@{host}"),
+                host,
+            })
+        }
+
+        pub fn profile(&self) -> &str {
+            &self.profile
+        }
+
+        pub fn host(&self) -> &str {
+            &self.host
         }
     }
 
@@ -147,15 +215,20 @@ mod macos {
         }
     }
 
-    pub fn start(username: &VpnUsername, executor: &Path) -> io::Result<(VpnProcess, VpnConsole)> {
+    pub fn start(
+        username: &VpnUsername,
+        gateway: &VpnGateway,
+        route: &SshRoute,
+        executor: &Path,
+    ) -> io::Result<(VpnProcess, VpnConsole)> {
         if !executor.is_absolute() {
-            return Err(invalid_input("Tufts VPN executor must be absolute"));
+            return Err(invalid_input("AnyConnect executor must be absolute"));
         }
         let tools = find_tools()?;
         let helper = ScriptHelper::create(executor)?;
         let port = reserve_ephemeral_port()?;
-        let openconnect = openconnect_argv(tools, username, helper.path(), executor);
-        let environment = script_environment(tools, port, helper.path());
+        let openconnect = openconnect_argv(tools, username, gateway, helper.path(), executor);
+        let environment = script_environment(tools, port, helper.path(), gateway, route);
         let spawned = czi_ssh_darwin::spawn_terminal(executor, &openconnect, &environment)?;
         let czi_ssh_darwin::SpawnedTerminal {
             pty_master,
@@ -177,7 +250,7 @@ mod macos {
         ))
     }
 
-    /// Dispatch a fixed Tufts VPN PTY executor or ocproxy script helper before GUI startup.
+    /// Dispatch a validated `AnyConnect` PTY executor or ocproxy script helper before GUI startup.
     ///
     /// # Errors
     ///
@@ -201,15 +274,16 @@ mod macos {
         let pair = pair_from_environment()?;
         let actual = arguments
             .get(2..)
-            .ok_or_else(|| invalid_input("Tufts VPN executor arguments are missing"))?;
-        validate_openconnect_exec_argv(pair, actual)?;
+            .ok_or_else(|| invalid_input("AnyConnect executor arguments are missing"))?;
+        let gateway = gateway_from_environment()?;
+        validate_openconnect_exec_argv(pair, &gateway, actual)?;
         let helper_path = PathBuf::from(
             std::env::var_os(SCRIPT_PATH_ENV)
-                .ok_or_else(|| invalid_input("Tufts VPN script path is missing"))?,
+                .ok_or_else(|| invalid_input("AnyConnect script path is missing"))?,
         );
         if actual.get(5).map(OsString::as_os_str) != Some(helper_path.as_os_str()) {
             return Err(invalid_input(
-                "Tufts VPN executor script path does not match its private helper",
+                "AnyConnect executor script path does not match its private helper",
             ));
         }
         validate_helper_path(&helper_path)?;
@@ -218,22 +292,23 @@ mod macos {
 
     fn run_ocproxy_script(arguments: &[OsString]) -> io::Result<std::convert::Infallible> {
         if arguments.len() != 1 {
-            return Err(invalid_input("Tufts VPN script accepts no arguments"));
+            return Err(invalid_input("AnyConnect script accepts no arguments"));
         }
         let helper_path = PathBuf::from(
             std::env::var_os(SCRIPT_PATH_ENV)
-                .ok_or_else(|| invalid_input("Tufts VPN script path is missing"))?,
+                .ok_or_else(|| invalid_input("AnyConnect script path is missing"))?,
         );
         if arguments[0] != helper_path.as_os_str() {
             return Err(invalid_input(
-                "Tufts VPN script path does not match argv[0]",
+                "AnyConnect script path does not match argv[0]",
             ));
         }
         validate_helper_path(&helper_path)?;
         validate_vpnfd(std::env::var_os("VPNFD").as_deref())?;
         let pair = pair_from_environment()?;
         let port = port_from_environment()?;
-        let forwarding = ocproxy_forwarding(port);
+        let target_host = target_host_from_environment()?;
+        let forwarding = ocproxy_forwarding(port, &target_host);
         let error = Command::new(pair.ocproxy())
             .arg("-L")
             .arg(forwarding)
@@ -248,11 +323,15 @@ mod macos {
             .and_then(OsStr::to_str)
             .and_then(|descriptor| descriptor.parse::<i32>().ok())
             .filter(|descriptor| *descriptor >= 0)
-            .ok_or_else(|| invalid_input("Tufts VPN script requires a valid VPNFD"))?;
+            .ok_or_else(|| invalid_input("AnyConnect script requires a valid VPNFD"))?;
         Ok(())
     }
 
-    fn validate_openconnect_exec_argv(pair: ToolPair, actual: &[OsString]) -> io::Result<()> {
+    fn validate_openconnect_exec_argv(
+        pair: ToolPair,
+        gateway: &VpnGateway,
+        actual: &[OsString],
+    ) -> io::Result<()> {
         if actual.len() != 8
             || actual[0] != pair.openconnect().as_os_str()
             || actual[1] != "--user"
@@ -261,11 +340,9 @@ mod macos {
             || actual[4] != "--script"
             || !safe_helper_argument(Path::new(&actual[5]))
             || actual[6] != "--protocol=anyconnect"
-            || actual[7] != GATEWAY
+            || actual[7] != gateway.as_str()
         {
-            return Err(invalid_input(
-                "invalid fixed Tufts VPN OpenConnect arguments",
-            ));
+            return Err(invalid_input("invalid AnyConnect OpenConnect arguments"));
         }
         Ok(())
     }
@@ -273,6 +350,7 @@ mod macos {
     fn openconnect_argv(
         pair: ToolPair,
         username: &VpnUsername,
+        gateway: &VpnGateway,
         helper: &Path,
         executor: &Path,
     ) -> Vec<OsString> {
@@ -286,26 +364,34 @@ mod macos {
             "--script".into(),
             helper.as_os_str().to_os_string(),
             "--protocol=anyconnect".into(),
-            GATEWAY.into(),
+            gateway.as_str().into(),
         ]
     }
 
-    fn script_environment(pair: ToolPair, port: u16, helper: &Path) -> Vec<(OsString, OsString)> {
+    fn script_environment(
+        pair: ToolPair,
+        port: u16,
+        helper: &Path,
+        gateway: &VpnGateway,
+        route: &SshRoute,
+    ) -> Vec<(OsString, OsString)> {
         vec![
             (SCRIPT_MODE_ENV.into(), "1".into()),
             (SCRIPT_PAIR_ENV.into(), pair.id.into()),
             (SCRIPT_PORT_ENV.into(), port.to_string().into()),
             (SCRIPT_PATH_ENV.into(), helper.as_os_str().to_os_string()),
+            (SCRIPT_GATEWAY_ENV.into(), gateway.as_str().into()),
+            (SCRIPT_TARGET_HOST_ENV.into(), route.host().into()),
         ]
     }
 
     fn pair_from_environment() -> io::Result<ToolPair> {
         let id = std::env::var(SCRIPT_PAIR_ENV)
-            .map_err(|_| invalid_input("Tufts VPN tool-pair identity is missing"))?;
+            .map_err(|_| invalid_input("AnyConnect tool-pair identity is missing"))?;
         TOOL_PAIRS
             .into_iter()
             .find(|pair| pair.id == id)
-            .ok_or_else(|| invalid_input("Tufts VPN tool-pair identity is invalid"))
+            .ok_or_else(|| invalid_input("AnyConnect tool-pair identity is invalid"))
     }
 
     fn port_from_environment() -> io::Result<u16> {
@@ -313,14 +399,28 @@ mod macos {
             .ok()
             .and_then(|port| port.parse::<u16>().ok())
             .filter(|port| *port != 0)
-            .ok_or_else(|| invalid_input("Tufts VPN local port is invalid"))
+            .ok_or_else(|| invalid_input("AnyConnect local port is invalid"))
+    }
+
+    fn gateway_from_environment() -> io::Result<VpnGateway> {
+        let gateway = std::env::var(SCRIPT_GATEWAY_ENV)
+            .map_err(|_| invalid_input("AnyConnect gateway is missing"))?;
+        VpnGateway::new(gateway)
+    }
+
+    fn target_host_from_environment() -> io::Result<String> {
+        let host = std::env::var(SCRIPT_TARGET_HOST_ENV)
+            .map_err(|_| invalid_input("AnyConnect SSH target is missing"))?;
+        czi_ssh::HostKeyAlias::new(host.clone())
+            .map_err(|_| invalid_input("AnyConnect SSH target is invalid"))?;
+        Ok(host)
     }
 
     fn find_tools() -> io::Result<ToolPair> {
         find_tools_with(executable_file).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                "Tufts VPN tools were not found as a matching pair. Install them separately with: brew install openconnect ocproxy",
+                "AnyConnect tools were not found as a matching pair. Install them separately with: brew install openconnect ocproxy",
             )
         })
     }
@@ -353,14 +453,14 @@ mod macos {
             if !child_is_live()? {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
-                    "OpenConnect exited before the Tufts SSH tunnel became ready",
+                    "OpenConnect exited before the SSH tunnel became ready",
                 ));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "timed out waiting for the Tufts SSH tunnel",
+                    "timed out waiting for the SSH tunnel",
                 ));
             }
             let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
@@ -415,8 +515,8 @@ mod macos {
             && line.iter().all(|byte| matches!(byte, b' '..=b'~'))
     }
 
-    fn ocproxy_forwarding(port: u16) -> String {
-        format!("{port}:{TARGET_HOST}:{TARGET_PORT}")
+    fn ocproxy_forwarding(port: u16, target_host: &str) -> String {
+        format!("{port}:{target_host}:{TARGET_PORT}")
     }
 
     struct ScriptHelper {
@@ -454,7 +554,7 @@ mod macos {
             }
             Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "could not create a private Tufts VPN helper directory",
+                "could not create a private AnyConnect helper directory",
             ))
         }
 
@@ -493,22 +593,22 @@ mod macos {
 
     fn validate_helper_path(path: &Path) -> io::Result<()> {
         if !safe_helper_argument(path) {
-            return Err(invalid_input("Tufts VPN helper path is invalid"));
+            return Err(invalid_input("AnyConnect helper path is invalid"));
         }
         let parent = path
             .parent()
-            .ok_or_else(|| invalid_input("Tufts VPN helper parent is missing"))?;
+            .ok_or_else(|| invalid_input("AnyConnect helper parent is missing"))?;
         let parent_metadata = fs::symlink_metadata(parent)?;
         if !parent_metadata.is_dir() || parent_metadata.mode() & 0o777 != 0o700 {
-            return Err(invalid_input("Tufts VPN helper directory is not private"));
+            return Err(invalid_input("AnyConnect helper directory is not private"));
         }
         let link_metadata = fs::symlink_metadata(path)?;
         if !link_metadata.file_type().is_symlink() {
-            return Err(invalid_input("Tufts VPN helper is not a symlink"));
+            return Err(invalid_input("AnyConnect helper is not a symlink"));
         }
         let target = fs::canonicalize(fs::read_link(path)?)?;
         if target != fs::canonicalize(std::env::current_exe()?)? {
-            return Err(invalid_input("Tufts VPN helper target is invalid"));
+            return Err(invalid_input("AnyConnect helper target is invalid"));
         }
         Ok(())
     }
@@ -546,11 +646,40 @@ mod macos {
         #[test]
         fn username_validation_is_bounded_ascii_and_not_shell_syntax() {
             assert_eq!(VpnUsername::new("jdoe").unwrap().as_str(), "jdoe");
-            assert!(VpnUsername::new("jane.doe@tufts.edu").is_ok());
+            assert!(VpnUsername::new("jane.doe@example.edu").is_ok());
             for invalid in ["", "two words", "bad;command", "bad\nname", "café"] {
                 assert!(VpnUsername::new(invalid).is_err(), "accepted {invalid:?}");
             }
             assert!(VpnUsername::new("a".repeat(256)).is_err());
+        }
+
+        #[test]
+        fn gateway_and_ssh_route_are_generic_bounded_and_canonical() {
+            let gateway = VpnGateway::new("https://vpn.example.edu/group").unwrap();
+            assert_eq!(gateway.as_str(), "https://vpn.example.edu/group");
+            for invalid in [
+                "",
+                "http://vpn.example.edu",
+                "https://user@vpn.example.edu",
+                "https://vpn.example.edu/#fragment",
+                "not a URL",
+            ] {
+                assert!(VpnGateway::new(invalid).is_err(), "accepted {invalid:?}");
+            }
+
+            let route = SshRoute::new("researcher@login.example.edu").unwrap();
+            assert_eq!(route.profile(), "researcher@login.example.edu");
+            assert_eq!(route.host(), "login.example.edu");
+            for invalid in [
+                "login.example.edu",
+                "researcher@",
+                "@login.example.edu",
+                "user@@login.example.edu",
+                "user@login.example.edu:22",
+                "user name@login.example.edu",
+            ] {
+                assert!(SshRoute::new(invalid).is_err(), "accepted {invalid:?}");
+            }
         }
 
         #[test]
@@ -583,9 +712,11 @@ mod macos {
         #[test]
         fn openconnect_and_ocproxy_argv_are_exact_and_user_text_never_enters_script() {
             let username = VpnUsername::new("jdoe").unwrap();
+            let gateway = VpnGateway::new("https://vpn.example.edu/group").unwrap();
+            let route = SshRoute::new("researcher@login.example.edu").unwrap();
             let helper = Path::new("/tmp/cz-vpn-1-ab-0/h");
             let executor = Path::new("/Applications/CZI Viewer.app/Contents/MacOS/czi-viewer");
-            let argv = openconnect_argv(TOOL_PAIRS[0], &username, helper, executor);
+            let argv = openconnect_argv(TOOL_PAIRS[0], &username, &gateway, helper, executor);
             assert_eq!(
                 argv,
                 [
@@ -598,29 +729,39 @@ mod macos {
                     OsStr::new("--script"),
                     helper.as_os_str(),
                     OsStr::new("--protocol=anyconnect"),
-                    OsStr::new("https://vpn.tufts.edu/duo"),
+                    OsStr::new("https://vpn.example.edu/group"),
                 ]
             );
-            validate_openconnect_exec_argv(TOOL_PAIRS[0], &argv[2..]).unwrap();
+            validate_openconnect_exec_argv(TOOL_PAIRS[0], &gateway, &argv[2..]).unwrap();
             assert!(!argv[7].to_string_lossy().contains(username.as_str()));
             assert_eq!(
-                ocproxy_forwarding(41_337),
-                "41337:login-prod.pax.tufts.edu:22"
+                ocproxy_forwarding(41_337, route.host()),
+                "41337:login.example.edu:22"
             );
+            let environment = script_environment(TOOL_PAIRS[0], 41_337, helper, &gateway, &route);
+            assert!(environment.contains(&(
+                OsString::from(SCRIPT_GATEWAY_ENV),
+                OsString::from("https://vpn.example.edu/group"),
+            )));
+            assert!(environment.contains(&(
+                OsString::from(SCRIPT_TARGET_HOST_ENV),
+                OsString::from("login.example.edu"),
+            )));
         }
 
         #[test]
         fn openconnect_executor_rejects_changed_fixed_arguments() {
             let username = VpnUsername::new("jdoe").unwrap();
+            let gateway = VpnGateway::new("https://vpn.example.edu/group").unwrap();
             let helper = Path::new("/tmp/cz-vpn-1-ab-0/h");
             let executor = Path::new("/tmp/czi-viewer");
-            let argv = openconnect_argv(TOOL_PAIRS[0], &username, helper, executor);
+            let argv = openconnect_argv(TOOL_PAIRS[0], &username, &gateway, helper, executor);
             let mut actual = argv[2..].to_vec();
             actual[4] = "--script=/tmp/user-text".into();
-            assert!(validate_openconnect_exec_argv(TOOL_PAIRS[0], &actual).is_err());
+            assert!(validate_openconnect_exec_argv(TOOL_PAIRS[0], &gateway, &actual).is_err());
             let mut actual = argv[2..].to_vec();
             actual[7] = "https://example.test/".into();
-            assert!(validate_openconnect_exec_argv(TOOL_PAIRS[0], &actual).is_err());
+            assert!(validate_openconnect_exec_argv(TOOL_PAIRS[0], &gateway, &actual).is_err());
         }
 
         #[test]
@@ -731,7 +872,7 @@ mod macos {
 pub use macos::*;
 
 #[cfg(not(target_os = "macos"))]
-/// Return without dispatching because the Tufts VPN integration is macOS-only.
+/// Return without dispatching because the AnyConnect integration is macOS-only.
 ///
 /// # Errors
 ///

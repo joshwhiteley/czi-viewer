@@ -421,20 +421,17 @@ fn loopback_endpoint_is_validated_and_interactive_argv_is_strict_and_exact() {
         HostKeyAlias::new("a".repeat(254)),
         Err(OpenSshConfigError::HostKeyAliasTooLong { length: 254 })
     ));
-    let alias = HostKeyAlias::new("login-prod.pax.tufts.edu").expect("valid host-key alias");
+    let alias = HostKeyAlias::new("login.example.edu").expect("valid host-key alias");
     assert_eq!(
         LoopbackEndpoint::new(0, alias.clone()),
         Err(OpenSshConfigError::LoopbackPortZero)
     );
     let endpoint = LoopbackEndpoint::new(41_337, alias).expect("valid loopback endpoint");
     assert_eq!(endpoint.port(), 41_337);
-    assert_eq!(
-        endpoint.host_key_alias().as_str(),
-        "login-prod.pax.tufts.edu"
-    );
+    assert_eq!(endpoint.host_key_alias().as_str(), "login.example.edu");
     let config = OpenSshConfig::new().with_loopback_endpoint(endpoint);
     let argv = config
-        .interactive_sftp_argv(&profile("login-prod.pax.tufts.edu"))
+        .interactive_sftp_argv(&profile("login.example.edu"))
         .into_iter()
         .map(|argument| argument.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
@@ -461,7 +458,7 @@ fn loopback_endpoint_is_validated_and_interactive_argv_is_strict_and_exact() {
             "-o",
             "Port=41337",
             "-o",
-            "HostKeyAlias=login-prod.pax.tufts.edu",
+            "HostKeyAlias=login.example.edu",
             "-o",
             "ProxyCommand=none",
             "-o",
@@ -470,7 +467,7 @@ fn loopback_endpoint_is_validated_and_interactive_argv_is_strict_and_exact() {
             "StrictHostKeyChecking=yes",
             "-T",
             "-s",
-            "login-prod.pax.tufts.edu",
+            "login.example.edu",
             "sftp",
         ]
         .into_iter()
@@ -478,7 +475,7 @@ fn loopback_endpoint_is_validated_and_interactive_argv_is_strict_and_exact() {
         .collect::<Vec<_>>()
     );
     let embedded = config
-        .embedded_sftp_argv(&profile("login-prod.pax.tufts.edu"))
+        .embedded_sftp_argv(&profile("login.example.edu"))
         .into_iter()
         .map(|argument| argument.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
