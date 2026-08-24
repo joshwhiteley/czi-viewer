@@ -1,6 +1,8 @@
 /target/
 /dist/
 .DS_Store
+__pycache__/
+*.pyc
 
 # Local CZI data and machine-specific fixture configuration.
 *.czi
