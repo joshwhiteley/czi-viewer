@@ -45,4 +45,4 @@ Do not describe this preview as notarized or generally trusted by Gatekeeper.
 
 ## CI releases
 
-`.github/workflows/preview.yml` runs manually and for `preview-*` tags. It uploads the DMG, ZIP, standalone app, checksums, SBOM, and notices as an artifact, and requests GitHub artifact attestations for file artifacts on GitHub.com. Only a `push` of a preview tag creates a prerelease; manual runs never write repository contents.
+`.github/workflows/preview.yml` runs manually and for `preview-*` tags. Its build artifact includes the DMG, ZIP, standalone app, checksums, SBOM, and notices. GitHub prereleases publish the distributable files: DMG, ZIP, checksums, SBOM, and notices. The workflow requests GitHub artifact attestations for file artifacts on GitHub.com. Only a `push` of a preview tag creates a prerelease; manual runs never write repository contents.
