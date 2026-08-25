@@ -26,6 +26,10 @@ The Python environment is hash-locked, receives a separate CycloneDX SBOM, and i
 
 A custom protocol-compatible helper remains an Advanced override for testing or specialized deployments. Its licensing and numerical validation remain the operator's responsibility.
 
+The updater uses `ureq` 2.12 with default features disabled and macOS native TLS, so certificate validation uses the system Security framework rather than a bundled TLS library. `ed25519-dalek` 2.2 verifies the maintainer signature in Rust; `sha2` 0.10 verifies streamed DMG bytes; and `semver` 1.0 compares versions. Their enabled runtime paths are permissively licensed. Non-macOS TLS backends present in the cross-platform lockfile are not compiled or shipped in the macOS application.
+
+Preview publication uses the separately installed GitHub CLI, OpenSSL 3, `jq`, and standard macOS command-line tools. They are release-operator tools, not linked or bundled application dependencies. OpenSSL is used only on the trusted local release machine to create and verify a detached Ed25519 update-manifest signature. The private key is not a repository dependency, CI secret, workflow input, artifact, or release asset.
+
 The eframe `default_fonts` feature embeds font assets under OFL-1.1 and Ubuntu-font-1.0. These two font licenses are allowed only for those bundled assets.
 
 The metadata parser uses `quick-xml` 0.41 with default features disabled. It is pure Rust and MIT licensed. It uses the plain reader rather than `NsReader`; namespace declarations are ordinary attributes and are bounded by the parser's aggregate attribute-byte limit. PNG snapshot export uses `png` 0.18 with default features disabled. It is pure Rust and dual MIT/Apache-2.0 licensed. The BaSiC protocol manifest uses `serde` and `serde_json`; both are pure Rust and dual MIT/Apache-2.0 licensed. Its added `itoa` transitive dependency is pure Rust and dual MIT/Apache-2.0 licensed; `zmij` is pure Rust and MIT licensed.

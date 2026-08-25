@@ -28,6 +28,7 @@ Open large CZI mosaics, inspect channels and metadata, and save an annotated vie
 - Open local files or read-only remote files through system OpenSSH SFTP.
 - Build channel composites and save annotated PNG snapshots.
 - Automatically fit a reversible BaSiC flat-field preview from the full supported CZI acquisition with the bundled BaSiCPy helper.
+- Check authenticated GitHub preview releases daily and install a verified DMG only after user confirmation.
 
 ## Current limits
 

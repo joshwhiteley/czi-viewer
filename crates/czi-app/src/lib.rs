@@ -8,6 +8,7 @@ mod anyconnect_vpn;
 mod basic;
 mod chooser;
 mod settings;
+mod update;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -3623,6 +3624,15 @@ struct EmbeddedAuthentication {
     status: AuthenticationStatus,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum UpdateActivity {
+    #[default]
+    Idle,
+    Checking,
+    Installing,
+    Handoff,
+}
+
 fn reuses_remote_connection(
     requested: &RemoteConnectionIdentity,
     connection_generation: u64,
@@ -3637,8 +3647,16 @@ fn reuses_remote_connection(
 }
 
 /// The local and SSH CZI mosaic viewer.
+#[allow(clippy::struct_excessive_bools)]
 pub struct ViewerApp {
     worker: DatasetWorker,
+    update_worker: update::UpdateWorker,
+    available_update: Option<update::VerifiedUpdate>,
+    update_activity: UpdateActivity,
+    update_dialog_open: bool,
+    update_message: Option<(String, bool)>,
+    update_install_target: Option<PathBuf>,
+    update_startup_acknowledged: bool,
     open_mode: OpenMode,
     path_input: String,
     native_choosers: chooser::NativeChoosers,
@@ -3699,9 +3717,17 @@ impl ViewerApp {
     #[must_use]
     pub fn new(_creation_context: &eframe::CreationContext<'_>) -> Self {
         let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
+        let update_install_target = update::current_application_bundle();
         let (snapshot_write_sender, snapshot_write_results) = mpsc::channel();
         let mut app = Self {
             worker: DatasetWorker::spawn(),
+            update_worker: update::UpdateWorker::spawn(),
+            available_update: None,
+            update_activity: UpdateActivity::Idle,
+            update_dialog_open: false,
+            update_message: None,
+            update_install_target,
+            update_startup_acknowledged: false,
             open_mode: OpenMode::Local,
             path_input: initial_path
                 .as_ref()
@@ -3840,6 +3866,229 @@ impl ViewerApp {
                     }
                 }
             }
+        }
+    }
+
+    fn request_update_check(&mut self) {
+        self.update_dialog_open = true;
+        self.update_message = None;
+        if self.update_activity == UpdateActivity::Installing {
+            return;
+        }
+        match self.update_worker.check_now() {
+            Ok(()) => self.update_activity = UpdateActivity::Checking,
+            Err(error) => {
+                self.update_activity = UpdateActivity::Idle;
+                self.update_message = Some((error, true));
+            }
+        }
+    }
+
+    fn request_update_install(&mut self) {
+        let Some(update) = self.available_update.clone() else {
+            return;
+        };
+        let Some(current_bundle) = self.update_install_target.clone() else {
+            self.update_message = Some((
+                String::from(
+                    "Automatic installation requires CZI Viewer to be running from /Applications.",
+                ),
+                true,
+            ));
+            return;
+        };
+        self.update_message = None;
+        match self
+            .update_worker
+            .install_after_confirmation(update, current_bundle)
+        {
+            Ok(()) => self.update_activity = UpdateActivity::Installing,
+            Err(error) => self.update_message = Some((error, true)),
+        }
+    }
+
+    fn poll_updates(&mut self, context: &egui::Context) {
+        while let Some(event) = self.update_worker.try_recv() {
+            match event {
+                update::UpdateEvent::UpdateAvailable { update, automatic } => {
+                    self.available_update = Some(*update);
+                    self.update_activity = UpdateActivity::Idle;
+                    self.update_message = None;
+                    if !automatic {
+                        self.update_dialog_open = true;
+                    }
+                }
+                update::UpdateEvent::ManualUpToDate => {
+                    self.available_update = None;
+                    self.update_activity = UpdateActivity::Idle;
+                    self.update_message = Some((
+                        format!("CZI Viewer {} is up to date.", env!("CARGO_PKG_VERSION")),
+                        false,
+                    ));
+                    self.update_dialog_open = true;
+                }
+                update::UpdateEvent::ManualError(error) => {
+                    self.update_activity = UpdateActivity::Idle;
+                    self.update_message = Some((error, true));
+                    self.update_dialog_open = true;
+                }
+                update::UpdateEvent::InstallError(error) => {
+                    if matches!(
+                        self.update_activity,
+                        UpdateActivity::Installing | UpdateActivity::Handoff
+                    ) {
+                        self.update_activity = UpdateActivity::Idle;
+                        self.update_message = Some((error, true));
+                        self.update_dialog_open = true;
+                    }
+                }
+                update::UpdateEvent::InstallPrepared => {
+                    if self.update_activity == UpdateActivity::Installing {
+                        self.update_activity = UpdateActivity::Handoff;
+                        if let Err(error) = self.update_worker.authorize_install_handoff() {
+                            self.update_activity = UpdateActivity::Idle;
+                            self.update_message = Some((error, true));
+                            self.update_dialog_open = true;
+                        }
+                    }
+                }
+                update::UpdateEvent::InstallReadyToClose => {
+                    if self.update_activity == UpdateActivity::Handoff {
+                        context.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+            }
+        }
+    }
+
+    fn show_update_banner(&mut self, context: &egui::Context) {
+        let Some(update) = self.available_update.as_ref() else {
+            return;
+        };
+        let version = update.version().to_string();
+        let release_url = update.release_page_url();
+        egui::TopBottomPanel::top("update_banner_v1").show(context, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(format!("CZI Viewer {version} is available."));
+                if ui.button("Download Update…").clicked() {
+                    self.update_dialog_open = true;
+                    self.update_message = None;
+                }
+                ui.hyperlink_to("View Release", release_url);
+            });
+        });
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn show_update_dialog(&mut self, context: &egui::Context) {
+        if !self.update_dialog_open {
+            return;
+        }
+        let mut open = self.update_dialog_open;
+        let mut check = false;
+        let mut install = false;
+        let mut cancel_install = false;
+        let available = self.available_update.clone();
+        let activity = self.update_activity;
+        let message = self.update_message.clone();
+        egui::Window::new("CZI Viewer Updates")
+            .id(egui::Id::new("czi_update_dialog_v1"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(460.0)
+            .show(context, |ui| {
+                match activity {
+                    UpdateActivity::Checking => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Checking the signed CZI Viewer preview releases…");
+                        });
+                    }
+                    UpdateActivity::Installing => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Downloading, verifying, and preparing the update…");
+                        });
+                        ui.label(
+                            "The app will close after verification and ask macOS to reopen it.",
+                        );
+                        if ui.button("Cancel Download").clicked() {
+                            cancel_install = true;
+                        }
+                    }
+                    UpdateActivity::Handoff => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Starting the verified update helper…");
+                        });
+                        ui.label("CZI Viewer will close momentarily.");
+                    }
+                    UpdateActivity::Idle => {
+                        if let Some(update) = available.as_ref() {
+                            ui.heading(format!("Version {} is available", update.version()));
+                            ui.label(
+                                "The download is authenticated with the CZI Viewer update signing key.",
+                            );
+                            ui.add_space(4.0);
+                            ui.colored_label(
+                                egui::Color32::YELLOW,
+                                "This preview remains ad-hoc signed and is not Apple notarized. Gatekeeper may require approval after installation.",
+                            );
+                            ui.label(
+                                "Install the verified update in /Applications and restart CZI Viewer?",
+                            );
+                            ui.hyperlink_to("View verified GitHub release", update.release_page_url());
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                let can_install = self.update_install_target.is_some();
+                                if ui
+                                    .add_enabled(
+                                        can_install,
+                                        egui::Button::new("Download, Install, and Restart"),
+                                    )
+                                    .clicked()
+                                {
+                                    install = true;
+                                }
+                                if !can_install {
+                                    ui.weak("Move CZI Viewer to Applications to enable automatic installation.");
+                                }
+                            });
+                        } else if message.is_none() {
+                            ui.label(format!(
+                                "Installed version: {}",
+                                env!("CARGO_PKG_VERSION")
+                            ));
+                            if ui.button("Check Now").clicked() {
+                                check = true;
+                            }
+                        }
+                    }
+                }
+                if let Some((message, is_error)) = message.as_ref() {
+                    ui.add_space(6.0);
+                    if *is_error {
+                        ui.colored_label(egui::Color32::LIGHT_RED, message);
+                    } else {
+                        ui.label(message);
+                    }
+                    if activity == UpdateActivity::Idle && ui.button("Check Again").clicked() {
+                        check = true;
+                    }
+                }
+            });
+        self.update_dialog_open = open;
+        if check {
+            self.request_update_check();
+        }
+        if install {
+            self.request_update_install();
+        }
+        if cancel_install {
+            let _ = self.update_worker.cancel();
+            self.update_activity = UpdateActivity::Idle;
+            self.update_message = Some((String::from("Update download cancelled."), false));
         }
     }
 
@@ -6910,6 +7159,7 @@ impl eframe::App for ViewerApp {
         self.poll_snapshot_results();
         self.poll_native_choosers();
         self.poll_helper_settings();
+        self.poll_updates(context);
         self.handle_dropped_files(context);
         self.handle_worker_events();
         self.poll_embedded_authentication(context);
@@ -6933,7 +7183,7 @@ impl eframe::App for ViewerApp {
                     match self.open_mode {
                         OpenMode::Local => {
                             ui.label("CZI");
-                            let field_width = (ui.available_width() - 252.0).max(120.0);
+                            let field_width = (ui.available_width() - 400.0).max(120.0);
                             let response = ui.add_sized(
                                 [field_width, 24.0],
                                 egui::TextEdit::singleline(&mut self.path_input)
@@ -6974,6 +7224,19 @@ impl eframe::App for ViewerApp {
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_enabled_ui(self.update_activity == UpdateActivity::Idle, |ui| {
+                            ui.menu_button("Help", |ui| {
+                                ui.label(format!("CZI Viewer {}", env!("CARGO_PKG_VERSION")));
+                                ui.separator();
+                                if ui.button("Check for Updates…").clicked() {
+                                    self.request_update_check();
+                                    ui.close();
+                                }
+                            });
+                        });
+                        if self.update_activity == UpdateActivity::Checking {
+                            ui.spinner();
+                        }
                         let color = if self.status.is_error {
                             egui::Color32::LIGHT_RED
                         } else {
@@ -6988,6 +7251,9 @@ impl eframe::App for ViewerApp {
                     });
                 });
             });
+
+        self.show_update_banner(context);
+        self.show_update_dialog(context);
 
         if self.open_mode == OpenMode::Ssh && self.remote_browser_visibility.is_open() {
             egui::SidePanel::right("remote_inspector_v2")
@@ -7025,6 +7291,10 @@ impl eframe::App for ViewerApp {
         egui::CentralPanel::default().show(context, |ui| {
             self.show_canvas(ui);
         });
+
+        if !self.update_startup_acknowledged && self.update_worker.acknowledge_startup().is_ok() {
+            self.update_startup_acknowledged = true;
+        }
 
         context.request_repaint_after(Duration::from_millis(100));
     }
@@ -7337,6 +7607,15 @@ fn level_selector(ui: &mut egui::Ui, pixel_type: PixelType, levels: &mut Levels)
 }
 
 pub use anyconnect_vpn::run_executor_if_requested as run_anyconnect_vpn_executor_if_requested;
+
+/// Run the narrowly scoped update replacement helper when requested by the app.
+///
+/// # Errors
+///
+/// Returns an error when update-helper arguments or replacement validation fail.
+pub fn run_update_helper_if_requested() -> Result<bool, String> {
+    update::run_update_helper_if_requested()
+}
 
 /// Run the macOS-native local viewer.
 ///

@@ -46,6 +46,14 @@ The collapsed **Advanced** section can select a custom protocol-compatible helpe
 
 The preview reloads only the bounded visible viewport and preserves the display range and field of view. Corrected PNGs state that the result is not quantitatively validated. See [BaSiC preview and helper protocol](basic-preview.md) for limits, packaging, and the protocol.
 
+## Updates
+
+CZI Viewer checks the signed preview releases at most once every 24 hours. An automatic check is silent when the Mac is offline or the installed version is current. Select **Check for Updates…** to check immediately.
+
+When a newer compatible Apple Silicon release is available, the app shows a banner. Select **Download Update…** to review it. Automatic installation is enabled only while CZI Viewer is running from `/Applications/CZI Viewer.app`. Select **Download, Install, and Restart** to confirm. The app then downloads the exact DMG, verifies its maintainer-signed manifest and SHA-256, mounts it read-only, validates the bundle, stages it beside the installed app, and restarts through a rollback-capable helper. The previous bundle is removed only after the updated app completes its first UI frame; if launch never reaches that point, the backup is preserved for recovery. No CZI path, metadata, SSH setting, credential, or user identifier is sent. GitHub still receives the connection IP as it does for any HTTPS request.
+
+Preview builds remain ad-hoc signed and are not notarized. The updater does not remove quarantine or bypass Gatekeeper. macOS can require **Open Anyway** after an update. If the app is not in Applications or the destination is not writable, use the verified GitHub release link and install the DMG manually.
+
 ## Make safe demo data
 
 The repository does not contain real microscopy data. Generate a deterministic, uncompressed Gray16 CZI locally:
