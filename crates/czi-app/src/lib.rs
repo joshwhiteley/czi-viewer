@@ -6887,7 +6887,11 @@ fn remote_actions_enabled(connected: bool, profile_editing: bool, browse_pending
 fn scene_label(scene: SceneId) -> String {
     match scene {
         SceneId::Implicit => String::from("implicit"),
-        SceneId::Explicit(value) => value.to_string(),
+        // CZI stores explicit scene coordinates with a zero-based index, while
+        // acquisition-facing field labels conventionally start at S01. Show
+        // both representations so users never need to guess which base an
+        // external field list uses.
+        SceneId::Explicit(value) => format!("S{:02} (CZI index {value})", value + 1),
     }
 }
 
@@ -9274,6 +9278,13 @@ mod tests {
         );
         assert!(choices.present);
         assert_eq!(PlaneSelector::default().scene, SceneId::Implicit);
+    }
+
+    #[test]
+    fn explicit_scene_labels_show_human_and_native_indices() {
+        assert_eq!(scene_label(SceneId::Implicit), "implicit");
+        assert_eq!(scene_label(SceneId::Explicit(0)), "S01 (CZI index 0)");
+        assert_eq!(scene_label(SceneId::Explicit(12)), "S13 (CZI index 12)");
     }
 
     #[test]
