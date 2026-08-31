@@ -6891,7 +6891,9 @@ fn scene_label(scene: SceneId) -> String {
         // acquisition-facing field labels conventionally start at S01. Show
         // both representations so users never need to guess which base an
         // external field list uses.
-        SceneId::Explicit(value) => format!("S{:02} (CZI index {value})", value + 1),
+        SceneId::Explicit(value) => {
+            format!("S{:02} (CZI index {value})", i64::from(value) + 1)
+        }
     }
 }
 
@@ -9278,6 +9280,12 @@ mod tests {
         );
         assert!(choices.present);
         assert_eq!(PlaneSelector::default().scene, SceneId::Implicit);
+
+        let selection = PlaneSelector::new(0, SceneId::Explicit(0), 0, 0);
+        let plane_before_label = query.plane(selection).cloned();
+        assert_eq!(scene_label(selection.scene), "S01 (CZI index 0)");
+        assert_eq!(selection.scene, SceneId::Explicit(0));
+        assert_eq!(query.plane(selection), plane_before_label.as_ref());
     }
 
     #[test]
@@ -9285,6 +9293,10 @@ mod tests {
         assert_eq!(scene_label(SceneId::Implicit), "implicit");
         assert_eq!(scene_label(SceneId::Explicit(0)), "S01 (CZI index 0)");
         assert_eq!(scene_label(SceneId::Explicit(12)), "S13 (CZI index 12)");
+        assert_eq!(
+            scene_label(SceneId::Explicit(i32::MAX)),
+            "S2147483648 (CZI index 2147483647)"
+        );
     }
 
     #[test]
