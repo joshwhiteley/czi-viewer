@@ -2244,7 +2244,9 @@ mod tests {
 
     #[test]
     fn fake_transport_observes_only_fixed_discovery_and_asset_urls() {
-        let version = "0.1.3";
+        let current = Version::parse(env!("CARGO_PKG_VERSION")).expect("current version");
+        let next_patch = current.patch.checked_add(1).expect("next patch version");
+        let version = format!("{}.{}.{next_patch}", current.major, current.minor);
         let stem = format!("CZI-Viewer-{version}-{TARGET}-preview");
         let manifest_url = format!(
             "https://github.com/joshwhiteley/czi-viewer/releases/download/preview-v{version}/{stem}-update.json"
@@ -2254,7 +2256,7 @@ mod tests {
             "https://github.com/joshwhiteley/czi-viewer/releases/download/preview-v{version}/{stem}.dmg"
         );
         let manifest = manifest(
-            version,
+            &version,
             "0000000000000000000000000000000000000000000000000000000000000000",
             10,
         );

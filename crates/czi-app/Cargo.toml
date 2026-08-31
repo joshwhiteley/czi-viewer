@@ -1,6 +1,6 @@
 [package]
 name = "czi-viewer"
-version = "0.1.2"
+version = "0.1.3"
 description = "Native macOS viewer for CZI microscopy images"
 homepage = "https://github.com/joshwhiteley/czi-viewer"
 repository = "https://github.com/joshwhiteley/czi-viewer"
