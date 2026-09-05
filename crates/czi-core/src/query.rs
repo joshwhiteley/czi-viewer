@@ -172,7 +172,9 @@ impl SpatialRect {
     /// Return true when two half-open rectangles overlap with non-zero area.
     #[must_use]
     pub const fn intersects(self, other: Self) -> bool {
-        self.min_x < other.max_x
+        !self.is_empty()
+            && !other.is_empty()
+            && self.min_x < other.max_x
             && other.min_x < self.max_x
             && self.min_y < other.max_y
             && other.min_y < self.max_y
@@ -458,10 +460,13 @@ pub struct PlaneInfo {
 }
 
 /// Immutable geometry index over [`DatasetIndex::tiles`].
+///
+/// Each exact plane and pyramid scale owns a static BVH, so a viewport visits only intersecting
+/// spatial bounds before the final paint-order sort.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TileQueryIndex {
     tiles: Vec<IndexedTile>,
-    levels: BTreeMap<(PlaneKey, PyramidScale), Vec<TileId>>,
+    levels: BTreeMap<(PlaneKey, PyramidScale), LevelIndex>,
     planes: BTreeMap<PlaneKey, PlaneInfo>,
     axes: SparseAxisChoices,
 }
@@ -474,6 +479,30 @@ struct IndexedTile {
     scale: PyramidScale,
     m_index: Option<i32>,
 }
+
+/// A static two-dimensional BVH for one exact plane and pyramid scale.
+///
+/// Tile ids are reordered only inside this private structure. They remain summary-directory ids,
+/// and query results are sorted by paint order after traversal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LevelIndex {
+    tile_ids: Vec<TileId>,
+    nodes: Vec<SpatialNode>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SpatialNode {
+    bounds: SpatialRect,
+    kind: SpatialNodeKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SpatialNodeKind {
+    Leaf { start: usize, end: usize },
+    Branch { left: usize, right: usize },
+}
+
+const BVH_LEAF_SIZE: usize = 8;
 
 /// Errors found while converting summary-directory geometry into a safe query index.
 #[derive(Clone, Debug, Error, PartialEq)]
@@ -566,6 +595,117 @@ impl fmt::Display for PlaneSelector {
     }
 }
 
+impl LevelIndex {
+    fn new(mut tile_ids: Vec<TileId>, tiles: &[IndexedTile]) -> Self {
+        let leaf_count = tile_ids.len().div_ceil(BVH_LEAF_SIZE);
+        let node_capacity = leaf_count.saturating_mul(2).saturating_sub(1);
+        let mut nodes = Vec::with_capacity(node_capacity);
+        if !tile_ids.is_empty() {
+            let end = tile_ids.len();
+            build_bvh_nodes(&mut nodes, &mut tile_ids, tiles, 0, end);
+        }
+        Self { tile_ids, nodes }
+    }
+
+    fn query(&self, viewport: SpatialRect, tiles: &[IndexedTile]) -> Vec<TileId> {
+        let mut hits = Vec::new();
+        if let Some(root) = self.nodes.first() {
+            if viewport.intersects(root.bounds) {
+                collect_bvh_hits(self, 0, viewport, tiles, &mut hits);
+            }
+        }
+        hits
+    }
+}
+
+fn build_bvh_nodes(
+    nodes: &mut Vec<SpatialNode>,
+    tile_ids: &mut [TileId],
+    tiles: &[IndexedTile],
+    start: usize,
+    end: usize,
+) -> usize {
+    let bounds = tile_ids[start..end]
+        .iter()
+        .map(|tile_id| tiles[tile_id.0].logical_rect)
+        .reduce(SpatialRect::union)
+        .expect("BVH range is non-empty");
+    let node_index = nodes.len();
+    nodes.push(SpatialNode {
+        bounds,
+        kind: SpatialNodeKind::Leaf { start, end },
+    });
+
+    if end - start <= BVH_LEAF_SIZE {
+        return node_index;
+    }
+
+    let split_axis = if rect_span(bounds, Axis::X) >= rect_span(bounds, Axis::Y) {
+        Axis::X
+    } else {
+        Axis::Y
+    };
+    let middle = start + (end - start) / 2;
+    tile_ids[start..end].select_nth_unstable_by(middle - start, |left, right| {
+        center_key(tiles[left.0].logical_rect, split_axis)
+            .cmp(&center_key(tiles[right.0].logical_rect, split_axis))
+            .then_with(|| left.cmp(right))
+    });
+    let left = build_bvh_nodes(nodes, tile_ids, tiles, start, middle);
+    let right = build_bvh_nodes(nodes, tile_ids, tiles, middle, end);
+    nodes[node_index].kind = SpatialNodeKind::Branch { left, right };
+    node_index
+}
+
+#[derive(Clone, Copy)]
+enum Axis {
+    X,
+    Y,
+}
+
+fn rect_span(rect: SpatialRect, axis: Axis) -> u128 {
+    match axis {
+        Axis::X => u128::try_from(i128::from(rect.max_x) - i128::from(rect.min_x))
+            .expect("rectangle X span is non-negative"),
+        Axis::Y => u128::try_from(i128::from(rect.max_y) - i128::from(rect.min_y))
+            .expect("rectangle Y span is non-negative"),
+    }
+}
+
+fn center_key(rect: SpatialRect, axis: Axis) -> i128 {
+    match axis {
+        Axis::X => i128::from(rect.min_x) + i128::from(rect.max_x),
+        Axis::Y => i128::from(rect.min_y) + i128::from(rect.max_y),
+    }
+}
+
+fn collect_bvh_hits(
+    index: &LevelIndex,
+    node_index: usize,
+    viewport: SpatialRect,
+    tiles: &[IndexedTile],
+    hits: &mut Vec<TileId>,
+) {
+    let node = &index.nodes[node_index];
+    if !viewport.intersects(node.bounds) {
+        return;
+    }
+    match node.kind {
+        SpatialNodeKind::Leaf { start, end } => {
+            hits.extend(
+                index.tile_ids[start..end]
+                    .iter()
+                    .copied()
+                    .filter(|tile_id| viewport.intersects(tiles[tile_id.0].logical_rect)),
+            );
+        }
+        SpatialNodeKind::Branch { left, right } => {
+            collect_bvh_hits(index, left, viewport, tiles, hits);
+            collect_bvh_hits(index, right, viewport, tiles, hits);
+        }
+    }
+}
+
 impl TileQueryIndex {
     /// Build an immutable geometry index. This is an alias for [`Self::new`].
     pub fn build(index: &DatasetIndex) -> Result<Self, TileQueryError> {
@@ -587,7 +727,7 @@ impl TileQueryIndex {
     /// Build an immutable geometry index without reading any tile payloads.
     pub fn new(index: &DatasetIndex) -> Result<Self, TileQueryError> {
         let mut tiles = Vec::with_capacity(index.tiles.len());
-        let mut levels: BTreeMap<(PlaneKey, PyramidScale), Vec<TileId>> = BTreeMap::new();
+        let mut level_tiles: BTreeMap<(PlaneKey, PyramidScale), Vec<TileId>> = BTreeMap::new();
         let mut plane_bounds: BTreeMap<PlaneKey, SpatialRect> = BTreeMap::new();
 
         for (raw_id, tile) in index.tiles.iter().enumerate() {
@@ -597,12 +737,17 @@ impl TileQueryIndex {
                 .entry(indexed.plane)
                 .and_modify(|bounds| *bounds = bounds.union(indexed.logical_rect))
                 .or_insert(indexed.logical_rect);
-            levels
+            level_tiles
                 .entry((indexed.plane, indexed.scale))
                 .or_default()
                 .push(tile_id);
             tiles.push(indexed);
         }
+
+        let levels = level_tiles
+            .into_iter()
+            .map(|(key, tile_ids)| (key, LevelIndex::new(tile_ids, &tiles)))
+            .collect::<BTreeMap<_, _>>();
 
         let mut planes = BTreeMap::new();
         for (plane, world_bounds) in plane_bounds {
@@ -718,12 +863,13 @@ impl TileQueryIndex {
         let mut hits = self
             .levels
             .get(&(plane, scale))
+            .map(|level| level.query(viewport, &self.tiles))
+            .unwrap_or_default()
             .into_iter()
-            .flatten()
             .filter_map(|tile_id| {
                 let tile = self.tiles[tile_id.0];
                 viewport.intersects(tile.logical_rect).then_some(TileHit {
-                    tile_id: *tile_id,
+                    tile_id,
                     plane: tile.plane,
                     logical_rect: tile.logical_rect,
                     physical_stored_size: tile.physical_stored_size,
@@ -1001,6 +1147,12 @@ mod tests {
         let rect = SpatialRect::from_start_size(-10, -4, 10, 4).expect("rect");
         assert!(rect.intersects(SpatialRect::new(-1, -1, 1, 1).expect("rect")));
         assert!(!rect.intersects(SpatialRect::new(0, 0, 2, 2).expect("rect")));
+        assert!(!rect.intersects(SpatialRect::new(0, -2, 2, 1).expect("rect")));
+        assert!(
+            !SpatialRect::new(0, 0, 0, 10)
+                .expect("empty rect")
+                .intersects(rect)
+        );
         assert!(SpatialRect::new(1, 0, 0, 1).is_err());
         let extreme = SpatialRect::new(i64::MIN, i64::MIN, i64::MAX, i64::MAX).unwrap();
         assert_eq!(extreme.width(), u64::MAX);
@@ -1150,5 +1302,92 @@ mod tests {
             TileQueryIndex::new(&index(vec![tile(missing_y, PyramidType::None)])),
             Err(TileQueryError::MissingY { .. })
         ));
+    }
+
+    #[test]
+    fn bvh_matches_brute_force_for_irregular_negative_and_overlapping_tiles() {
+        let mut tiles = Vec::new();
+        for index in 0..160_i32 {
+            let scale_two = index % 2 == 0;
+            let logical = 8 + (index % 5) * 2;
+            let stored = if scale_two { logical / 2 } else { logical };
+            let x = (index % 19) * 17 - 160;
+            let y = (index % 23) * 13 - 140;
+            let mut dimensions = base(
+                x,
+                y,
+                u32::try_from(logical).expect("logical size"),
+                u32::try_from(stored).expect("stored size"),
+            );
+            if index % 3 != 0 {
+                dimensions.push(dimension(DimensionCode::M, index - 80, 1, 1));
+            }
+            tiles.push(tile(dimensions, PyramidType::None));
+        }
+        let query = TileQueryIndex::new(&index(tiles)).expect("geometry index");
+        let selector = PlaneSelector::default();
+
+        for scale in [
+            PyramidScale::new(1, 1).unwrap(),
+            PyramidScale::new(2, 1).unwrap(),
+        ] {
+            for query_number in 0..240_i64 {
+                let min_x = (query_number * 29) % 420 - 210;
+                let min_y = (query_number * 47) % 380 - 190;
+                let viewport = SpatialRect::from_start_size(
+                    min_x,
+                    min_y,
+                    u32::try_from(query_number % 41 + 1).expect("viewport width"),
+                    u32::try_from(query_number % 37 + 1).expect("viewport height"),
+                )
+                .expect("viewport");
+                let result = query
+                    .query_at_scale(selector, viewport, scale)
+                    .expect("indexed query");
+                assert_eq!(
+                    result.hits,
+                    brute_force_hits(&query, selector.key(), viewport, scale),
+                    "query {query_number} at scale {scale:?}"
+                );
+            }
+        }
+    }
+
+    fn brute_force_hits(
+        query: &TileQueryIndex,
+        plane: PlaneKey,
+        viewport: SpatialRect,
+        scale: PyramidScale,
+    ) -> Vec<TileHit> {
+        let mut hits = query
+            .tiles
+            .iter()
+            .enumerate()
+            .filter_map(|(raw_id, tile)| {
+                (tile.plane == plane
+                    && tile.scale == scale
+                    && viewport.intersects(tile.logical_rect))
+                .then_some(TileHit {
+                    tile_id: TileId(raw_id),
+                    plane: tile.plane,
+                    logical_rect: tile.logical_rect,
+                    physical_stored_size: tile.physical_stored_size,
+                    scale: tile.scale,
+                    m_index: tile.m_index,
+                    paint_order: 0,
+                })
+            })
+            .collect::<Vec<_>>();
+        hits.sort_unstable_by_key(|hit| {
+            (
+                hit.m_index.is_none(),
+                hit.m_index.unwrap_or_default(),
+                hit.tile_id,
+            )
+        });
+        for (paint_order, hit) in hits.iter_mut().enumerate() {
+            hit.paint_order = paint_order;
+        }
+        hits
     }
 }

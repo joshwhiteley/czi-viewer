@@ -20,7 +20,7 @@ signing = "ad-hoc"
 [dependencies]
 czi-core = { path = "../czi-core" }
 czi-ssh = { path = "../czi-ssh" }
-eframe = { version = "=0.32.3", default-features = false, features = ["wgpu", "default_fonts"] }
+eframe = { version = "=0.32.3", default-features = false, features = ["wgpu", "default_fonts", "accesskit"] }
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
 png = { version = "0.18", default-features = false }
 semver = "=1.0.28"

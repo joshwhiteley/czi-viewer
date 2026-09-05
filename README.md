@@ -26,8 +26,10 @@ Open large CZI mosaics, inspect channels and metadata, and save an annotated vie
 - Select observed channels, scenes, Z positions, and time points.
 - Name channels and show calibrated scale bars from CZI metadata.
 - Open local files or read-only remote files through system OpenSSH SFTP.
-- Build channel composites and save annotated PNG snapshots.
-- Automatically fit a reversible BaSiC flat-field preview from the full supported CZI acquisition with the bundled BaSiCPy helper.
+- Build channel composites with independent contrast/gamma, bounded raw preview histograms, and auto-contrast.
+- Prepare a reversible BaSiC flat-field preview on demand, or enable automatic preparation in Settings.
+- Use recent local files, keyboard shortcuts, view bookmarks, an overview map, and adjustable interface scaling.
+- Export through a native Save As dialog or copy the canvas to the clipboard.
 - Check authenticated GitHub preview releases daily and install a verified DMG only after user confirmation.
 
 ## Current limits

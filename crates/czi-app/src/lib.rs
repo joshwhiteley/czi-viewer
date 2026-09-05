@@ -6,7 +6,13 @@
 
 mod anyconnect_vpn;
 mod basic;
+mod channel_display;
 mod chooser;
+mod desktop;
+mod export;
+mod navigation;
+mod preferences;
+mod render;
 mod settings;
 mod update;
 
@@ -19,10 +25,10 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use czi_core::{
-    BlockCache, CziDataset, DecodedPixels, DecodedTile, DimensionCode, LocalFileSource,
-    MetadataDocument, MetadataParseOptions, MetadataSummary, PhysicalSize, PixelType, PlaneInfo,
-    PlaneKey, PlaneSelector, PyramidScale, SceneId, SpatialRect, TileHit, TileId, TileIndex,
-    TileQueryIndex, ViewQuery, summarize_metadata,
+    BlockCache, CziDataset, DimensionCode, LocalFileSource, MetadataDocument, MetadataParseOptions,
+    MetadataSummary, PhysicalSize, PixelType, PlaneInfo, PlaneKey, PlaneSelector, PyramidScale,
+    SceneId, SpatialRect, TileHit, TileId, TileIndex, TileQueryIndex, ViewQuery,
+    summarize_metadata,
 };
 use czi_ssh::{
     EmbeddedSshCancellation, HostKeyAlias, LoopbackEndpoint, OpenSshConfig, RemoteDirEntry,
@@ -737,6 +743,13 @@ fn accepts_open_result(
 }
 
 #[derive(Clone, Debug)]
+struct RenderConfig {
+    levels: Levels,
+    role: ChannelRole,
+    basic_profile: Option<basic::ChannelProfile>,
+}
+
+#[derive(Clone, Debug)]
 struct ViewRequest {
     source_generation: u64,
     view_generation: u64,
@@ -745,11 +758,13 @@ struct ViewRequest {
     prefetch_viewport: SpatialRect,
     target_downsample: f64,
     forced_scales: HashMap<PlaneKey, PyramidScale>,
+    render_configs: HashMap<PlaneKey, RenderConfig>,
     resident_tile_ids: Vec<TileId>,
 }
 
 type ViewRequestKey = (Vec<PlaneKey>, SpatialRect, u64);
 
+#[allow(clippy::large_enum_variant)]
 enum ViewSubmission {
     Sent,
     Pending(ViewRequest),
@@ -970,6 +985,7 @@ fn set_console_pump_error(snapshot: &Mutex<ConsolePumpSnapshot>, error: String) 
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum WorkerEvent {
     Opened {
         info: Box<DatasetInfo>,
@@ -1030,7 +1046,8 @@ enum WorkerEvent {
         scale: PyramidScale,
         paint_order: usize,
         prefetch: bool,
-        tile: DecodedTile,
+        image: egui::ColorImage,
+        lease: render::RenderLease,
         source_generation: u64,
         view_generation: u64,
     },
@@ -1038,6 +1055,8 @@ enum WorkerEvent {
         plane: PlaneKey,
         scale: PyramidScale,
         visible_tile_ids: Vec<TileId>,
+        raw_histogram: Option<channel_display::Histogram>,
+        raw_tiles_available: usize,
         source_generation: u64,
         view_generation: u64,
     },
@@ -1153,6 +1172,29 @@ enum TileDecodeResult {
     Failed,
 }
 
+#[derive(Default)]
+struct VisibleRawStats {
+    histogram: Option<channel_display::Histogram>,
+    available_tiles: usize,
+}
+
+impl VisibleRawStats {
+    fn add(&mut self, tile: &czi_core::DecodedTile) {
+        if self.available_tiles >= channel_display::MAX_TILES_PER_PLANE {
+            return;
+        }
+        let histogram = channel_display::Histogram::from_tile(tile);
+        if let Some(existing) = self.histogram.as_mut() {
+            if existing.merge(&histogram) {
+                self.available_tiles = self.available_tiles.saturating_add(1);
+            }
+        } else {
+            self.histogram = Some(histogram);
+            self.available_tiles = 1;
+        }
+    }
+}
+
 struct PlanePrefetch {
     hits: Vec<TileHit>,
 }
@@ -1219,11 +1261,17 @@ struct DatasetWorker {
     embedded_cancellation: EmbeddedCancellationSlot,
     vpn_cancellation: VpnCancellationSlot,
     basic_cancellation: BasicCancellationSlot,
+    render_budget: Arc<render::InFlightBudget>,
     join: Option<JoinHandle<()>>,
 }
 
 impl DatasetWorker {
+    #[cfg(test)]
     fn spawn() -> Self {
+        Self::spawn_with_repaint(None)
+    }
+
+    fn spawn_with_repaint(repaint: Option<egui::Context>) -> Self {
         let (commands, command_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let (event_tx, events) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let embedded_cancellation = EmbeddedCancellationSlot::default();
@@ -1231,6 +1279,8 @@ impl DatasetWorker {
         let vpn_cancellation = VpnCancellationSlot::default();
         let worker_vpn_cancellation = vpn_cancellation.clone();
         let basic_cancellation = BasicCancellationSlot::default();
+        let render_budget = render::InFlightBudget::new(render::RENDER_INFLIGHT_LIMIT);
+        let worker_render_budget = Arc::clone(&render_budget);
         let join = thread::Builder::new()
             .name(String::from("czi-dataset-worker"))
             .spawn(move || {
@@ -1239,6 +1289,8 @@ impl DatasetWorker {
                     &event_tx,
                     &worker_embedded_cancellation,
                     &worker_vpn_cancellation,
+                    &worker_render_budget,
+                    repaint.as_ref(),
                 );
             })
             .expect("start CZI dataset worker");
@@ -1248,6 +1300,7 @@ impl DatasetWorker {
             embedded_cancellation,
             vpn_cancellation,
             basic_cancellation,
+            render_budget,
             join: Some(join),
         }
     }
@@ -1274,6 +1327,7 @@ impl DatasetWorker {
         self.embedded_cancellation.cancel_active();
         self.vpn_cancellation.cancel_active();
         self.basic_cancellation.cancel_active();
+        self.render_budget.close();
         self.events.take();
         let commands = self.commands.take();
         if let Some(commands) = &commands {
@@ -1342,8 +1396,11 @@ fn worker_loop(
     events: &SyncSender<WorkerEvent>,
     embedded_cancellation: &EmbeddedCancellationSlot,
     vpn_cancellation: &VpnCancellationSlot,
+    render_budget: &Arc<render::InFlightBudget>,
+    repaint: Option<&egui::Context>,
 ) {
     let mut dataset = None;
+    let mut decoded_tiles = render::DecodedTileCache::new(render::DECODED_TILE_CACHE_LIMIT);
     let mut browse_session = None;
     let mut vpn_session = None;
     let mut active_source_generation = 0;
@@ -1352,6 +1409,9 @@ fn worker_loop(
     let mut basic_fits: Vec<BasicFitHandle> = Vec::new();
     let mut basic_waiting_for_viewport = false;
     loop {
+        if let Some(repaint) = repaint {
+            repaint.request_repaint();
+        }
         reap_basic_fits(&mut basic_fits);
         let command = match pending_commands.pop_front() {
             Some(command) => command,
@@ -1402,6 +1462,7 @@ fn worker_loop(
                 connection_generation,
             } => {
                 cancel_basic_jobs(&mut basic_sampling, &basic_fits);
+                decoded_tiles.clear();
                 active_source_generation = source_generation;
                 let remote = matches!(&locator, DatasetLocator::Remote { .. });
                 let connection = EmbeddedConnectionContext {
@@ -1477,6 +1538,7 @@ fn worker_loop(
             }
             WorkerCommand::ClearDataset => {
                 cancel_basic_jobs(&mut basic_sampling, &basic_fits);
+                decoded_tiles.clear();
                 dataset = None;
                 active_source_generation = 0;
             }
@@ -1493,9 +1555,15 @@ fn worker_loop(
                         break;
                     }
                 } else if let Some(opened) = dataset.as_ref() {
-                    if let Some(ViewInterruption { command, resume }) =
-                        process_view(commands, events, opened, &request)
-                    {
+                    if let Some(ViewInterruption { command, resume }) = process_view(
+                        commands,
+                        events,
+                        opened,
+                        &request,
+                        &mut decoded_tiles,
+                        render_budget,
+                        repaint,
+                    ) {
                         if let Some(resume) = resume {
                             pending_commands.push_front(WorkerCommand::View(resume));
                         }
@@ -2445,6 +2513,9 @@ fn process_view(
     events: &SyncSender<WorkerEvent>,
     opened: &WorkerDataset,
     request: &ViewRequest,
+    decoded_tiles: &mut render::DecodedTileCache,
+    render_budget: &Arc<render::InFlightBudget>,
+    repaint: Option<&egui::Context>,
 ) -> Option<ViewInterruption> {
     if let Some(newer) = take_newer_command(commands, request) {
         return Some(newer);
@@ -2458,6 +2529,9 @@ fn process_view(
             request,
             plane,
             prefetch_quota(index, plane_count, MAX_PREFETCH_TILES),
+            decoded_tiles,
+            render_budget,
+            repaint,
         )
     }) {
         VisiblePlanesOutcome::Complete(prefetch) => prefetch,
@@ -2470,11 +2544,22 @@ fn process_view(
         .copied()
         .collect::<HashSet<_>>();
     let prefetch = interleave_prefetch(prefetch_planes, MAX_PREFETCH_TILES);
-    let mut interruption =
-        match decode_tiles(commands, events, opened, request, &resident, prefetch, true) {
-            TileDecodeResult::Complete | TileDecodeResult::Failed => return None,
-            TileDecodeResult::Interrupted(interruption) => *interruption,
-        };
+    let mut interruption = match decode_tiles(
+        commands,
+        events,
+        opened,
+        request,
+        &resident,
+        prefetch,
+        true,
+        decoded_tiles,
+        render_budget,
+        None,
+        repaint,
+    ) {
+        TileDecodeResult::Complete | TileDecodeResult::Failed => return None,
+        TileDecodeResult::Interrupted(interruption) => *interruption,
+    };
     if interruption
         .resume
         .as_ref()
@@ -2502,6 +2587,7 @@ fn process_visible_planes(
     VisiblePlanesOutcome::Complete(prefetch)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_plane_view(
     commands: &Receiver<WorkerCommand>,
     events: &SyncSender<WorkerEvent>,
@@ -2509,6 +2595,9 @@ fn process_plane_view(
     request: &ViewRequest,
     plane: PlaneSelector,
     prefetch_limit: usize,
+    decoded_tiles: &mut render::DecodedTileCache,
+    render_budget: &Arc<render::InFlightBudget>,
+    repaint: Option<&egui::Context>,
 ) -> PlaneViewOutcome {
     let query = match worker_view_query(opened, request, plane, request.viewport) {
         Ok(query) => query,
@@ -2521,16 +2610,9 @@ fn process_plane_view(
             return PlaneViewOutcome::Failed;
         }
     };
-    let prefetch = match worker_view_query(opened, request, plane, request.prefetch_viewport) {
-        Ok(query) => query,
-        Err(message) => {
-            let _ = events.send(WorkerEvent::ViewFailed {
-                message,
-                source_generation: request.source_generation,
-                view_generation: request.view_generation,
-            });
-            return PlaneViewOutcome::Failed;
-        }
+    let prefetch_hits = match worker_view_query(opened, request, plane, request.prefetch_viewport) {
+        Ok(query) => query.hits,
+        Err(_) => Vec::new(),
     };
 
     let visible_tile_ids = query.hits.iter().map(|hit| hit.tile_id).collect::<Vec<_>>();
@@ -2542,6 +2624,7 @@ fn process_plane_view(
     let visible = visible_tile_ids.iter().copied().collect::<HashSet<_>>();
     let mut visible_decode = query.hits.clone();
     sort_center_first(&mut visible_decode, request.viewport);
+    let mut raw_stats = VisibleRawStats::default();
     match decode_tiles(
         commands,
         events,
@@ -2550,6 +2633,10 @@ fn process_plane_view(
         &resident,
         visible_decode,
         false,
+        decoded_tiles,
+        render_budget,
+        Some(&mut raw_stats),
+        repaint,
     ) {
         TileDecodeResult::Complete => {}
         TileDecodeResult::Interrupted(interruption) => {
@@ -2561,7 +2648,9 @@ fn process_plane_view(
         .send(WorkerEvent::ViewFinished {
             plane: query.plane,
             scale: query.scale,
-            visible_tile_ids,
+            visible_tile_ids: visible_tile_ids.clone(),
+            raw_histogram: raw_stats.histogram,
+            raw_tiles_available: raw_stats.available_tiles,
             source_generation: request.source_generation,
             view_generation: request.view_generation,
         })
@@ -2569,8 +2658,10 @@ fn process_plane_view(
     {
         return PlaneViewOutcome::Failed;
     }
-    let mut prefetch_decode = prefetch
-        .hits
+    if let Some(repaint) = repaint {
+        repaint.request_repaint();
+    }
+    let mut prefetch_decode = prefetch_hits
         .into_iter()
         .filter(|hit| !visible.contains(&hit.tile_id))
         .collect::<Vec<_>>();
@@ -2587,16 +2678,69 @@ fn worker_view_query(
     plane: PlaneSelector,
     viewport: SpatialRect,
 ) -> Result<czi_core::ViewQueryResult, String> {
-    if let Some(scale) = request.forced_scales.get(&plane.key()) {
+    let forced = request.forced_scales.get(&plane.key()).copied();
+    let initial = if let Some(scale) = forced {
         opened
             .query
-            .query_at_scale(plane, viewport, *scale)
-            .map_err(|error| error.to_string())
+            .query_at_scale(plane, viewport, scale)
+            .map_err(|error| error.to_string())?
     } else {
-        ViewQuery::new(plane, viewport, request.target_downsample)
-            .map_err(|error| error.to_string())
-            .and_then(|view| opened.query.query(&view).map_err(|error| error.to_string()))
+        let view = ViewQuery::new(plane, viewport, request.target_downsample)
+            .map_err(|error| error.to_string())?;
+        opened
+            .query
+            .query(&view)
+            .map_err(|error| error.to_string())?
+    };
+    let plane_budget = TEXTURE_CACHE_LIMIT / request.planes.len().max(1);
+    let plane_tile_limit = render::MAX_TEXTURE_TILES / request.planes.len().max(1);
+    if view_hits_fit_render_budget(&initial.hits, plane_budget, plane_tile_limit) {
+        return Ok(initial);
     }
+
+    // BaSiC profiles are verified against the forced scale. Do not silently apply one to a
+    // different, unverified representation merely because that representation is coarser.
+    if forced.is_some() {
+        return Err(format!(
+            "plane {plane} exceeds the render budget at its verified BaSiC level"
+        ));
+    }
+
+    // A very fine level can exceed practical GPU limits even when the CZI index is valid. Try
+    // progressively coarser indexed levels before failing the view; this keeps the canvas and
+    // export semantics explicit instead of silently dropping an oversized tile.
+    let scales = opened.query.scales(plane).unwrap_or(&[]);
+    for scale in scales
+        .iter()
+        .copied()
+        .filter(|scale| *scale > initial.scale)
+    {
+        let fallback = opened
+            .query
+            .query_at_scale(plane, viewport, scale)
+            .map_err(|error| error.to_string())?;
+        if view_hits_fit_render_budget(&fallback.hits, plane_budget, plane_tile_limit) {
+            return Ok(fallback);
+        }
+    }
+    Err(format!(
+        "plane {plane} has no renderable level (tile or visible working set exceeds {}-pixel, {}-byte, or {}-tile limit)",
+        render::MAX_TEXTURE_DIMENSION,
+        plane_budget,
+        plane_tile_limit
+    ))
+}
+
+fn view_hits_fit_render_budget(hits: &[TileHit], budget: usize, tile_limit: usize) -> bool {
+    hits.len() <= tile_limit
+        && hits
+            .iter()
+            .try_fold(0_usize, |total, hit| {
+                render::rendered_bytes_for_physical_size(hit.physical_stored_size)
+                    .ok()
+                    .and_then(|bytes| total.checked_add(bytes))
+            })
+            .is_some_and(|total| total <= budget)
 }
 
 fn prefetch_quota(index: usize, plane_count: usize, limit: usize) -> usize {
@@ -2627,6 +2771,7 @@ fn interleave_prefetch(planes: Vec<Vec<TileHit>>, limit: usize) -> Vec<TileHit> 
     hits
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn decode_tiles(
     commands: &Receiver<WorkerCommand>,
     events: &SyncSender<WorkerEvent>,
@@ -2635,17 +2780,85 @@ fn decode_tiles(
     resident: &HashSet<TileId>,
     hits: Vec<TileHit>,
     prefetch: bool,
+    decoded_tiles: &mut render::DecodedTileCache,
+    render_budget: &Arc<render::InFlightBudget>,
+    mut raw_stats: Option<&mut VisibleRawStats>,
+    repaint: Option<&egui::Context>,
 ) -> TileDecodeResult {
     for hit in hits {
         if resident.contains(&hit.tile_id) {
+            if let Some(tile) = decoded_tiles.get(hit.tile_id)
+                && let Some(raw_stats) = raw_stats.as_deref_mut()
+            {
+                raw_stats.add(tile.as_ref());
+            }
             continue;
         }
-        let tile = match opened.dataset.decoded_tile(hit.tile_id.index()) {
-            Ok(tile) => tile,
-            Err(_) if prefetch => continue,
+        if let Some(newer) = take_newer_command(commands, request) {
+            return TileDecodeResult::Interrupted(Box::new(newer));
+        }
+        let tile = match decoded_tiles.get(hit.tile_id) {
+            Some(tile) => tile,
+            None => match opened.dataset.decoded_tile(hit.tile_id.index()) {
+                Ok(tile) => {
+                    let tile = Arc::new(tile);
+                    let _ = decoded_tiles.insert(hit.tile_id, Arc::clone(&tile));
+                    tile
+                }
+                Err(_) if prefetch => continue,
+                Err(error) => {
+                    let _ = events.send(WorkerEvent::ViewFailed {
+                        message: format!("tile {}: {error}", hit.tile_id),
+                        source_generation: request.source_generation,
+                        view_generation: request.view_generation,
+                    });
+                    return TileDecodeResult::Failed;
+                }
+            },
+        };
+        if let Some(raw_stats) = raw_stats.as_deref_mut() {
+            raw_stats.add(tile.as_ref());
+        }
+        let Some(config) = request.render_configs.get(&hit.plane) else {
+            let _ = events.send(WorkerEvent::ViewFailed {
+                message: format!("missing render settings for plane {:?}", hit.plane),
+                source_generation: request.source_generation,
+                view_generation: request.view_generation,
+            });
+            return TileDecodeResult::Failed;
+        };
+        let profile = config.basic_profile.as_ref();
+        let image = match render::texture_image(tile.as_ref(), config.levels, config.role, profile)
+        {
+            Ok(image) => image,
+            Err(_error) if prefetch => continue,
             Err(error) => {
                 let _ = events.send(WorkerEvent::ViewFailed {
                     message: format!("tile {}: {error}", hit.tile_id),
+                    source_generation: request.source_generation,
+                    view_generation: request.view_generation,
+                });
+                return TileDecodeResult::Failed;
+            }
+        };
+        let bytes = match render::validate_image(&image) {
+            Ok(bytes) => bytes,
+            Err(_error) if prefetch => continue,
+            Err(error) => {
+                let _ = events.send(WorkerEvent::ViewFailed {
+                    message: format!("tile {}: {error}", hit.tile_id),
+                    source_generation: request.source_generation,
+                    view_generation: request.view_generation,
+                });
+                return TileDecodeResult::Failed;
+            }
+        };
+        let lease = match render_budget.reserve(bytes) {
+            Ok(lease) => lease,
+            Err(_error) if prefetch => continue,
+            Err(error) => {
+                let _ = events.send(WorkerEvent::ViewFailed {
+                    message: format!("tile {} cannot enter render queue: {error}", hit.tile_id),
                     source_generation: request.source_generation,
                     view_generation: request.view_generation,
                 });
@@ -2659,12 +2872,16 @@ fn decode_tiles(
             scale: hit.scale,
             paint_order: hit.paint_order,
             prefetch,
-            tile,
+            image,
+            lease,
             source_generation: request.source_generation,
             view_generation: request.view_generation,
         };
         if events.send(event).is_err() {
             return TileDecodeResult::Failed;
+        }
+        if let Some(repaint) = repaint {
+            repaint.request_repaint();
         }
         if let Some(newer) = take_newer_command(commands, request) {
             return TileDecodeResult::Interrupted(Box::new(newer));
@@ -2794,6 +3011,11 @@ impl ActivePlaneState {
 fn export_blocker(active: &ActivePlaneState, pyramid: &PyramidDisplay) -> Option<&'static str> {
     active
         .export_message()
+        .or_else(|| {
+            pyramid
+                .render_failed
+                .then_some("Rendering failed; choose a coarser view before exporting PNG.")
+        })
         .or_else(|| (!pyramid.is_ready()).then_some("Composite channels are still loading."))
 }
 
@@ -2990,6 +3212,7 @@ fn basic_scale_map_covers_planes(
 struct Levels {
     black: u16,
     white: u16,
+    gamma_milli: u16,
 }
 
 impl Levels {
@@ -3000,8 +3223,16 @@ impl Levels {
                 PixelType::Gray8 => u16::from(u8::MAX),
                 _ => u16::MAX,
             },
+            gamma_milli: 1_000,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct VisibleHistogram {
+    histogram: channel_display::Histogram,
+    available_tiles: usize,
+    expected_tiles: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3150,83 +3381,27 @@ fn select_requested_scale(scales: &[PyramidScale], target_downsample: f64) -> Op
     Some(selected)
 }
 
-fn display_intensity(value: u16, levels: Levels) -> u8 {
-    if value <= levels.black {
-        return 0;
-    }
-    if value >= levels.white {
-        return u8::MAX;
-    }
-    let span = u32::from(levels.white - levels.black);
-    let scaled = u32::from(value - levels.black) * u32::from(u8::MAX) / span;
-    u8::try_from(scaled).expect("scaled grayscale intensity fits in u8")
+fn display_intensity(value: u16, levels: Levels, gamma: &[u8; 256]) -> u8 {
+    let linear = if value <= levels.black {
+        0
+    } else if value >= levels.white {
+        u8::MAX
+    } else {
+        let span = u32::from(levels.white - levels.black);
+        let scaled = u32::from(value - levels.black) * u32::from(u8::MAX) / span;
+        u8::try_from(scaled).expect("scaled grayscale intensity fits in u8")
+    };
+    gamma[usize::from(linear)]
 }
 
+#[cfg(test)]
 fn texture_image(
-    tile: &DecodedTile,
+    tile: &czi_core::DecodedTile,
     levels: Levels,
     role: ChannelRole,
     basic_profile: Option<&basic::ChannelProfile>,
 ) -> Result<egui::ColorImage, &'static str> {
-    let width = usize::try_from(tile.width).map_err(|_| "tile width does not fit usize")?;
-    let height = usize::try_from(tile.height).map_err(|_| "tile height does not fit usize")?;
-    let pixel_count = width
-        .checked_mul(height)
-        .ok_or("tile dimensions overflow display size")?;
-    let mut grayscale = Vec::new();
-    grayscale
-        .try_reserve_exact(pixel_count)
-        .map_err(|_| "cannot allocate display grayscale buffer")?;
-    match &tile.pixels {
-        DecodedPixels::Gray8(values) if values.len() == pixel_count => {
-            grayscale.extend(values.iter().copied().enumerate().map(|(index, value)| {
-                let raw = u16::from(value);
-                let corrected = basic_profile
-                    .filter(|profile| profile.pixel_max == u16::from(u8::MAX))
-                    .map_or(raw, |profile| {
-                        basic::correct_value(
-                            raw,
-                            index % width,
-                            index / width,
-                            width,
-                            height,
-                            profile,
-                        )
-                    });
-                display_intensity(corrected, levels)
-            }));
-        }
-        DecodedPixels::Gray16(values) if values.len() == pixel_count => {
-            grayscale.extend(values.iter().copied().enumerate().map(|(index, raw)| {
-                let corrected = basic_profile
-                    .filter(|profile| profile.pixel_max == u16::MAX)
-                    .map_or(raw, |profile| {
-                        basic::correct_value(
-                            raw,
-                            index % width,
-                            index / width,
-                            width,
-                            height,
-                            profile,
-                        )
-                    });
-                display_intensity(corrected, levels)
-            }));
-        }
-        _ => return Err("decoded pixel count does not match the tile dimensions"),
-    }
-    let pixels = grayscale
-        .into_iter()
-        .map(|value| match role {
-            ChannelRole::Off => egui::Color32::TRANSPARENT,
-            ChannelRole::Gray => egui::Color32::from_gray(value),
-            ChannelRole::Red | ChannelRole::Green | ChannelRole::Blue => {
-                let [red, green, blue] = blend_channel([0; 3], value, role);
-                egui::Color32::from_rgba_premultiplied(red, green, blue, value)
-            }
-        })
-        .collect();
-    Ok(egui::ColorImage::new([width, height], pixels))
+    render::texture_image(tile, levels, role, basic_profile)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -3282,12 +3457,23 @@ impl TextureCache {
         self.evict_non_visible();
     }
 
-    fn begin_view(&mut self, source_generation: u64, planes: &[PlaneKey]) -> Vec<TileId> {
+    fn begin_view(
+        &mut self,
+        source_generation: u64,
+        planes: &[PlaneKey],
+        viewport: SpatialRect,
+    ) -> Vec<TileId> {
+        // Pin fallback/resident tiles inside the new viewport, not every tile ever visited in
+        // these planes. Otherwise a full cache cannot admit new tiles after a pan.
         self.protected = self
             .entries
-            .keys()
-            .filter(|key| key.source_generation == source_generation && planes.contains(&key.plane))
-            .copied()
+            .iter()
+            .filter(|(key, entry)| {
+                key.source_generation == source_generation
+                    && planes.contains(&key.plane)
+                    && entry.logical_rect.intersects(viewport)
+            })
+            .map(|(key, _)| *key)
             .collect();
         for entry in self.entries.values_mut() {
             entry.visible = false;
@@ -3305,6 +3491,7 @@ impl TextureCache {
             .collect()
     }
 
+    #[cfg(test)]
     fn insert(
         &mut self,
         key: TextureKey,
@@ -3312,12 +3499,66 @@ impl TextureCache {
         bytes: usize,
         hit: TileHit,
         visible: bool,
-    ) {
+    ) -> Result<(), &'static str> {
+        self.prepare_insert(key, bytes)?;
+        self.commit_insert(key, texture, bytes, hit, visible);
+        Ok(())
+    }
+
+    /// Evict old entries before a backend texture is allocated. This keeps the aggregate cache
+    /// budget firm even during a GPU upload.
+    fn prepare_insert(&mut self, key: TextureKey, bytes: usize) -> Result<(), &'static str> {
+        if bytes > self.budget {
+            return Err("texture exceeds the aggregate GPU cache budget");
+        }
         self.clock = self.clock.wrapping_add(1);
-        if let Some(previous) = self.entries.remove(&key) {
+        let previous = self.entries.remove(&key);
+        if let Some(previous) = &previous {
             self.bytes = self.bytes.saturating_sub(previous.bytes);
         }
-        self.bytes = self.bytes.saturating_add(bytes);
+        while self
+            .bytes
+            .checked_add(bytes)
+            .is_none_or(|total| total > self.budget)
+            || self.entries.len() >= render::MAX_TEXTURE_TILES
+        {
+            let candidate = self
+                .entries
+                .iter()
+                .filter(|(candidate, entry)| !entry.visible && !self.protected.contains(candidate))
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(candidate, _)| *candidate);
+            let Some(candidate) = candidate else {
+                if let Some(previous) = previous {
+                    self.bytes = self.bytes.saturating_add(previous.bytes);
+                    self.entries.insert(key, previous);
+                }
+                return Err("texture cache budget is full of visible tiles");
+            };
+            if let Some(entry) = self.entries.remove(&candidate) {
+                self.bytes = self.bytes.saturating_sub(entry.bytes);
+            }
+        }
+        Ok(())
+    }
+
+    fn commit_insert(
+        &mut self,
+        key: TextureKey,
+        texture: egui::TextureHandle,
+        bytes: usize,
+        hit: TileHit,
+        visible: bool,
+    ) {
+        debug_assert!(
+            self.bytes
+                .checked_add(bytes)
+                .is_some_and(|total| total <= self.budget)
+        );
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .expect("texture cache admission checked byte count");
         self.entries.insert(
             key,
             TextureEntry {
@@ -3329,7 +3570,6 @@ impl TextureCache {
                 paint_order: hit.paint_order,
             },
         );
-        self.evict_non_visible();
     }
 
     fn finish_view(&mut self, source_generation: u64, plane: PlaneKey, visible: &[TileId]) {
@@ -3407,7 +3647,8 @@ struct PendingTile {
     scale: PyramidScale,
     paint_order: usize,
     prefetch: bool,
-    tile: DecodedTile,
+    image: egui::ColorImage,
+    lease: render::RenderLease,
     source_generation: u64,
     view_generation: u64,
 }
@@ -3418,6 +3659,7 @@ struct PyramidDisplay {
     expected: HashMap<PlaneKey, PyramidScale>,
     completed: HashMap<PlaneKey, PyramidScale>,
     displayed: HashMap<PlaneKey, PyramidScale>,
+    render_failed: bool,
 }
 
 impl PyramidDisplay {
@@ -3425,7 +3667,12 @@ impl PyramidDisplay {
         *self = Self::default();
     }
 
+    fn fail(&mut self) {
+        self.render_failed = true;
+    }
+
     fn request(&mut self, view_generation: u64, requested: HashMap<PlaneKey, PyramidScale>) {
+        self.render_failed = false;
         self.view_generation = Some(view_generation);
         self.displayed
             .retain(|plane, _| requested.contains_key(plane));
@@ -3505,7 +3752,7 @@ fn apply_view_finished(
     pyramid: &mut PyramidDisplay,
     cache: &mut TextureCache,
     active_state: &ActivePlaneState,
-    active_planes: &[PlaneKey],
+    _active_planes: &[PlaneKey],
     source_generation: u64,
     view_generation: u64,
     plane: PlaneKey,
@@ -3521,8 +3768,6 @@ fn apply_view_finished(
         visible_tile_ids,
     );
     cache.finish_view(source_generation, plane, &visible_tiles[&plane]);
-    let (visible, resident, bytes) =
-        cache.current_counts_for_planes(source_generation, active_planes);
     let (completed, expected) = pyramid.completion_counts();
     let progress = if !pyramid.is_ready() {
         format!("Loading channels {completed}/{expected}")
@@ -3532,10 +3777,9 @@ fn apply_view_finished(
         String::from("Ready")
     };
     Status::normal(format!(
-        "{progress} · Requested {}× · Displayed {}× · {visible} visible · {resident} resident · {} cache",
+        "{progress} · Requested {}× · Displayed {}×",
         format_scale_summary(pyramid.requested_summary()),
         format_scale_summary(pyramid.displayed_summary()),
-        format_bytes(bytes),
     ))
 }
 
@@ -3578,8 +3822,15 @@ struct SnapshotRegion {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::struct_excessive_bools)] // Frozen export options and two capture lifecycle flags.
 struct SnapshotRequest {
     generation: u64,
+    source_generation: u64,
+    view_generation: u64,
+    copy_to_clipboard: bool,
+    include_annotations: bool,
+    capture_sent: bool,
+    started_at: std::time::Instant,
     region: SnapshotRegion,
     armed_frame: u64,
     region_frozen: bool,
@@ -3587,6 +3838,7 @@ struct SnapshotRequest {
 }
 
 enum SnapshotWriteResult {
+    Cancelled { generation: u64 },
     Saved { generation: u64, path: PathBuf },
     Failed { generation: u64, message: String },
 }
@@ -3649,6 +3901,7 @@ fn reuses_remote_connection(
 /// The local and SSH CZI mosaic viewer.
 #[allow(clippy::struct_excessive_bools)]
 pub struct ViewerApp {
+    desktop: desktop::DesktopState,
     worker: DatasetWorker,
     update_worker: update::UpdateWorker,
     available_update: Option<update::VerifiedUpdate>,
@@ -3681,6 +3934,7 @@ pub struct ViewerApp {
     authentication_focus_request: Option<u64>,
     inspector_tab: InspectorTab,
     display_mode: DisplayMode,
+    display_channel: i32,
     channel_roles: HashMap<i32, ChannelRole>,
     metadata_filter: String,
     dataset: Option<DatasetInfo>,
@@ -3691,9 +3945,11 @@ pub struct ViewerApp {
     status: Status,
     cache: TextureCache,
     pending_tiles: Vec<PendingTile>,
+    pending_render_bytes: usize,
     visible_tile_ids: HashMap<PlaneKey, Vec<TileId>>,
+    visible_histograms: HashMap<PlaneKey, VisibleHistogram>,
     pyramid_display: PyramidDisplay,
-    levels: Levels,
+    channel_levels: HashMap<i32, Levels>,
     basic_preview: BasicPreviewState,
     camera: Camera,
     fit_pending: bool,
@@ -3715,12 +3971,13 @@ pub struct ViewerApp {
 impl ViewerApp {
     /// Create the viewer state and its dedicated dataset worker.
     #[must_use]
-    pub fn new(_creation_context: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
         let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
         let update_install_target = update::current_application_bundle();
         let (snapshot_write_sender, snapshot_write_results) = mpsc::channel();
         let mut app = Self {
-            worker: DatasetWorker::spawn(),
+            desktop: desktop::DesktopState::new(creation_context.egui_ctx.clone()),
+            worker: DatasetWorker::spawn_with_repaint(Some(creation_context.egui_ctx.clone())),
             update_worker: update::UpdateWorker::spawn(),
             available_update: None,
             update_activity: UpdateActivity::Idle,
@@ -3754,6 +4011,7 @@ impl ViewerApp {
             authentication_focus_request: None,
             inspector_tab: InspectorTab::Display,
             display_mode: DisplayMode::Single,
+            display_channel: 0,
             channel_roles: HashMap::new(),
             metadata_filter: String::new(),
             dataset: None,
@@ -3764,9 +4022,11 @@ impl ViewerApp {
             status: Status::normal("Choose Local or SSH, then open a .czi file."),
             cache: TextureCache::new(TEXTURE_CACHE_LIMIT),
             pending_tiles: Vec::new(),
+            pending_render_bytes: 0,
             visible_tile_ids: HashMap::new(),
+            visible_histograms: HashMap::new(),
             pyramid_display: PyramidDisplay::default(),
-            levels: Levels::default_for(PixelType::Gray16),
+            channel_levels: HashMap::new(),
             basic_preview: BasicPreviewState::default(),
             camera: Camera::default(),
             fit_pending: false,
@@ -3793,7 +4053,10 @@ impl ViewerApp {
     fn invalidate_view(&mut self) {
         self.generations.begin_view();
         self.clear_pending_view();
+        self.pending_tiles.clear();
+        self.pending_render_bytes = 0;
         self.visible_tile_ids.clear();
+        self.visible_histograms.clear();
         self.pyramid_display.clear();
         self.cache.clear_visibility();
     }
@@ -4167,6 +4430,13 @@ impl ViewerApp {
         {
             return;
         }
+        self.close_dataset();
+    }
+
+    fn close_dataset(&mut self) {
+        self.desktop.bookmarks.clear();
+        self.desktop.opening_local = None;
+        self.pending_snapshot = None;
         self.worker.basic_cancellation.cancel_active();
         self.generations.begin_source();
         self.dataset = None;
@@ -4279,6 +4549,13 @@ impl ViewerApp {
     }
 
     fn open_locator(&mut self, locator: DatasetLocator) {
+        self.desktop.bookmarks.clear();
+        self.desktop.opening_local = match &locator {
+            DatasetLocator::Local(path) if path.is_absolute() => Some(path.clone()),
+            DatasetLocator::Local(path) => std::env::current_dir().ok().map(|cwd| cwd.join(path)),
+            DatasetLocator::Remote { .. } => None,
+        };
+        self.pending_snapshot = None;
         let origin = if matches!(&locator, DatasetLocator::Remote { .. }) {
             DatasetOrigin::Remote
         } else {
@@ -4473,7 +4750,27 @@ impl ViewerApp {
     }
 
     fn export_unavailable_message(&self) -> Option<&'static str> {
-        export_blocker(&self.active_plane_state(), &self.pyramid_display)
+        export_blocker(&self.active_plane_state(), &self.pyramid_display).or_else(|| {
+            (!self.visible_textures_ready())
+                .then_some("Rendered channels are still being uploaded.")
+        })
+    }
+
+    fn visible_textures_ready(&self) -> bool {
+        let active = self.active_planes();
+        active.iter().all(|plane| {
+            self.visible_tile_ids
+                .get(&plane.key())
+                .into_iter()
+                .flatten()
+                .all(|tile_id| {
+                    self.cache.entries.contains_key(&TextureKey {
+                        source_generation: self.generations.source,
+                        plane: plane.key(),
+                        tile_id: *tile_id,
+                    })
+                })
+        })
     }
 
     fn missing_assignment_label(&self) -> Option<String> {
@@ -4624,6 +4921,28 @@ impl ViewerApp {
             .and_then(|profiles| profiles.channels.get(&plane.c))
     }
 
+    fn levels_for_channel(&self, channel: i32, pixel_type: PixelType) -> Levels {
+        self.channel_levels
+            .get(&channel)
+            .copied()
+            .unwrap_or_else(|| Levels::default_for(pixel_type))
+    }
+
+    fn levels_for_display_channel_mut(&mut self, pixel_type: PixelType) -> &mut Levels {
+        self.channel_levels
+            .entry(self.display_channel)
+            .or_insert_with(|| Levels::default_for(pixel_type))
+    }
+
+    fn visible_histogram_plane(&self) -> PlaneKey {
+        PlaneKey::new(
+            self.display_channel,
+            self.selection.scene,
+            self.selection.z,
+            self.selection.t,
+        )
+    }
+
     fn active_cache_counts(&self, source_generation: u64) -> (usize, usize, usize) {
         let planes = self
             .active_planes()
@@ -4642,11 +4961,7 @@ impl ViewerApp {
     }
 
     fn request_view(&mut self, viewport: SpatialRect) {
-        let Some(bounds) = self.dataset.as_ref().and_then(|dataset| {
-            dataset
-                .plane(self.selection)
-                .map(|plane| plane.world_bounds)
-        }) else {
+        let Some(bounds) = self.active_world_bounds() else {
             return;
         };
         let planes = self.active_planes();
@@ -4690,9 +5005,31 @@ impl ViewerApp {
                     .map(|scale| (plane.key(), scale))
             })
             .collect::<HashMap<_, _>>();
+        let pixel_type = self
+            .dataset
+            .as_ref()
+            .map_or(PixelType::Gray16, |dataset| dataset.pixel_type);
+        let render_configs = planes
+            .iter()
+            .map(|plane| {
+                let key = plane.key();
+                let scale = requested_scales.get(&key).copied();
+                (
+                    key,
+                    RenderConfig {
+                        levels: self.levels_for_channel(key.c, pixel_type),
+                        role: self.role_for_plane(key),
+                        basic_profile: scale
+                            .and_then(|scale| self.basic_profile(key, scale).cloned()),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
         self.pyramid_display
             .request(view_generation, requested_scales);
-        let resident_tile_ids = self.cache.begin_view(self.generations.source, &plane_keys);
+        let resident_tile_ids =
+            self.cache
+                .begin_view(self.generations.source, &plane_keys, viewport);
         let request = ViewRequest {
             source_generation: self.generations.source,
             view_generation,
@@ -4701,6 +5038,7 @@ impl ViewerApp {
             prefetch_viewport: prefetch_viewport(viewport, bounds),
             target_downsample,
             forced_scales,
+            render_configs,
             resident_tile_ids,
         };
         self.last_request = Some(request_key.clone());
@@ -4736,6 +5074,7 @@ impl ViewerApp {
                 {
                     self.snapshot_writing = None;
                     self.status = Status::normal(format!("Saved PNG: {}", path.display()));
+                    self.desktop.last_export = Some(path);
                 }
                 Ok(SnapshotWriteResult::Failed {
                     generation,
@@ -4744,7 +5083,17 @@ impl ViewerApp {
                     self.snapshot_writing = None;
                     self.status = Status::error(message);
                 }
-                Ok(SnapshotWriteResult::Saved { .. } | SnapshotWriteResult::Failed { .. }) => {}
+                Ok(SnapshotWriteResult::Cancelled { generation })
+                    if self.snapshot_writing == Some(generation) =>
+                {
+                    self.snapshot_writing = None;
+                    self.status = Status::normal("Export cancelled.");
+                }
+                Ok(
+                    SnapshotWriteResult::Saved { .. }
+                    | SnapshotWriteResult::Failed { .. }
+                    | SnapshotWriteResult::Cancelled { .. },
+                ) => {}
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
         }
@@ -4801,16 +5150,57 @@ impl ViewerApp {
         );
         let request = SnapshotRequest {
             generation: self.snapshot_generation,
+            source_generation: self.generations.source,
+            view_generation: self.generations.view,
+            copy_to_clipboard: std::mem::take(&mut self.desktop.copy_snapshot),
+            include_annotations: self.desktop.preferences.export_annotations
+                || self.basic_preview.on,
+            capture_sent: false,
+            started_at: std::time::Instant::now(),
             region,
             armed_frame: self.ui_frame,
             region_frozen: false,
             filename,
         };
-        context.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
-            request.generation,
-        )));
         self.pending_snapshot = Some(request);
-        self.status = Status::normal("Capturing annotated canvas PNG…");
+        self.status = Status::normal("Capturing canvas…");
+        context.request_repaint();
+    }
+
+    fn arm_snapshot(&mut self, context: &egui::Context) {
+        let Some(request) = &self.pending_snapshot else {
+            return;
+        };
+        if request.started_at.elapsed() > Duration::from_secs(10) {
+            self.pending_snapshot = None;
+            self.status = Status::error("Canvas capture timed out. Please retry the export.");
+            return;
+        }
+        if !self
+            .generations
+            .accepts_view(request.source_generation, request.view_generation)
+            || self.export_unavailable_message().is_some()
+            || (request.region_frozen
+                && !snapshot_geometry_matches(request.region, self.snapshot_region))
+        {
+            self.pending_snapshot = None;
+            self.status =
+                Status::error("The view changed before capture. Export again when it is ready.");
+            return;
+        }
+        let request = self
+            .pending_snapshot
+            .as_mut()
+            .expect("snapshot checked above");
+        // Wait until the next frame so menus and navigation overlays are not photographed.
+        if !request.capture_sent && self.ui_frame > request.armed_frame && request.region_frozen {
+            context.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
+                request.generation,
+            )));
+            request.capture_sent = true;
+        } else if !request.capture_sent {
+            context.request_repaint();
+        }
     }
 
     fn handle_screenshot(&mut self, generation: u64, image: Arc<egui::ColorImage>) {
@@ -4818,30 +5208,59 @@ impl ViewerApp {
         else {
             return;
         };
+        if !self
+            .generations
+            .accepts_view(request.source_generation, request.view_generation)
+            || self.export_unavailable_message().is_some()
+            || !snapshot_geometry_matches(request.region, self.snapshot_region)
+        {
+            self.status = Status::error(
+                "The view or window layout changed during capture. Export again when it is ready.",
+            );
+            return;
+        }
         let Some(crop) = screenshot_crop_bounds(image.size, request.region) else {
             self.status = Status::error("The canvas snapshot area was outside the screenshot.");
             return;
         };
+        if request.copy_to_clipboard {
+            let rgba = crop_screenshot_rgba(&image, crop);
+            self.desktop
+                .context
+                .copy_image(egui::ColorImage::from_rgba_unmultiplied(
+                    [crop.width, crop.height],
+                    &rgba,
+                ));
+            self.status = Status::normal("Canvas sent to clipboard.");
+            return;
+        }
         let sender = self.snapshot_write_sender.clone();
-        let filename = request.filename;
+        let filename =
+            snapshot_output_filename_with_sequence(&request.filename, unix_timestamp(), 0);
+        let context = self.desktop.context.clone();
         self.snapshot_writing = Some(request.generation);
-        self.status = Status::normal("Writing PNG snapshot…");
+        self.status = Status::normal("Choose a PNG destination…");
         if thread::Builder::new()
             .name(String::from("czi-png-writer"))
             .spawn(move || {
                 let rgba = crop_screenshot_rgba(&image, crop);
-                let result = write_png_snapshot(&filename, crop.width, crop.height, &rgba)
-                    .map_or_else(
-                        |message| SnapshotWriteResult::Failed {
-                            generation: request.generation,
-                            message,
-                        },
-                        |path| SnapshotWriteResult::Saved {
-                            generation: request.generation,
-                            path,
-                        },
-                    );
+                let saved = encode_png_rgba(crop.width, crop.height, &rgba)
+                    .and_then(|png| export::save_png(&filename, &png));
+                let result = match saved {
+                    Ok(Some(path)) => SnapshotWriteResult::Saved {
+                        generation: request.generation,
+                        path,
+                    },
+                    Ok(None) => SnapshotWriteResult::Cancelled {
+                        generation: request.generation,
+                    },
+                    Err(message) => SnapshotWriteResult::Failed {
+                        generation: request.generation,
+                        message,
+                    },
+                };
                 let _ = sender.send(result);
+                context.request_repaint();
             })
             .is_err()
         {
@@ -4873,9 +5292,11 @@ impl ViewerApp {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn show_display_inspector(&mut self, ui: &mut egui::Ui) {
         let before_selection = self.selection;
         let before_mode = self.display_mode;
+        let before_bounds = self.active_world_bounds();
         ui.horizontal(|ui| {
             ui.label("Mode");
             ui.selectable_value(&mut self.display_mode, DisplayMode::Single, "Single");
@@ -4892,12 +5313,19 @@ impl ViewerApp {
                     &mut self.selection.c,
                 )
             } else {
-                composite_channel_assignments(
+                let changed = composite_channel_assignments(
                     ui,
                     &dataset.c,
                     &dataset.metadata_summary,
                     &mut self.channel_roles,
-                )
+                );
+                display_channel_selector(
+                    ui,
+                    &dataset.c,
+                    &dataset.metadata_summary,
+                    &mut self.display_channel,
+                );
+                changed
             };
             channel_changed
                 | scene_selector(ui, &dataset.s, &mut self.selection.scene)
@@ -4920,17 +5348,12 @@ impl ViewerApp {
                 true
             };
             if let Some(dataset) = self.dataset.as_ref() {
-                let previous_bounds = dataset
-                    .plane(before_selection)
-                    .map(|plane| plane.world_bounds);
                 self.selection = dataset.repair_selection(self.selection, changed);
-                let next_bounds = dataset
-                    .plane(self.selection)
-                    .map(|plane| plane.world_bounds);
-                if preserve_channel_fov {
-                    if let (Some(previous), Some(next)) = (previous_bounds, next_bounds) {
-                        self.camera.rebase_bounds(previous, next);
-                    }
+            }
+            let next_bounds = self.active_world_bounds();
+            if preserve_channel_fov {
+                if let (Some(previous), Some(next)) = (before_bounds, next_bounds) {
+                    self.camera.rebase_bounds(previous, next);
                 }
             }
             self.cache.clear();
@@ -4940,6 +5363,9 @@ impl ViewerApp {
             }
         }
 
+        if self.display_mode == DisplayMode::Single {
+            self.display_channel = self.selection.c;
+        }
         if let Some(missing) = self.missing_assignment_label() {
             ui.colored_label(egui::Color32::YELLOW, missing);
         }
@@ -4950,28 +5376,81 @@ impl ViewerApp {
             .dataset
             .as_ref()
             .map_or(PixelType::Gray16, |dataset| dataset.pixel_type);
-        if level_selector(ui, pixel_type, &mut self.levels) {
+        let levels_changed = {
+            let levels = self.levels_for_display_channel_mut(pixel_type);
+            level_selector(ui, pixel_type, levels)
+        };
+        if levels_changed {
+            self.cache.clear();
+            self.invalidate_view();
+        }
+        let display_plane = self.visible_histogram_plane();
+        if self.show_visible_histogram(ui, display_plane, pixel_type) {
             self.cache.clear();
             self.invalidate_view();
         }
         show_pyramid_summary(ui, &self.pyramid_display);
         self.show_basic_preview(ui);
-        if let Some(dataset) = self.dataset.as_ref() {
-            let (visible, resident, bytes) = self.active_cache_counts(self.generations.source);
-            ui.label(format!(
-                "Visible: {visible} · Resident: {resident} · Cache: {}",
-                format_bytes(bytes)
-            ));
-            if let Some(plane) = dataset.plane(self.selection) {
+        ui.collapsing("Technical details", |ui| {
+            if let Some(dataset) = self.dataset.as_ref() {
+                let (visible, resident, bytes) = self.active_cache_counts(self.generations.source);
                 ui.label(format!(
-                    "World bounds: [{}, {})..[{}, {})",
-                    plane.world_bounds.min_x,
-                    plane.world_bounds.min_y,
-                    plane.world_bounds.max_x,
-                    plane.world_bounds.max_y
+                    "Visible: {visible} · Resident: {resident} · Cache: {}",
+                    format_bytes(bytes)
                 ));
+                if let Some(plane) = dataset.plane(self.selection) {
+                    ui.label(format!(
+                        "World bounds: [{}, {})..[{}, {})",
+                        plane.world_bounds.min_x,
+                        plane.world_bounds.min_y,
+                        plane.world_bounds.max_x,
+                        plane.world_bounds.max_y
+                    ));
+                }
             }
+        });
+    }
+
+    fn show_visible_histogram(
+        &mut self,
+        ui: &mut egui::Ui,
+        plane: PlaneKey,
+        pixel_type: PixelType,
+    ) -> bool {
+        let Some(summary) = self.visible_histograms.get(&plane) else {
+            ui.weak("Raw histogram unavailable: no decoded visible tiles yet.");
+            return false;
+        };
+        let samples = summary.histogram.sample_count();
+        ui.weak(format!(
+            "Raw preview · {samples} samples · {}/{} tiles",
+            summary.available_tiles, summary.expected_tiles
+        )).on_hover_text(format!(
+            "Up to {} raw tiles per plane and {} samples per tile. Not whole-image or quantitative statistics. BaSiC correction is not included.",
+            channel_display::MAX_TILES_PER_PLANE, channel_display::MAX_SAMPLES_PER_TILE
+        ));
+        show_histogram_bars(ui, &summary.histogram);
+        let auto_range = summary.histogram.auto_range();
+        let enabled = auto_range.is_some();
+        let clicked = ui
+            .add_enabled(
+                enabled,
+                egui::Button::new("Auto Contrast (visible preview)"),
+            )
+            .clicked();
+        let Some((black, white)) = auto_range.filter(|_| clicked) else {
+            return false;
+        };
+        let levels = self.levels_for_display_channel_mut(pixel_type);
+        if levels.black == black && levels.white == white {
+            return false;
         }
+        levels.black = black;
+        levels.white = white;
+        self.status = Status::normal(format!(
+            "Auto Contrast applied to the bounded visible preview: {black}–{white}."
+        ));
+        true
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4979,7 +5458,7 @@ impl ViewerApp {
         ui.separator();
         ui.heading("BaSiC preview");
         ui.weak(
-            "Automatically fitted from the full supported CZI acquisition. Reversible display preview only; the CZI is never modified.",
+            "Prepare on demand from the full supported acquisition. Reversible display preview only; the CZI is never modified.",
         );
         ui.collapsing("Advanced", |ui| {
             ui.weak("Override the bundled BaSiCPy helper for testing or custom deployments.");
@@ -5027,7 +5506,7 @@ impl ViewerApp {
             if self.basic_preview.is_busy() {
                 cancel = ui.button("Cancel").clicked();
             } else {
-                let label = if ready { "Refit" } else { "Retry fit" };
+                let label = if ready { "Refit" } else { "Prepare BaSiC" };
                 prepare = ui
                     .add_enabled(self.dataset.is_some(), egui::Button::new(label))
                     .clicked();
@@ -5052,7 +5531,7 @@ impl ViewerApp {
         }
         match self.basic_preview.phase {
             BasicPhase::Idle => {
-                ui.weak("Open a CZI to fit its profile automatically.");
+                ui.weak("Select Prepare BaSiC when needed. Automatic preparation is available in Settings.");
             }
             BasicPhase::Sampling => {
                 ui.horizontal(|ui| {
@@ -5394,7 +5873,8 @@ impl ViewerApp {
                 scale,
                 paint_order,
                 prefetch,
-                tile,
+                image,
+                lease,
                 source_generation,
                 view_generation,
             } if self
@@ -5405,6 +5885,28 @@ impl ViewerApp {
                     .iter()
                     .any(|active| active.key() == plane) =>
             {
+                let bytes = match render::validate_image(&image) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        drop(lease);
+                        self.pyramid_display.fail();
+                        self.status = Status::error(error);
+                        return;
+                    }
+                };
+                if self
+                    .pending_render_bytes
+                    .checked_add(bytes)
+                    .is_none_or(|total| total > render::RENDER_INFLIGHT_LIMIT)
+                {
+                    drop(lease);
+                    self.pyramid_display.fail();
+                    self.status = Status::error(
+                        "Rendered tile queue exceeded its memory budget; view was stopped.",
+                    );
+                    return;
+                }
+                self.pending_render_bytes += bytes;
                 self.pending_tiles.push(PendingTile {
                     tile_id,
                     plane,
@@ -5412,7 +5914,8 @@ impl ViewerApp {
                     scale,
                     paint_order,
                     prefetch,
-                    tile,
+                    image,
+                    lease,
                     source_generation,
                     view_generation,
                 });
@@ -5421,6 +5924,8 @@ impl ViewerApp {
                 plane,
                 scale,
                 visible_tile_ids,
+                raw_histogram,
+                raw_tiles_available,
                 source_generation,
                 view_generation,
             } if self
@@ -5431,6 +5936,18 @@ impl ViewerApp {
                     .iter()
                     .any(|active| active.key() == plane) =>
             {
+                if let Some(histogram) = raw_histogram {
+                    self.visible_histograms.insert(
+                        plane,
+                        VisibleHistogram {
+                            histogram,
+                            available_tiles: raw_tiles_available,
+                            expected_tiles: visible_tile_ids.len(),
+                        },
+                    );
+                } else {
+                    self.visible_histograms.remove(&plane);
+                }
                 let active_state = self.active_plane_state();
                 let active_planes = match &active_state {
                     ActivePlaneState::Active(planes)
@@ -5463,6 +5980,7 @@ impl ViewerApp {
                 .generations
                 .accepts_view(source_generation, view_generation) =>
             {
+                self.pyramid_display.fail();
                 self.status = Status::error(message);
             }
             WorkerEvent::BasicPlanned {
@@ -5594,8 +6112,10 @@ impl ViewerApp {
             return;
         }
         self.selection = info.default_selection();
+        self.display_channel = self.selection.c;
+        self.channel_levels.clear();
+        self.visible_histograms.clear();
         self.channel_roles = default_channel_roles(&info.c, &info.metadata_summary);
-        self.levels = Levels::default_for(info.pixel_type);
         self.status = Status::normal(format!(
             "Indexed {} tile(s); choose a plane or view the mosaic.",
             info.tile_count
@@ -5614,7 +6134,12 @@ impl ViewerApp {
         self.fit_pending = true;
         self.basic_preview.reset();
         self.invalidate_view();
-        self.prepare_basic_preview();
+        if !remote && let Some(path) = self.desktop.opening_local.take() {
+            self.desktop.remember_local(path);
+        }
+        if self.desktop.preferences.automatic_basic {
+            self.prepare_basic_preview();
+        }
     }
 
     fn handle_remote_paths(
@@ -5661,6 +6186,10 @@ impl ViewerApp {
 
     fn refresh_textures(&mut self, context: &egui::Context) {
         let pending = std::mem::take(&mut self.pending_tiles);
+        self.pending_render_bytes = 0;
+        let mut remaining = Vec::new();
+        let mut upload_count = 0;
+        let mut upload_bytes = 0_usize;
         for pending in pending {
             if !self
                 .generations
@@ -5672,49 +6201,65 @@ impl ViewerApp {
             {
                 continue;
             }
+            let bytes = match render::validate_image(&pending.image) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.pyramid_display.fail();
+                    self.status = Status::error(error);
+                    continue;
+                }
+            };
+            if upload_count > 0
+                && (upload_count >= render::UPLOADS_PER_FRAME
+                    || upload_bytes
+                        .checked_add(bytes)
+                        .is_none_or(|total| total > render::UPLOAD_BYTES_PER_FRAME))
+            {
+                self.pending_render_bytes = self.pending_render_bytes.saturating_add(bytes);
+                remaining.push(pending);
+                continue;
+            }
             let hit = TileHit {
                 tile_id: pending.tile_id,
                 plane: pending.plane,
                 logical_rect: pending.logical_rect,
                 physical_stored_size: PhysicalSize {
-                    width: pending.tile.width,
-                    height: pending.tile.height,
+                    width: u32::try_from(pending.image.size[0]).unwrap_or(u32::MAX),
+                    height: u32::try_from(pending.image.size[1]).unwrap_or(u32::MAX),
                 },
                 scale: pending.scale,
                 m_index: None,
                 paint_order: pending.paint_order,
             };
-            let basic_profile = self.basic_profile(pending.plane, pending.scale).cloned();
-            match texture_image(
-                &pending.tile,
-                self.levels,
-                self.role_for_plane(pending.plane),
-                basic_profile.as_ref(),
-            ) {
-                Ok(image) => {
-                    let bytes = image
-                        .pixels
-                        .len()
-                        .saturating_mul(std::mem::size_of::<egui::Color32>());
-                    let texture = context.load_texture(
-                        format!("czi-{}-{}", pending.source_generation, pending.tile_id),
-                        image,
-                        egui::TextureOptions::NEAREST,
-                    );
-                    self.cache.insert(
-                        TextureKey {
-                            source_generation: pending.source_generation,
-                            plane: pending.plane,
-                            tile_id: pending.tile_id,
-                        },
-                        texture,
-                        bytes,
-                        hit,
-                        !pending.prefetch,
-                    );
+            let key = TextureKey {
+                source_generation: pending.source_generation,
+                plane: pending.plane,
+                tile_id: pending.tile_id,
+            };
+            if let Err(error) = self.cache.prepare_insert(key, bytes) {
+                // Prefetch is optional. A visible tile admission failure must remain an explicit
+                // render failure so export cannot report success with an incomplete canvas.
+                if !pending.prefetch {
+                    self.pyramid_display.fail();
+                    self.status = Status::error(error);
                 }
-                Err(error) => self.status = Status::error(error),
+                drop(pending.lease);
+                continue;
             }
+            let texture = context.load_texture(
+                format!("czi-{}-{}", pending.source_generation, pending.tile_id),
+                pending.image,
+                egui::TextureOptions::NEAREST,
+            );
+            self.cache
+                .commit_insert(key, texture, bytes, hit, !pending.prefetch);
+            upload_count += 1;
+            upload_bytes = upload_bytes.saturating_add(bytes);
+            drop(pending.lease);
+        }
+        self.pending_tiles = remaining;
+        if !self.pending_tiles.is_empty() {
+            context.request_repaint();
         }
     }
 
@@ -6129,12 +6674,15 @@ impl ViewerApp {
                 )
                 .clicked()
             {
+                self.desktop.copy_snapshot = false;
                 self.request_snapshot(ui.ctx());
             }
+            ui.label(format!("{:.0}%", self.camera.zoom * 100.0))
+                .on_hover_text("Logical image pixels per UI point; Retina physical pixels differ.");
             if let Some(reason) = self.export_unavailable_message() {
                 ui.colored_label(egui::Color32::YELLOW, reason);
             }
-            ui.weak("Wheel: zoom at cursor · Drag: pan · logical world coordinates");
+            ui.weak("Wheel / pinch: zoom · Drag: pan");
         });
         let title_height =
             26.0 + if self.display_mode == DisplayMode::Composite {
@@ -6161,9 +6709,21 @@ impl ViewerApp {
             self.basic_preview.on,
         );
         draw_canvas_title(&title_painter, title_response.rect, title);
-        let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::drag());
+        let (response, painter) =
+            ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
+        if response.clicked() {
+            response.request_focus();
+        }
+        let include_annotations = self
+            .pending_snapshot
+            .as_ref()
+            .is_none_or(|request| request.include_annotations);
         let snapshot_region = SnapshotRegion {
-            rect: title_response.rect.union(response.rect),
+            rect: if include_annotations {
+                title_response.rect.union(response.rect)
+            } else {
+                response.rect
+            },
             pixels_per_point: ui.ctx().pixels_per_point(),
         };
         self.snapshot_region = Some(snapshot_region);
@@ -6189,15 +6749,14 @@ impl ViewerApp {
             canvas_message(&painter, response.rect, message);
             return;
         }
-        let Some(plane) = dataset.plane(self.selection) else {
+        let Some(bounds) = self.active_world_bounds() else {
             canvas_message(
                 &painter,
                 response.rect,
-                "The selected sparse plane has no geometry.",
+                "The selected active planes have no geometry.",
             );
             return;
         };
-        let bounds = plane.world_bounds;
         let pixel_size_um = dataset.metadata_summary.pixel_size.map(|size| size.x_um);
         if self.fit_pending {
             self.camera.fit(response.rect, bounds);
@@ -6208,10 +6767,16 @@ impl ViewerApp {
         if response.hovered() {
             if let Some(cursor) = ui.input(|input| input.pointer.hover_pos()) {
                 let scroll_y = ui.input(|input| input.raw_scroll_delta.y);
-                if scroll_y != 0.0 {
+                let pinch = ui.input(egui::InputState::zoom_delta);
+                let has_pinch = (pinch - 1.0).abs() > f32::EPSILON;
+                if scroll_y != 0.0 || has_pinch {
                     self.camera.zoom_at(
                         cursor,
-                        f64::from(scroll_y * 0.002).exp(),
+                        if has_pinch {
+                            f64::from(pinch)
+                        } else {
+                            f64::from(scroll_y * 0.002).exp()
+                        },
                         response.rect,
                         bounds,
                     );
@@ -6223,6 +6788,7 @@ impl ViewerApp {
             self.camera.pan += ui.input(|input| input.pointer.delta());
             changed = true;
         }
+        changed |= navigation::keyboard_pan_zoom(ui, &response, &mut self.camera, bounds);
         if changed {
             self.last_request = None;
         }
@@ -6292,7 +6858,17 @@ impl ViewerApp {
         if !has_visible {
             canvas_message(&painter, response.rect, "Loading visible tiles…");
         }
-        draw_scale_bar(&painter, response.rect, self.camera.zoom, pixel_size_um);
+        if include_annotations {
+            draw_scale_bar(&painter, response.rect, self.camera.zoom, pixel_size_um);
+        }
+        if self.desktop.preferences.show_overview
+            && self.pending_snapshot.is_none()
+            && navigation::overview(ui, response.rect, bounds, &mut self.camera)
+        {
+            response.request_focus();
+            self.last_request = None;
+            ui.ctx().request_repaint();
+        }
     }
 }
 
@@ -6770,6 +7346,13 @@ fn freeze_snapshot_region(
     true
 }
 
+fn snapshot_geometry_matches(frozen: SnapshotRegion, current: Option<SnapshotRegion>) -> bool {
+    current.is_some_and(|current| {
+        current.rect == frozen.rect
+            && (current.pixels_per_point - frozen.pixels_per_point).abs() <= f32::EPSILON
+    })
+}
+
 fn screenshot_crop_bounds(image_size: [usize; 2], region: SnapshotRegion) -> Option<PixelCrop> {
     let pixels_per_point = region.pixels_per_point;
     if !pixels_per_point.is_finite() || pixels_per_point <= 0.0 {
@@ -6867,51 +7450,6 @@ fn encode_png_rgba(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>, 
         .map_err(|error| format!("Could not encode PNG pixels: {error}"))?;
     drop(writer);
     Ok(bytes)
-}
-
-fn write_png_snapshot(
-    filename: &str,
-    width: usize,
-    height: usize,
-    rgba: &[u8],
-) -> Result<PathBuf, String> {
-    let png = encode_png_rgba(width, height, rgba)?;
-    let directory = snapshot_directory();
-    let timestamp = unix_timestamp();
-    for sequence in 0_u16..1_000 {
-        let path = directory.join(snapshot_output_filename_with_sequence(
-            filename, timestamp, sequence,
-        ));
-        let mut file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(format!("Could not save PNG to {}: {error}", path.display()));
-            }
-        };
-        if let Err(error) = std::io::Write::write_all(&mut file, &png) {
-            let _ = std::fs::remove_file(&path);
-            return Err(format!("Could not save PNG to {}: {error}", path.display()));
-        }
-        return Ok(path);
-    }
-    Err(String::from(
-        "Could not choose an unused PNG snapshot filename.",
-    ))
-}
-
-fn snapshot_directory() -> PathBuf {
-    let desktop = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join("Desktop"));
-    desktop
-        .filter(|path| path.is_dir())
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn snapshot_output_filename_with_sequence(source: &str, timestamp: u64, sequence: u16) -> String {
@@ -7171,6 +7709,8 @@ impl eframe::App for ViewerApp {
         self.poll_embedded_authentication(context);
         self.retry_pending_open();
         self.flush_pending_view();
+        self.show_desktop_menu(context);
+        self.show_desktop_status(context);
 
         egui::TopBottomPanel::top("top_toolbar_v2")
             .exact_height(40.0)
@@ -7243,17 +7783,6 @@ impl eframe::App for ViewerApp {
                         if self.update_activity == UpdateActivity::Checking {
                             ui.spinner();
                         }
-                        let color = if self.status.is_error {
-                            egui::Color32::LIGHT_RED
-                        } else {
-                            egui::Color32::LIGHT_GRAY
-                        };
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(&self.status.message).color(color),
-                            )
-                            .truncate(),
-                        );
                     });
                 });
             });
@@ -7270,39 +7799,63 @@ impl eframe::App for ViewerApp {
                 .show(context, |ui| self.show_remote_browser(ui));
         }
 
-        egui::SidePanel::left("dataset_panel_v2")
-            .resizable(true)
-            .default_width(260.0)
-            .min_width(220.0)
-            .max_width(320.0)
-            .show(context, |ui| {
-                ui.heading("Dataset");
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.inspector_tab, InspectorTab::Display, "Display");
-                    ui.selectable_value(
-                        &mut self.inspector_tab,
-                        InspectorTab::Metadata,
-                        "Metadata",
-                    );
+        if self.desktop.preferences.inspector_open {
+            egui::SidePanel::left("dataset_panel_v2")
+                .resizable(true)
+                .default_width(260.0)
+                .min_width(220.0)
+                .max_width(320.0)
+                .show(context, |ui| {
+                    ui.heading("Dataset");
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.inspector_tab,
+                            InspectorTab::Display,
+                            "Display",
+                        );
+                        ui.selectable_value(
+                            &mut self.inspector_tab,
+                            InspectorTab::Metadata,
+                            "Metadata",
+                        );
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical().show(ui, |ui| match self.inspector_tab {
+                        InspectorTab::Display => self.show_display_inspector(ui),
+                        InspectorTab::Metadata => self.show_metadata_inspector(ui),
+                    });
                 });
-                ui.separator();
-                match self.inspector_tab {
-                    InspectorTab::Display => self.show_display_inspector(ui),
-                    InspectorTab::Metadata => self.show_metadata_inspector(ui),
-                }
-            });
+        }
 
         self.refresh_textures(context);
         egui::CentralPanel::default().show(context, |ui| {
             self.show_canvas(ui);
         });
 
+        self.arm_snapshot(context);
+        self.desktop.flush_preferences();
         if !self.update_startup_acknowledged && self.update_worker.acknowledge_startup().is_ok() {
             self.update_startup_acknowledged = true;
         }
 
-        context.request_repaint_after(Duration::from_millis(100));
+        // Dataset events wake egui directly from the worker. Keep a bounded fallback only for
+        // asynchronous producers that do not own an egui context (update, settings, choosers,
+        // and the PNG writer), and only while one of them is active.
+        let repaint_fallback = if self.update_activity != UpdateActivity::Idle
+            || self.pending_open.is_some()
+            || self.pending_view.is_some()
+            || self.remote_browse_pending
+            || self.basic_preview.is_busy()
+            || self.snapshot_writing.is_some()
+        {
+            Duration::from_millis(250)
+        } else {
+            // Slow housekeeping for workers without a repaint callback. Dataset tile delivery is
+            // event-driven and does not rely on this timer.
+            Duration::from_secs(1)
+        };
+        context.request_repaint_after(repaint_fallback);
     }
 }
 
@@ -7331,6 +7884,27 @@ fn selection_selector(
                 ui.selectable_value(selected, *value, value.to_string());
             }
         });
+    if choices.values.len() > 1 {
+        let last_index = choices.values.len() - 1;
+        let mut index = choices
+            .values
+            .iter()
+            .position(|value| value == selected)
+            .unwrap_or(0);
+        if ui
+            .add(
+                egui::Slider::new(&mut index, 0..=last_index)
+                    .show_value(false)
+                    .text(format!("{label} step")),
+            )
+            .on_hover_text(
+                "Steps through observed planes only; missing planes are never synthesized.",
+            )
+            .changed()
+        {
+            *selected = choices.values[index];
+        }
+    }
     *selected != before
 }
 
@@ -7354,6 +7928,30 @@ fn channel_selector(
         .show_ui(ui, |ui| {
             for value in &choices.values {
                 ui.selectable_value(selected, *value, label(*value));
+            }
+        });
+    *selected != before
+}
+
+fn display_channel_selector(
+    ui: &mut egui::Ui,
+    choices: &DimensionChoices,
+    summary: &MetadataSummary,
+    selected: &mut i32,
+) -> bool {
+    if !choices.present {
+        ui.horizontal(|ui| {
+            ui.label("Display channel");
+            ui.weak("not present (0)");
+        });
+        return false;
+    }
+    let before = *selected;
+    egui::ComboBox::from_label("Display channel")
+        .selected_text(channel_label(summary, *selected))
+        .show_ui(ui, |ui| {
+            for value in &choices.values {
+                ui.selectable_value(selected, *value, channel_label(summary, *value));
             }
         });
     *selected != before
@@ -7602,6 +8200,21 @@ fn level_selector(ui: &mut egui::Ui, pixel_type: PixelType, levels: &mut Levels)
     let before = *levels;
     ui.add(egui::Slider::new(&mut levels.black, 0..=maximum).text("Black"));
     ui.add(egui::Slider::new(&mut levels.white, 0..=maximum).text("White"));
+    ui.add(
+        egui::Slider::new(&mut levels.gamma_milli, 100..=4_000)
+            .text("Gamma")
+            .step_by(10.0)
+            .custom_formatter(|value, _| format!("{:.2}", value / 1000.0))
+            .custom_parser(|text| {
+                text.parse::<f64>()
+                    .ok()
+                    .filter(|value| value.is_finite())
+                    .map(|value| value * 1000.0)
+            }),
+    );
+    if ui.button("Reset channel display").clicked() {
+        *levels = Levels::default_for(pixel_type);
+    }
     if levels.black >= levels.white {
         if levels.black < maximum {
             levels.white = levels.black + 1;
@@ -7610,6 +8223,30 @@ fn level_selector(ui: &mut egui::Ui, pixel_type: PixelType, levels: &mut Levels)
         }
     }
     *levels != before
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn show_histogram_bars(ui: &mut egui::Ui, histogram: &channel_display::Histogram) {
+    let width = ui.available_width().max(32.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 72.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let maximum = histogram.bins.iter().copied().max().unwrap_or(0);
+    if maximum == 0 {
+        return;
+    }
+    let bin_width = rect.width() / 256.0;
+    for (index, count) in histogram.bins.iter().enumerate() {
+        if *count == 0 {
+            continue;
+        }
+        let height = rect.height() * (*count as f32 / maximum as f32);
+        let left = rect.left() + index as f32 * bin_width;
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(left, rect.bottom() - height),
+            egui::pos2(left + bin_width.max(1.0), rect.bottom()),
+        );
+        painter.rect_filled(bar, 0.0, ui.visuals().selection.bg_fill);
+    }
 }
 
 pub use anyconnect_vpn::run_executor_if_requested as run_anyconnect_vpn_executor_if_requested;
@@ -7630,7 +8267,9 @@ pub fn run_update_helper_if_requested() -> Result<bool, String> {
 /// Returns the native window or graphics-backend error from eframe.
 pub fn run() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1440.0, 900.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1440.0, 900.0])
+            .with_min_inner_size([800.0, 600.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -7643,7 +8282,10 @@ pub fn run() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use czi_core::{ChannelMetadata, CompressionMode, DimensionEntry, DirectoryEntry, PyramidType};
+    use czi_core::{
+        ChannelMetadata, CompressionMode, DecodedPixels, DecodedTile, DimensionEntry,
+        DirectoryEntry, PyramidType,
+    };
 
     fn dimension(code: DimensionCode, start: i32) -> DimensionEntry {
         DimensionEntry {
@@ -7683,6 +8325,37 @@ mod tests {
             m_index: None,
             paint_order: tile_id,
         }
+    }
+
+    #[test]
+    fn visible_raw_stats_are_bounded_to_sampled_tile_pixels() {
+        let tile = DecodedTile {
+            width: 512,
+            height: 512,
+            pixels: DecodedPixels::Gray16(vec![32_768; 512 * 512]),
+        };
+        let mut stats = VisibleRawStats::default();
+        stats.add(&tile);
+        assert_eq!(stats.available_tiles, 1);
+        assert_eq!(
+            stats.histogram.as_ref().expect("histogram").sample_count(),
+            channel_display::MAX_SAMPLES_PER_TILE as u64
+        );
+    }
+
+    #[test]
+    fn channel_levels_keep_gamma_as_part_of_display_state() {
+        let mut levels = HashMap::new();
+        levels.insert(
+            7,
+            Levels {
+                black: 10,
+                white: 200,
+                gamma_milli: 1_500,
+            },
+        );
+        assert_eq!(levels.get(&7).expect("channel levels").gamma_milli, 1_500);
+        assert_eq!(levels.get(&3), None);
     }
 
     #[test]
@@ -7868,6 +8541,8 @@ mod tests {
                 &event_tx,
                 &embedded_cancellation,
                 &vpn_cancellation,
+                &render::InFlightBudget::new(render::RENDER_INFLIGHT_LIMIT),
+                None,
             );
         });
         let terminal = events
@@ -8366,6 +9041,14 @@ mod tests {
             prefetch_viewport: SpatialRect::new(0, 0, 1, 1).expect("unit prefetch viewport"),
             target_downsample: 1.0,
             forced_scales: HashMap::new(),
+            render_configs: HashMap::from([(
+                PlaneSelector::default().key(),
+                RenderConfig {
+                    levels: Levels::default_for(PixelType::Gray16),
+                    role: ChannelRole::Gray,
+                    basic_profile: None,
+                },
+            )]),
             resident_tile_ids: Vec::new(),
         }
     }
@@ -8591,6 +9274,43 @@ mod tests {
     }
 
     #[test]
+    fn render_failure_blocks_export_even_after_view_completion() {
+        let scale = PyramidScale::new(1, 1).expect("scale");
+        let plane = PlaneKey::new(0, SceneId::Implicit, 0, 0);
+        let active = ActivePlaneState::Active(vec![plane.into()]);
+        let mut display = PyramidDisplay::default();
+        display.request(1, HashMap::from([(plane, scale)]));
+        assert!(display.finish(1, plane, scale));
+        assert!(export_blocker(&active, &display).is_none());
+        display.fail();
+        assert_eq!(
+            export_blocker(&active, &display),
+            Some("Rendering failed; choose a coarser view before exporting PNG.")
+        );
+        display.request(2, HashMap::from([(plane, scale)]));
+        assert!(export_blocker(&active, &display).is_some());
+    }
+
+    #[test]
+    fn view_render_settings_are_snapshotted_with_generation() {
+        let request = test_view_request(7);
+        let key = PlaneSelector::default().key();
+        let snapshot = request.render_configs[&key].clone();
+        let mut changed = snapshot.clone();
+        changed.levels = Levels {
+            black: 12,
+            white: 200,
+            gamma_milli: 1_250,
+        };
+        changed.role = ChannelRole::Blue;
+        assert_eq!(request.view_generation, 7);
+        assert_eq!(request.render_configs[&key].levels, snapshot.levels);
+        assert_eq!(request.render_configs[&key].role, snapshot.role);
+        assert_ne!(changed.levels, snapshot.levels);
+        assert_ne!(changed.role, snapshot.role);
+    }
+
+    #[test]
     fn unequal_channel_scale_still_records_plane_completion() {
         let one = PyramidScale::new(1, 1).expect("one scale");
         let two = PyramidScale::new(2, 1).expect("two scale");
@@ -8801,6 +9521,12 @@ mod tests {
 
         let mut request = Some(SnapshotRequest {
             generation: 2,
+            source_generation: 0,
+            view_generation: 0,
+            copy_to_clipboard: false,
+            include_annotations: true,
+            capture_sent: false,
+            started_at: std::time::Instant::now(),
             region: SnapshotRegion {
                 rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1.0, 1.0)),
                 pixels_per_point: 1.0,
@@ -9254,6 +9980,8 @@ mod tests {
                 &event_tx,
                 &worker_cancellation,
                 &worker_vpn_cancellation,
+                &render::InFlightBudget::new(render::RENDER_INFLIGHT_LIMIT),
+                None,
             );
         });
         commands
@@ -9269,6 +9997,7 @@ mod tests {
             embedded_cancellation,
             vpn_cancellation,
             basic_cancellation,
+            render_budget: render::InFlightBudget::new(render::RENDER_INFLIGHT_LIMIT),
             join: Some(join),
         };
         worker.shutdown();
@@ -9622,5 +10351,111 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert!(records.iter().any(|record| record.visible));
         assert_eq!(records[0].last_used, 2);
+    }
+
+    #[test]
+    fn raw_preview_limits_the_number_of_sampled_tiles() {
+        let tile = czi_core::DecodedTile {
+            width: 1,
+            height: 1,
+            pixels: czi_core::DecodedPixels::Gray8(vec![42]),
+        };
+        let mut stats = VisibleRawStats::default();
+        for _ in 0..channel_display::MAX_TILES_PER_PLANE * 2 {
+            stats.add(&tile);
+        }
+        assert_eq!(stats.available_tiles, channel_display::MAX_TILES_PER_PLANE);
+        assert_eq!(stats.histogram.unwrap().sample_count(), 64);
+    }
+
+    #[test]
+    fn texture_cache_rejects_visible_working_set_over_hard_budget() {
+        let context = egui::Context::default();
+        let mut cache = TextureCache::new(4);
+        let plane = PlaneKey::new(0, SceneId::Implicit, 0, 0);
+        let hit = |tile_id| TileHit {
+            tile_id: TileId(tile_id),
+            plane,
+            logical_rect: SpatialRect::new(0, 0, 1, 1).expect("unit rect"),
+            physical_stored_size: PhysicalSize {
+                width: 1,
+                height: 1,
+            },
+            scale: PyramidScale::new(1, 1).expect("unit scale"),
+            m_index: None,
+            paint_order: tile_id,
+        };
+        let texture = |name| {
+            context.load_texture(
+                name,
+                egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+                egui::TextureOptions::NEAREST,
+            )
+        };
+        let first = TextureKey {
+            source_generation: 1,
+            plane,
+            tile_id: TileId(1),
+        };
+        cache
+            .insert(first, texture("first"), 4, hit(1), true)
+            .expect("first tile fits");
+        let second = TextureKey {
+            source_generation: 1,
+            plane,
+            tile_id: TileId(2),
+        };
+        assert!(
+            cache
+                .insert(second, texture("second"), 4, hit(2), true)
+                .is_err()
+        );
+        assert_eq!(cache.bytes, 4);
+        assert!(cache.entries.contains_key(&first));
+        assert!(!cache.entries.contains_key(&second));
+
+        let viewport = SpatialRect::new(1, 0, 2, 1).unwrap();
+        cache.begin_view(1, &[plane], viewport);
+        assert!(!cache.protected.contains(&first));
+        let moved_hit = TileHit {
+            logical_rect: viewport,
+            ..hit(2)
+        };
+        cache
+            .insert(second, texture("after pan"), 4, moved_hit, true)
+            .unwrap();
+        assert_eq!(cache.bytes, 4);
+        assert!(!cache.entries.contains_key(&first));
+        assert!(cache.entries.contains_key(&second));
+        cache.begin_view(1, &[plane], viewport);
+        assert!(cache.protected.contains(&second));
+
+        let hits = vec![hit(1); render::MAX_TEXTURE_TILES + 1];
+        assert!(!view_hits_fit_render_budget(
+            &hits,
+            TEXTURE_CACHE_LIMIT,
+            render::MAX_TEXTURE_TILES
+        ));
+        let mut tiny_cache = TextureCache::new(TEXTURE_CACHE_LIMIT);
+        let tiny = texture("tiny");
+        for index in 0..=render::MAX_TEXTURE_TILES {
+            tiny_cache
+                .insert(
+                    TextureKey {
+                        tile_id: TileId(index),
+                        ..first
+                    },
+                    tiny.clone(),
+                    4,
+                    hit(index),
+                    false,
+                )
+                .unwrap();
+        }
+        assert_eq!(tiny_cache.entries.len(), render::MAX_TEXTURE_TILES);
+        assert!(!tiny_cache.entries.contains_key(&TextureKey {
+            tile_id: TileId(0),
+            ..first
+        }));
     }
 }

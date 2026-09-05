@@ -32,9 +32,11 @@ Preview publication uses the separately installed GitHub CLI, OpenSSL 3, `jq`, a
 
 The eframe `default_fonts` feature embeds font assets under OFL-1.1 and Ubuntu-font-1.0. These two font licenses are allowed only for those bundled assets.
 
+The eframe `accesskit` feature enables platform accessibility. On Apple Silicon it compiles the permissively licensed Rust `accesskit`, `accesskit_consumer`, `accesskit_winit`, and `accesskit_macos` crates, with `objc2` bindings to system AppKit. It does not bundle an additional C/C++ runtime. Linux D-Bus/AT-SPI and Windows accessibility dependencies appear in the cross-platform lockfile but are not compiled or shipped in the macOS app.
+
 The metadata parser uses `quick-xml` 0.41 with default features disabled. It is pure Rust and MIT licensed. It uses the plain reader rather than `NsReader`; namespace declarations are ordinary attributes and are bounded by the parser's aggregate attribute-byte limit. PNG snapshot export uses `png` 0.18 with default features disabled. It is pure Rust and dual MIT/Apache-2.0 licensed. The BaSiC protocol manifest uses `serde` and `serde_json`; both are pure Rust and dual MIT/Apache-2.0 licensed. Its added `itoa` transitive dependency is pure Rust and dual MIT/Apache-2.0 licensed; `zmij` is pure Rust and MIT licensed.
 
-`cargo deny check advisories` currently reports two upstream, transitive, unmaintained crates with no safe upgrade: `paste` (`RUSTSEC-2024-0436`) through `metal`/`wgpu`, and `ttf-parser` (`RUSTSEC-2026-0192`) through `epaint`. Review them when updating the pinned eframe/wgpu stack. The metadata-parser advisories `RUSTSEC-2026-0194` and `RUSTSEC-2026-0195` are removed by the quick-xml 0.41 upgrade.
+`cargo deny check advisories` currently reports two upstream, transitive, unmaintained crates with no safe upgrade: `paste` (`RUSTSEC-2024-0436`) through `metal`/`wgpu`, and `ttf-parser` (`RUSTSEC-2026-0192`) through `epaint`. Review them when updating the pinned eframe/wgpu stack. The cross-platform license check also rejects the existing Windows-only `clipboard-win`/`error-code` BSL-1.0 dependencies under the current allowlist; this requires a focused license-policy review, not an automatic suppression. The metadata-parser advisories `RUSTSEC-2026-0194` and `RUSTSEC-2026-0195` are removed by the quick-xml 0.41 upgrade.
 
 ## Review requirements
 

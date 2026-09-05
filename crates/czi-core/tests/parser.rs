@@ -1,7 +1,7 @@
 use czi_core::{
     AttachmentIndex, BlockCache, CompressionMode, CziDataset, CziError, DecodedPixels,
     DimensionCode, LocalFileSource, MemorySource, ParseOptions, PixelType, PyramidType,
-    RandomAccessSource, SourceError,
+    RandomAccessSource, SourceError, SourceInfo,
 };
 use std::path::PathBuf;
 use std::sync::{
@@ -19,6 +19,8 @@ const FILE_HEADER_DATA_SIZE: usize = 512;
 const DIRECTORY_DATA_SIZE: usize = 128;
 const DV_FIXED_SIZE: usize = 32;
 const DIMENSION_SIZE: usize = 20;
+const GIANT_SPARSE_WIDTH: i32 = 20_000;
+const GIANT_SPARSE_HEIGHT: i32 = 20_000;
 
 #[derive(Debug)]
 struct SyntheticFile {
@@ -109,6 +111,197 @@ fn decodes_uncompressed_gray_tiles_with_stored_xy_dimensions() {
         tile.pixels,
         DecodedPixels::Gray8(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 255])
     );
+}
+
+#[test]
+fn decoded_tile_limits_accept_exact_boundaries_and_reject_one_below() {
+    let mut gray8 = synthetic_file(false);
+    make_single_plane(&mut gray8, 0, 16);
+    let dataset = CziDataset::open_with_options(
+        MemorySource::new(gray8.bytes.clone()),
+        ParseOptions::default()
+            .with_max_decoded_tile_bytes(16)
+            .with_max_decoded_tile_dimensions(8, 2),
+    )
+    .expect("bounded Gray8 tile");
+    assert_eq!(
+        dataset.decoded_tile(0).expect("exact byte boundary").width,
+        8
+    );
+
+    let mut too_few_bytes = synthetic_file(false);
+    make_single_plane(&mut too_few_bytes, 0, 16);
+    let error = CziDataset::open_with_options(
+        MemorySource::new(too_few_bytes.bytes),
+        ParseOptions::default().with_max_decoded_tile_bytes(15),
+    )
+    .expect("open remains lazy")
+    .decoded_tile(0)
+    .expect_err("one byte below the decoded size");
+    assert!(matches!(
+        error,
+        CziError::LimitExceeded {
+            kind: "decoded tile bytes",
+            value: 16,
+            maximum: 15,
+        }
+    ));
+
+    let mut too_narrow = synthetic_file(false);
+    make_single_plane(&mut too_narrow, 0, 16);
+    let error = CziDataset::open_with_options(
+        MemorySource::new(too_narrow.bytes),
+        ParseOptions::default().with_max_decoded_tile_dimensions(7, 2),
+    )
+    .expect("open remains lazy")
+    .decoded_tile(0)
+    .expect_err("one pixel below the width limit");
+    assert!(matches!(
+        error,
+        CziError::LimitExceeded {
+            kind: "decoded tile width",
+            value: 8,
+            maximum: 7,
+        }
+    ));
+
+    let mut too_short = synthetic_file(false);
+    make_single_plane(&mut too_short, 0, 16);
+    let error = CziDataset::open_with_options(
+        MemorySource::new(too_short.bytes),
+        ParseOptions::default().with_max_decoded_tile_dimensions(8, 1),
+    )
+    .expect("open remains lazy")
+    .decoded_tile(0)
+    .expect_err("one pixel below the height limit");
+    assert!(matches!(
+        error,
+        CziError::LimitExceeded {
+            kind: "decoded tile height",
+            value: 2,
+            maximum: 1,
+        }
+    ));
+
+    let mut gray16 = synthetic_file(false);
+    make_single_plane(&mut gray16, 1, 32);
+    let dataset = CziDataset::open_with_options(
+        MemorySource::new(gray16.bytes),
+        ParseOptions::default()
+            .with_max_decoded_tile_bytes(32)
+            .with_max_decoded_tile_dimensions(8, 2),
+    )
+    .expect("bounded Gray16 tile");
+    assert_eq!(dataset.decoded_tile(0).expect("Gray16 boundary").width, 8);
+}
+
+#[test]
+fn giant_correctly_sized_sparse_payload_is_rejected_before_pixel_read() {
+    let (bytes, payload_offset, virtual_length) = giant_sparse_file();
+    let payload_reads = Arc::new(AtomicUsize::new(0));
+    let source = SparseSource {
+        bytes: Arc::from(bytes),
+        length: virtual_length,
+        payload_offset,
+        payload_reads: Arc::clone(&payload_reads),
+    };
+    let dataset = CziDataset::open(source).expect("sparse CZI index");
+    let error = dataset
+        .decoded_tile(0)
+        .expect_err("decoded byte limit must precede payload allocation");
+    assert!(matches!(
+        error,
+        CziError::LimitExceeded {
+            kind: "decoded tile bytes",
+            value: 400_000_000,
+            maximum: 268_435_456,
+        }
+    ));
+    assert_eq!(payload_reads.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn deterministic_mutation_smoke_stays_bounded_and_panic_free() {
+    let mut valid = synthetic_file(false);
+    make_single_plane(&mut valid, 0, 16);
+    let options = ParseOptions::default()
+        .with_max_metadata_bytes(1_024)
+        .with_max_directory_entries(16)
+        .with_max_dimensions_per_entry(8)
+        .with_max_total_dimensions(32)
+        .with_max_index_bytes(4_096)
+        .with_max_decoded_tile_bytes(64)
+        .with_max_decoded_tile_dimensions(64, 64);
+    let max_request = 4_096;
+    let mut cases = vec![("baseline", valid.bytes.clone())];
+    let ranges = [
+        (
+            "file-header",
+            0,
+            SEGMENT_HEADER_SIZE + FILE_HEADER_DATA_SIZE,
+        ),
+        (
+            "directory",
+            usize::try_from(valid.directory_offset).expect("directory offset"),
+            usize::try_from(valid.directory_offset).expect("directory offset")
+                + SEGMENT_HEADER_SIZE
+                + DIRECTORY_DATA_SIZE
+                + DV_FIXED_SIZE
+                + 4 * DIMENSION_SIZE,
+        ),
+        (
+            "subblock-header",
+            usize::try_from(valid.subblock_offset).expect("subblock offset"),
+            tile_data_range(&valid),
+        ),
+        ("pixel-payload", tile_data_range(&valid), valid.bytes.len()),
+    ];
+    for case in 0..64_usize {
+        let (label, start, end) = ranges[case % ranges.len()];
+        let mut bytes = valid.bytes.clone();
+        let mut random = MutationRng::new(0x5eed_2026_u64 + u64::try_from(case).expect("case"));
+        let offset = start + random.index(end - start);
+        let delta = u8::try_from(random.next_u64() % 255 + 1).expect("mutation byte");
+        bytes[offset] ^= delta;
+        cases.push((label, bytes));
+    }
+
+    let mut successful_opens = 0_usize;
+    let mut decode_attempts = 0_usize;
+    let mut successful_decodes = 0_usize;
+    for (label, bytes) in cases {
+        let largest_request = Arc::new(AtomicUsize::new(0));
+        let source = BoundedReadSource {
+            inner: MemorySource::new(bytes),
+            max_request,
+            largest_request: Arc::clone(&largest_request),
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let dataset = CziDataset::open_with_options(source, options)?;
+            let mut attempted = 0_usize;
+            let mut decoded = 0_usize;
+            for tile_id in 0..dataset.index().tile_count().min(3) {
+                attempted += 1;
+                if dataset.decoded_tile(tile_id).is_ok() {
+                    decoded += 1;
+                }
+            }
+            Ok::<(usize, usize), CziError>((attempted, decoded))
+        }));
+        assert!(outcome.is_ok(), "mutation category {label} panicked");
+        assert!(
+            largest_request.load(Ordering::Relaxed) <= max_request,
+            "mutation category {label} exceeded bounded read size"
+        );
+        if let Ok(Ok((attempted, decoded))) = outcome {
+            successful_opens += 1;
+            decode_attempts += attempted;
+            successful_decodes += decoded;
+        }
+    }
+    assert!(successful_opens > 0, "valid baseline must open");
+    assert!(decode_attempts > 0, "valid baseline must attempt a decode");
+    assert!(successful_decodes > 0, "valid baseline must decode");
 }
 
 #[test]
@@ -580,6 +773,111 @@ fn open(bytes: Vec<u8>) -> CziDataset {
 }
 
 #[derive(Clone)]
+struct SparseSource {
+    bytes: Arc<[u8]>,
+    length: u64,
+    payload_offset: u64,
+    payload_reads: Arc<AtomicUsize>,
+}
+
+impl RandomAccessSource for SparseSource {
+    fn info(&self) -> SourceInfo {
+        SourceInfo {
+            length: self.length,
+            version: 0,
+        }
+    }
+
+    fn read_at(&self, offset: u64, destination: &mut [u8]) -> Result<(), SourceError> {
+        let size = u64::try_from(destination.len())
+            .map_err(|_| SourceError::LengthConversion { length: u64::MAX })?;
+        let end = offset
+            .checked_add(size)
+            .ok_or(SourceError::RangeOverflow { offset, size })?;
+        if end > self.length {
+            return Err(SourceError::OutOfBounds {
+                offset,
+                end,
+                length: self.length,
+            });
+        }
+        if offset >= self.payload_offset {
+            self.payload_reads.fetch_add(1, Ordering::Relaxed);
+        }
+        destination.fill(0);
+        let bytes_len = u64::try_from(self.bytes.len()).expect("test bytes length");
+        if offset < bytes_len {
+            let copy_end = end.min(bytes_len);
+            let source_start = usize::try_from(offset).expect("test source offset");
+            let source_end = usize::try_from(copy_end).expect("test source end");
+            let destination_end = source_end - source_start;
+            destination[..destination_end].copy_from_slice(&self.bytes[source_start..source_end]);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct BoundedReadSource {
+    inner: MemorySource,
+    max_request: usize,
+    largest_request: Arc<AtomicUsize>,
+}
+
+impl RandomAccessSource for BoundedReadSource {
+    fn info(&self) -> SourceInfo {
+        self.inner.info()
+    }
+
+    fn read_at(&self, offset: u64, destination: &mut [u8]) -> Result<(), SourceError> {
+        self.largest_request
+            .fetch_max(destination.len(), Ordering::Relaxed);
+        if destination.len() > self.max_request {
+            return Err(SourceError::Allocation {
+                size: destination.len(),
+            });
+        }
+        self.inner.read_at(offset, destination)
+    }
+
+    fn read_vec_at(&self, offset: u64, size: u64) -> Result<Vec<u8>, SourceError> {
+        let max_request = u64::try_from(self.max_request).expect("max request fits u64");
+        self.largest_request.fetch_max(
+            usize::try_from(size).unwrap_or(usize::MAX),
+            Ordering::Relaxed,
+        );
+        if size > max_request {
+            return Err(SourceError::Allocation {
+                size: usize::try_from(size).unwrap_or(usize::MAX),
+            });
+        }
+        self.inner.read_vec_at(offset, size)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MutationRng(u64);
+
+impl MutationRng {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        self.0
+    }
+
+    fn index(&mut self, length: usize) -> usize {
+        let length = u64::try_from(length).expect("mutation range fits u64");
+        usize::try_from(self.next_u64() % length).expect("mutation index fits usize")
+    }
+}
+
+#[derive(Clone)]
 struct CountingSource {
     inner: Arc<dyn RandomAccessSource>,
     reads: Arc<AtomicUsize>,
@@ -678,6 +976,37 @@ fn make_single_plane(file: &mut SyntheticFile, pixel_type: i32, data_size: i64) 
     let data_size_offset =
         usize::try_from(file.subblock_offset).expect("offset") + SEGMENT_HEADER_SIZE + 8;
     file.bytes[data_size_offset..data_size_offset + 8].copy_from_slice(&data_size.to_le_bytes());
+}
+
+fn giant_sparse_file() -> (Vec<u8>, u64, u64) {
+    let mut file = synthetic_file(false);
+    for entry in [directory_entry_offset(&file), inline_entry_offset(&file)] {
+        file.bytes[entry + 2..entry + 6].copy_from_slice(&0_i32.to_le_bytes());
+        file.bytes[entry + DV_FIXED_SIZE + 3 * DIMENSION_SIZE + 16
+            ..entry + DV_FIXED_SIZE + 3 * DIMENSION_SIZE + 20]
+            .copy_from_slice(&1_i32.to_le_bytes());
+        file.bytes[entry + DV_FIXED_SIZE + 8..entry + DV_FIXED_SIZE + 12]
+            .copy_from_slice(&GIANT_SPARSE_WIDTH.to_le_bytes());
+        file.bytes[entry + DV_FIXED_SIZE + 16..entry + DV_FIXED_SIZE + 20]
+            .copy_from_slice(&GIANT_SPARSE_WIDTH.to_le_bytes());
+        file.bytes[entry + DV_FIXED_SIZE + DIMENSION_SIZE + 8
+            ..entry + DV_FIXED_SIZE + DIMENSION_SIZE + 12]
+            .copy_from_slice(&GIANT_SPARSE_HEIGHT.to_le_bytes());
+        file.bytes[entry + DV_FIXED_SIZE + DIMENSION_SIZE + 16
+            ..entry + DV_FIXED_SIZE + DIMENSION_SIZE + 20]
+            .copy_from_slice(&GIANT_SPARSE_HEIGHT.to_le_bytes());
+    }
+    let payload_size = u64::try_from(GIANT_SPARSE_WIDTH).expect("width")
+        * u64::try_from(GIANT_SPARSE_HEIGHT).expect("height");
+    let allocated_size = 256 + payload_size;
+    let subblock = usize::try_from(file.subblock_offset).expect("subblock offset");
+    file.bytes[subblock + 16..subblock + 24].copy_from_slice(&allocated_size.to_le_bytes());
+    file.bytes[subblock + 24..subblock + 32].copy_from_slice(&allocated_size.to_le_bytes());
+    file.bytes[subblock + SEGMENT_HEADER_SIZE + 8..subblock + SEGMENT_HEADER_SIZE + 16]
+        .copy_from_slice(&payload_size.to_le_bytes());
+    let payload_offset = u64::try_from(subblock + SEGMENT_HEADER_SIZE + 256).expect("payload");
+    let virtual_length = file.subblock_offset + SEGMENT_HEADER_SIZE as u64 + allocated_size;
+    (file.bytes, payload_offset, virtual_length)
 }
 
 fn set_tile_compression(file: &mut SyntheticFile, compression: i32) {

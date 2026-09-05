@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use czi_core::{
     DatasetIndex, DecodedPixels, DecodedTile, PixelType, PlaneKey, PyramidScale, SceneId,
@@ -28,6 +28,7 @@ pub(crate) const MAX_INPUT_BYTES: u64 = 32 * 1024 * 1024;
 const MIN_SUPPORTED_GAIN: f32 = 1.0e-6;
 const MAX_SUPPORTED_GAIN: f32 = 1.0e6;
 const RESPONSE_JSON_LIMIT: u64 = 64 * 1024;
+const HELPER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 type DetectorTileIdentity = (i64, i64, i64, i64, Option<i32>);
 type DetectorTileSignature = (DetectorTileIdentity, PixelType);
@@ -389,6 +390,15 @@ pub(crate) fn run_helper(
     request: &TempRequest,
     cancelled: &AtomicBool,
 ) -> Result<ProfileSet, String> {
+    run_helper_with_timeout(helper, request, cancelled, HELPER_TIMEOUT)
+}
+
+fn run_helper_with_timeout(
+    helper: &Path,
+    request: &TempRequest,
+    cancelled: &AtomicBool,
+    timeout: Duration,
+) -> Result<ProfileSet, String> {
     let helper = validate_helper_path(helper)?;
     if cancelled.load(Ordering::Acquire) {
         return Err(String::from("BaSiC preparation cancelled."));
@@ -396,10 +406,10 @@ pub(crate) fn run_helper(
     let mut child = helper_command(&helper, request.path())
         .spawn()
         .map_err(|error| format!("Could not start BaSiC helper: {error}"))?;
+    let started = Instant::now();
     loop {
         if cancelled.load(Ordering::Acquire) {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_helper(&mut child);
             return Err(String::from("BaSiC preparation cancelled."));
         }
         match child.try_wait() {
@@ -407,10 +417,16 @@ pub(crate) fn run_helper(
             Ok(Some(status)) => {
                 return Err(format!("BaSiC helper exited unsuccessfully ({status})."));
             }
+            Ok(None) if started.elapsed() >= timeout => {
+                terminate_helper(&mut child);
+                return Err(format!(
+                    "BaSiC helper timed out after {} seconds.",
+                    timeout.as_secs()
+                ));
+            }
             Ok(None) => std::thread::sleep(Duration::from_millis(25)),
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_helper(&mut child);
                 return Err(format!("Could not wait for BaSiC helper: {error}"));
             }
         }
@@ -419,6 +435,11 @@ pub(crate) fn run_helper(
         return Err(String::from("BaSiC preparation cancelled."));
     }
     request.read_response()
+}
+
+fn terminate_helper(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn helper_command(helper: &Path, request_path: &Path) -> Command {
@@ -1600,6 +1621,159 @@ mod tests {
         assert!(!rendered.contains("ssh-profile"));
         assert!(!rendered.contains("credential"));
         assert!(!rendered.contains("sftp"));
+    }
+
+    #[cfg(unix)]
+    fn timeout_test_request() -> TempRequest {
+        let plan = SamplePlan {
+            channels: vec![ChannelSamplePlan {
+                spec: ChannelSpec {
+                    id: String::from("c0"),
+                    c_index: 0,
+                    name: String::from("Fluorescence"),
+                    is_phase: false,
+                },
+                pixel_max: u16::MAX,
+                candidates: vec![candidate(TileId(0)); TEST_SAMPLES],
+            }],
+            verified_scales: HashMap::new(),
+        };
+        TempRequest::create(&plan).expect("request")
+    }
+
+    #[cfg(unix)]
+    fn hanging_helper() -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = create_private_temp_dir().expect("helper directory");
+        let helper = directory.join("hanging-helper.sh");
+        fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > helper.pid\nexec /bin/sleep 60\n",
+        )
+        .expect("helper script");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).expect("helper mode");
+        (directory, helper)
+    }
+
+    #[cfg(unix)]
+    fn assert_pid_reaped(pid: &str) {
+        let status = Command::new("/bin/kill")
+            .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .expect("kill command");
+        assert!(!status.success(), "helper process {pid:?} is still running");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_timeout_kills_and_reaps_hanging_child() {
+        let request = timeout_test_request();
+        let (helper_directory, helper) = hanging_helper();
+        let started = Instant::now();
+        let error = run_helper_with_timeout(
+            &helper,
+            &request,
+            &AtomicBool::new(false),
+            Duration::from_secs(1),
+        )
+        .expect_err("hanging helper must time out");
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid = fs::read_to_string(request.path().join("helper.pid")).expect("helper pid");
+        assert_pid_reaped(&pid);
+        fs::remove_dir_all(helper_directory).expect("helper cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_cancellation_kills_and_reaps_hanging_child() {
+        let request = timeout_test_request();
+        let request_path = request.path().to_path_buf();
+        let (helper_directory, helper) = hanging_helper();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker = std::thread::spawn(move || {
+            run_helper_with_timeout(
+                &helper,
+                &request,
+                &worker_cancelled,
+                Duration::from_secs(10),
+            )
+        });
+        let pid_path = request_path.join("helper.pid");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pid_path.is_file() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(pid_path.is_file(), "hanging helper did not start");
+        let pid = fs::read_to_string(&pid_path).expect("helper pid");
+        cancelled.store(true, Ordering::Release);
+        let error = worker
+            .join()
+            .expect("helper worker")
+            .expect_err("cancelled");
+        assert_eq!(error, "BaSiC preparation cancelled.");
+        assert_pid_reaped(&pid);
+        fs::remove_dir_all(helper_directory).expect("helper cleanup");
+    }
+
+    #[test]
+    fn response_parser_handles_bounded_deterministic_fuzz_corpus() {
+        let spec = ChannelSpec {
+            id: String::from("c0"),
+            c_index: 0,
+            name: String::from("Fluorescence"),
+            is_phase: false,
+        };
+        let plan = SamplePlan {
+            channels: vec![ChannelSamplePlan {
+                spec,
+                pixel_max: u16::MAX,
+                candidates: vec![candidate(TileId(0)); TEST_SAMPLES],
+            }],
+            verified_scales: HashMap::new(),
+        };
+        let request = TempRequest::create(&plan).expect("request");
+        let seed = br#"{"version":1,"status":"preview-not-held-out-validated","darkfield_enabled":false,"channels":[{"id":"c0","method":"BaSiC approximate","version":1,"sample_count":32,"support_fraction":1.0,"gain_range":{"min":1.0,"max":1.0},"gain_file":"gain-c0.f32le","support_file":"support-c0.u8"}]}"#;
+        fs::write(
+            request.path().join("gain-c0.f32le"),
+            vec![1.0_f32; grid_pixels()]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .expect("gain");
+        fs::write(request.path().join("support-c0.u8"), vec![1; grid_pixels()]).expect("support");
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for _ in 0..512 {
+            let mut bytes = seed.to_vec();
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let mutations = usize::try_from(state % 8).expect("small mutation count") + 1;
+            for _ in 0..mutations {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                let index = usize::try_from(
+                    state % u64::try_from(bytes.len()).expect("bounded seed length"),
+                )
+                .expect("bounded seed index");
+                bytes[index] = state.to_le_bytes()[0];
+            }
+            fs::write(request.path().join("response.json"), bytes).expect("response");
+            let _ = request.read_response();
+        }
+        let oversized = vec![b'{'; usize::try_from(RESPONSE_JSON_LIMIT).expect("small limit") + 1];
+        fs::write(request.path().join("response.json"), oversized).expect("oversized response");
+        assert!(
+            request
+                .read_response()
+                .unwrap_err()
+                .contains("bounded regular")
+        );
     }
 
     #[test]

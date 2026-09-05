@@ -2,9 +2,11 @@
 
 The BaSiC feature is a reversible display preview. It never modifies the CZI, writes to an SSH source, exports a corrected CZI/TIFF, or stores a fitted profile after the viewer session.
 
-## Automatic fitting and helper selection
+## On-demand fitting and helper selection
 
-The packaged app includes a frozen BaSiCPy helper and starts profile preparation automatically after each CZI opens. It fits every sparse channel from every supported acquisition position in that CZI. The profile remains session-only and the display toggle stays off until every channel is ready.
+The packaged app includes a frozen BaSiCPy helper. Select **Prepare BaSiC** in the Display inspector to start preparation. Automatic preparation is off by default to avoid background CPU, disk, and remote-network work. Enable **Prepare BaSiC automatically on future opens** in **File → Settings…** if desired.
+
+Preparation fits every sparse channel from every supported acquisition position in that CZI. The profile remains session-only and the display toggle stays off until every channel is ready.
 
 The **Advanced** section can select a compatible custom helper. The viewer validates and stores only its canonical absolute executable path in a private, bounded settings file under macOS Application Support. **Use bundled helper** removes that override. Developers can instead provide an environment override:
 
@@ -12,7 +14,7 @@ The **Advanced** section can select a compatible custom helper. The viewer valid
 CZI_BASIC_HELPER=/absolute/path/to/basic-helper cargo run --release -p czi-viewer
 ```
 
-The viewer uses `std::process::Command` directly. It does not use a shell. The bundled or custom child receives the fixed `--request-dir` flag and one value: an app-owned absolute temporary request directory. Its environment is cleared. The child receives no CZI path, SSH profile, credential, remote path, SFTP session, or source handle. The directory is removed after success, failure, or cooperative cancellation.
+The viewer uses `std::process::Command` directly. It does not use a shell. The bundled or custom child receives the fixed `--request-dir` flag and one value: an app-owned absolute temporary request directory. Its environment is cleared. The child receives no CZI path, SSH profile, credential, remote path, SFTP session, or source handle. The directory is removed after success, failure, or cancellation. The helper has a five-minute execution deadline, separate from tile sampling time. Timeout or cancellation kills and reaps the helper. A timeout reports an error rather than silently accepting an incomplete profile.
 
 Release builds freeze Python 3.11, BaSiCPy 2.0.0, PyTorch 2.2.2, NumPy 1.26.4, SciPy 1.12.0, and scikit-image 0.26.0 from a hash-locked Apple Silicon wheel set. The helper is ad-hoc signed with the app. Separate Python notices and a CycloneDX SBOM are included in each release.
 
@@ -81,7 +83,7 @@ Local and Shared SFTP sources use the same read-only dataset worker. Local sampl
 
 The UI reports positions per channel, total tile reads, native/pyramid representation counts, estimated decoded bytes, and whether sampling is waiting for viewport work. Sample files are app-owned temporary data, source access remains read-only, and fitted profiles remain session-only.
 
-Detector/pyramid mapping verification begins automatically after the dataset opens. Planning polls the same cancellation token between planes and scales. A single in-memory geometry query or sort is not preemptible and can briefly delay queued viewport work before tile sampling begins. Viewport requests preempt sampling between bounded steps. Source and fit generations reject late progress and results after cancel, refit, or source replacement.
+Detector/pyramid mapping verification begins when preparation is requested, or after opening when automatic preparation is enabled. Planning polls the same cancellation token between planes and scales. A single in-memory geometry query or sort is not preemptible and can briefly delay queued viewport work before tile sampling begins. Viewport requests preempt sampling between bounded steps. Source and fit generations reject late progress and results after cancel, refit, or source replacement.
 
 ## Preview correction
 
@@ -97,7 +99,7 @@ The result must be finite and is clipped to 0–255 for Gray8 or 0–65535 for G
 
 Native tiles are always valid detector representations. A pyramid level is used during preview only when every tile at that exact sparse plane/level maps one-to-one to the native detector tiles by logical rectangle and mosaic index. Otherwise the preview reload falls back to a verified finer level, ultimately native. This keeps correction in detector-tile coordinates without inventing a sensor mapping.
 
-Toggling clears the rendered texture cache and reloads only the bounded visible/prefetch request. It preserves display levels and field of view. Corrected PNG snapshots always include:
+Toggling rebuilds display textures for the bounded visible/prefetch request. Resident decoded tiles can be reused without rereading the source. It preserves display levels and field of view. Corrected PNG snapshots always include:
 
 ```text
 BaSiC preview · darkfield off · not quantitatively validated

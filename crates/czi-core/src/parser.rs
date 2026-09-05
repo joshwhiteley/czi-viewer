@@ -23,6 +23,12 @@ const DEFAULT_MAX_DIRECTORY_ENTRIES: u64 = 1_000_000;
 const DEFAULT_MAX_DIMENSIONS: u64 = 64;
 const DEFAULT_MAX_TOTAL_DIMENSIONS: u64 = 1_000_000;
 const DEFAULT_MAX_INDEX_BYTES: u64 = 256 * 1024 * 1024;
+// A 256 MiB tile accommodates unusually large 16-bit tiles while still bounding one decode.
+const DEFAULT_MAX_DECODED_TILE_BYTES: u64 = 256 * 1024 * 1024;
+// The byte bound is the primary memory guard; this dimension bound also rejects pathological
+// shapes before multiplying the dimensions or asking the source for the payload.
+const DEFAULT_MAX_DECODED_TILE_WIDTH: u32 = 65_536;
+const DEFAULT_MAX_DECODED_TILE_HEIGHT: u32 = 65_536;
 
 const FILE_ID: &[u8; 16] = b"ZISRAWFILE\0\0\0\0\0\0";
 const DIRECTORY_ID: &[u8; 16] = b"ZISRAWDIRECTORY\0";
@@ -200,6 +206,21 @@ pub struct ParseOptions {
     pub max_total_dimensions: u64,
     /// Maximum bytes used by the complete summary directory payload.
     pub max_index_bytes: u64,
+    /// Maximum decoded pixel bytes for one tile.
+    ///
+    /// The default is 256 MiB. This is large enough for unusually large real-world 16-bit
+    /// tiles, while preventing a single decoded tile from requesting an unbounded allocation.
+    pub max_decoded_tile_bytes: u64,
+    /// Maximum stored X dimension for one decoded tile.
+    ///
+    /// The default is 65,536 pixels. The byte limit remains the effective memory bound for
+    /// supported Gray8 and Gray16 tiles.
+    pub max_decoded_tile_width: u32,
+    /// Maximum stored Y dimension for one decoded tile.
+    ///
+    /// The default is 65,536 pixels. The byte limit remains the effective memory bound for
+    /// supported Gray8 and Gray16 tiles.
+    pub max_decoded_tile_height: u32,
 }
 
 impl Default for ParseOptions {
@@ -210,6 +231,9 @@ impl Default for ParseOptions {
             max_dimensions_per_entry: DEFAULT_MAX_DIMENSIONS,
             max_total_dimensions: DEFAULT_MAX_TOTAL_DIMENSIONS,
             max_index_bytes: DEFAULT_MAX_INDEX_BYTES,
+            max_decoded_tile_bytes: DEFAULT_MAX_DECODED_TILE_BYTES,
+            max_decoded_tile_width: DEFAULT_MAX_DECODED_TILE_WIDTH,
+            max_decoded_tile_height: DEFAULT_MAX_DECODED_TILE_HEIGHT,
         }
     }
 }
@@ -247,6 +271,35 @@ impl ParseOptions {
     #[must_use]
     pub const fn with_max_index_bytes(mut self, maximum: u64) -> Self {
         self.max_index_bytes = maximum;
+        self
+    }
+
+    /// Set the maximum decoded pixel bytes for one tile.
+    #[must_use]
+    pub const fn with_max_decoded_tile_bytes(mut self, maximum: u64) -> Self {
+        self.max_decoded_tile_bytes = maximum;
+        self
+    }
+
+    /// Set the maximum stored X and Y dimensions for one decoded tile.
+    #[must_use]
+    pub const fn with_max_decoded_tile_dimensions(mut self, width: u32, height: u32) -> Self {
+        self.max_decoded_tile_width = width;
+        self.max_decoded_tile_height = height;
+        self
+    }
+
+    /// Set the maximum stored X dimension for one decoded tile.
+    #[must_use]
+    pub const fn with_max_decoded_tile_width(mut self, maximum: u32) -> Self {
+        self.max_decoded_tile_width = maximum;
+        self
+    }
+
+    /// Set the maximum stored Y dimension for one decoded tile.
+    #[must_use]
+    pub const fn with_max_decoded_tile_height(mut self, maximum: u32) -> Self {
+        self.max_decoded_tile_height = maximum;
         self
     }
 }
@@ -979,7 +1032,8 @@ impl CziDataset {
     ///
     /// Returns [`CziError::UnsupportedPixel`] for pixel types other than Gray8 and Gray16,
     /// [`CziError::UnsupportedCompression`] for every compressed payload, or a structured
-    /// source/format/allocation error when the tile cannot safely be decoded.
+    /// source/format/allocation/limit error when the tile cannot safely be decoded. Dimensions
+    /// and decoded byte size are checked before the pixel payload is allocated.
     pub fn decoded_tile(&self, index: usize) -> Result<DecodedTile, CziError> {
         let tile = self.index.tiles.get(index).ok_or(CziError::Missing {
             what: "tile",
@@ -994,6 +1048,12 @@ impl CziDataset {
             });
         }
         let (width, height) = stored_xy_dimensions(&tile.entry)?;
+        let bytes_per_pixel = match tile.entry.pixel_type {
+            PixelType::Gray8 => 1,
+            PixelType::Gray16 => 2,
+            pixel_type => return Err(CziError::UnsupportedPixel { pixel_type }),
+        };
+        check_decoded_tile_limits(width, height, bytes_per_pixel, self.options)?;
         let pixels = checked_mul(
             u64::from(width),
             u64::from(height),
@@ -1030,9 +1090,45 @@ impl CziDataset {
                     pixels: DecodedPixels::Gray16(values),
                 })
             }
-            pixel_type => Err(CziError::UnsupportedPixel { pixel_type }),
+            _ => unreachable!("pixel type was checked above"),
         }
     }
+}
+
+fn check_decoded_tile_limits(
+    width: u32,
+    height: u32,
+    bytes_per_pixel: u64,
+    options: ParseOptions,
+) -> Result<(), CziError> {
+    if width > options.max_decoded_tile_width {
+        return Err(CziError::LimitExceeded {
+            kind: "decoded tile width",
+            value: u64::from(width),
+            maximum: u64::from(options.max_decoded_tile_width),
+        });
+    }
+    if height > options.max_decoded_tile_height {
+        return Err(CziError::LimitExceeded {
+            kind: "decoded tile height",
+            value: u64::from(height),
+            maximum: u64::from(options.max_decoded_tile_height),
+        });
+    }
+    let pixel_count = checked_mul(
+        u64::from(width),
+        u64::from(height),
+        "decoded tile pixel count",
+    )?;
+    let decoded_bytes = checked_mul(pixel_count, bytes_per_pixel, "decoded tile byte count")?;
+    if decoded_bytes > options.max_decoded_tile_bytes {
+        return Err(CziError::LimitExceeded {
+            kind: "decoded tile bytes",
+            value: decoded_bytes,
+            maximum: options.max_decoded_tile_bytes,
+        });
+    }
+    Ok(())
 }
 
 fn stored_xy_dimensions(entry: &DirectoryEntry) -> Result<(u32, u32), CziError> {
